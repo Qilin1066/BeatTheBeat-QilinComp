@@ -4,7 +4,7 @@ Ahead-of-time recompilation of the Europe/Australia release of *Beat the Beat: R
 
 ## Native startup probe
 
-Build the probe from your local PAL WBFS image or extracted data partition. The build verifies the executable and translates it locally. See the [native build and validation instructions](docs/NATIVE-PORT.md).
+Build the probe from your local PAL WBFS image or extracted data partition. The build verifies the executable and translates it locally. See the [native build and validation instructions](docs/NATIVE-PORT.md) and the [project decisions and next steps](docs/PROJECT-STATUS.md).
 
 ## Earlier preview
 
