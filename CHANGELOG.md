@@ -11,6 +11,22 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-18
+A faster loop: the differential test runs in parallel on Linux, macOS and Windows, a full run at 8 trials per function takes about 2 minutes on 16 cores (v0.5.0 took about 45 minutes at 4 trials on two cores), and `qilin lift` rewrites only what changed, so rebuilds are incremental. 50,992 trials, 0 unexplained mismatches.
+
+### Added
+- **Parallel differential test:** `--jobs` workers (default: one per CPU), each with its own Unicorn and `qilin_difftest`. Trials are seeded per function (`--seed` and its address), so results don't depend on scheduling, and `--only` (now a comma-separated list) or the new `--range LO-HI` replays exactly the trials of a full run.
+- **The differential test on Windows:** a reader thread replaces `select` for the harness's time-out; the harness reserves the guest space but commits only MEM1, and sets binary mode on its pipes.
+
+### Changed
+- **`qilin lift`:** files of 256 consecutive functions counted over every function, lifted or not (35 files, was 25 of 300 lifted functions), so boundaries don't move when more functions lift; a file is written only when its content changes, and stale chunks are removed.
+- **Generated code** declares each local separately: MSVC applies `[[maybe_unused]]` only to a declaration's first declarator. It now builds with MSVC `/W4 /WX`, less C4702 (unreachable code after inlining a callee that always stops), which is disabled for generated code.
+- **Faster trials** (39 ms to 19 ms on one core): Unicorn's MEM1 is a buffer of the driver's, compared with `memcmp`; neither side copies all of MEM1 per trial; the random heap is drawn in bulk. The trials themselves changed with this, so counts differ from v0.5.0's.
+- The default is 8 trials per function, and the results are 50,992 trials.
+
+### Fixed
+- **Difftest:** the entry stub at `0x80002F00` was written only into Unicorn's memory, so a function reading memory down to it saw different bytes on each side (a false mismatch, `801E9140`). It is now part of the starting state on both sides.
+
 ## [0.5.0] - 2026-11-18
 The lifter's first slice and the differential test: 6,374 of the game's functions become C++, and every one runs against the original code under Unicorn: 25,496 trials, 0 unexplained mismatches.
 

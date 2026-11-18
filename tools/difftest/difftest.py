@@ -9,20 +9,34 @@ returned to, every changed byte of MEM1, and how it stopped (memory fault and
 its address, trap, a call into a function that isn't lifted yet). Whole call
 trees run: a lifted function's lifted callees run too, on both sides.
 
-  difftest.py --harness build/qilin_difftest --dol main.dol --gen gen [--trials 8] [--only ADDR] [--seed N]
+  difftest.py --harness build/qilin_difftest --dol main.dol --gen gen
+              [--trials 8] [--seed N] [--jobs N]
+              [--only ADDR[,ADDR...]] [--range LO-HI] [--first N]
 
-Needs `pip install unicorn` (2.1 or later). Trials that run too long under
-Unicorn (an infinite loop on random input) are skipped, and counted.
+Functions are shared out among --jobs workers (default: one per CPU), each
+with its own Unicorn and its own qilin_difftest. A function's trials are drawn
+from a generator seeded with --seed and the function's address alone, so they
+are the same whatever the number of workers, the order, or the selection:
+`--only` on a mismatching function replays exactly the trials of the full run.
+
+Needs `pip install unicorn` (2.1 or later). Runs on Linux, macOS and Windows.
+Trials that run too long under Unicorn (an infinite loop on random input) are
+skipped, and counted.
 """
 import argparse
+import array
 import collections
+import ctypes
+import multiprocessing
 import os
+import queue
 import random
-import select
 import re
 import struct
 import subprocess
 import sys
+import threading
+import time
 
 from unicorn import Uc, UcError, UC_ARCH_PPC, UC_MODE_PPC32, UC_MODE_BIG_ENDIAN, UC_HOOK_MEM_UNMAPPED, \
     UC_HOOK_BLOCK, UC_HOOK_CODE, UC_PROT_ALL
@@ -40,15 +54,22 @@ LIMIT = 400_000             # instructions per trial under Unicorn
 PAGE = 4096
 STATUS = ["returned", "memory fault", "bad jump", "bad return", "trap", "not lifted", "unsupported"]
 
+memcmp = ctypes.cdll.msvcrt.memcmp if sys.platform == "win32" else ctypes.CDLL(None).memcmp
+memcmp.restype, memcmp.argtypes = ctypes.c_int, [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t]
+
 
 def load_dol(path):
+    """MEM1 holding the DOL image, and the text sections as (lo, hi) addresses."""
     data = open(path, "rb").read()
     image = bytearray(MEM1_SIZE)
+    text = []
     for i in range(18):
         off, addr, size = (struct.unpack(">I", data[o + 4 * i:o + 4 * i + 4])[0] for o in (0, 0x48, 0x90))
         if size:
             image[addr - MEM1:addr - MEM1 + size] = data[off:off + size]
-    return bytes(image)
+            if i < 7:
+                text.append((addr, addr + size))
+    return bytes(image), text
 
 
 def time_readers(gen):
@@ -83,23 +104,27 @@ def functions(gen):
 class Original:
     """The original code under Unicorn."""
 
-    def __init__(self, image, not_lifted):
+    def __init__(self, image, text, not_lifted):
         self.mu = Uc(UC_ARCH_PPC, UC_MODE_PPC32 | UC_MODE_BIG_ENDIAN)
         try:
             self.mu.ctl_set_cpu_model(P.UC_CPU_PPC32_750CL_V2_0)
         except Exception:
             pass
-        self.mu.mem_map(MEM1, MEM1_SIZE, UC_PROT_ALL)
-        self.mu.mem_write(MEM1, image)
+        # MEM1 lives in a buffer of ours, so finding what a trial changed is a
+        # memcmp against its starting state: no 24 MB read out of Unicorn.
+        self.mem = (ctypes.c_ubyte * MEM1_SIZE).from_buffer_copy(image)
+        self.mu.mem_map_ptr(MEM1, MEM1_SIZE, UC_PROT_ALL, ctypes.addressof(self.mem))
         self.image = image
+        self.initial = bytearray(image)  # a trial's starting state; the image again between trials
+        self.initial_at = ctypes.addressof((ctypes.c_ubyte * MEM1_SIZE).from_buffer(self.initial))
         self.not_lifted = not_lifted
         self.mu.hook_add(UC_HOOK_MEM_UNMAPPED, self._unmapped)
         self.mu.hook_add(UC_HOOK_BLOCK, self._block)
         # Every divw/divwu: did a trial divide by zero (or 0x80000000 by -1)?
-        for off in range(0, MEM1_SIZE - 4, 4):
-            w = struct.unpack(">I", image[off:off + 4])[0]
-            if w >> 26 == 31 and (w >> 1) & 0x1FF in (459, 491) and (w >> 1) & 0x3FF != 0x3FF:
-                self.mu.hook_add(UC_HOOK_CODE, self._divide, w, MEM1 + off, MEM1 + off)
+        for lo, hi in text:
+            for i, (w,) in enumerate(struct.iter_unpack(">I", image[lo - MEM1:hi - MEM1])):
+                if w >> 26 == 31 and (w >> 1) & 0x1FF in (459, 491) and (w >> 1) & 0x3FF != 0x3FF:
+                    self.mu.hook_add(UC_HOOK_CODE, self._divide, w, lo + 4 * i, lo + 4 * i)
 
     def _unmapped(self, mu, access, address, size, value, data):
         self.stop = (1, mu.reg_read(P.UC_PPC_REG_PC), address)
@@ -120,14 +145,10 @@ class Original:
         # Unicorn 2.1's write hook misses dcbz, stmw and stswi, so changes are
         # found by comparing all of MEM1 with the trial's starting state.
         mu = self.mu
-        stub = struct.pack(">4I", 0x7C0103A6, 0x3C000000 | regs[0] >> 16, 0x60000000 | regs[0] & 0xFFFF,
-                           0x48000000 | (fn - (STUB + 12)) & 0x03FFFFFC)
-        writes = list(writes) + [(STUB, stub)]  # part of the starting state, like the heap and stack
-        initial = bytearray(self.image)
+        initial = self.initial
         for addr, blob in writes:
             initial[addr - MEM1:addr - MEM1 + len(blob)] = blob
             mu.mem_write(addr, blob)
-        initial = bytes(initial)
         for i in range(32):
             mu.reg_write(P.UC_PPC_REG_0 + i, regs[i])
         mu.reg_write(P.UC_PPC_REG_LR, regs[32])
@@ -159,17 +180,18 @@ class Original:
         out = [mu.reg_read(P.UC_PPC_REG_0 + i) for i in range(32)]
         out += [mu.reg_read(P.UC_PPC_REG_LR), mu.reg_read(P.UC_PPC_REG_CTR), mu.reg_read(P.UC_PPC_REG_CR), 0,
                 MAGIC if status[0] == 0 else 0]
-        after = bytes(mu.mem_read(MEM1, MEM1_SIZE))
+        mem_at, initial_at = ctypes.addressof(self.mem), self.initial_at
         changed = {}
         for big in range(0, MEM1_SIZE, 1 << 16):
-            if after[big:big + (1 << 16)] == initial[big:big + (1 << 16)]:
+            if not memcmp(mem_at + big, initial_at + big, 1 << 16):
                 continue
             for page in range(big, big + (1 << 16), PAGE):
-                if after[page:page + PAGE] == initial[page:page + PAGE]:
+                if not memcmp(mem_at + page, initial_at + page, PAGE):
                     continue
-                for off in range(page, page + PAGE, 32):
-                    if after[off:off + 32] != initial[off:off + 32]:
-                        changed[MEM1 + off] = after[off:off + 32]
+                after = ctypes.string_at(mem_at + page, PAGE)
+                for off in range(0, PAGE, 32):
+                    if after[off:off + 32] != initial[page + off:page + off + 32]:
+                        changed[MEM1 + page + off] = after[off:off + 32]
                 mu.mem_write(MEM1 + page, self.image[page:page + PAGE])  # back to the image
         if status[0] == 0 and not timeout:  # XER out through mfxer r0 at MAGIC, for the same reason
             mu.mem_write(MAGIC, struct.pack(">I", 0x7C0102A6))
@@ -177,22 +199,47 @@ class Original:
             mu.emu_start(MAGIC, MAGIC + 4)
             out[35] = mu.reg_read(P.UC_PPC_REG_0)
             mu.mem_write(MAGIC, self.image[MAGIC - MEM1:MAGIC - MEM1 + 4])
-        for addr, blob in writes:  # the trial's own writes, back to the image too
-            mu.mem_write(addr, self.image[addr - MEM1:addr - MEM1 + len(blob)])
+        for addr, blob in writes:  # the trial's own writes, back to the image too, on both copies
+            original = self.image[addr - MEM1:addr - MEM1 + len(blob)]
+            mu.mem_write(addr, original)
+            initial[addr - MEM1:addr - MEM1 + len(blob)] = original
         if timeout:
             return None
         return status, out, changed
 
 
 class Lifted:
-    """The lifted code in qilin_difftest."""
+    """The lifted code in qilin_difftest. A reader thread collects its results,
+    so a hung harness can be timed out the same way on every host."""
 
     def __init__(self, harness, dol):
-        self.args = [harness, dol]
+        self.args = [os.path.abspath(harness), dol]  # Windows won't resolve a relative path with '/'
         self.start()
 
     def start(self):
         self.p = subprocess.Popen(self.args, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+        self.results = queue.Queue()
+        threading.Thread(target=self._read, args=(self.p.stdout, self.results), daemon=True).start()
+
+    @staticmethod
+    def _read(stream, results):
+        def rd(n):
+            b = stream.read(n)
+            if len(b) != n:
+                raise EOFError
+            return b
+        try:
+            while True:
+                status = struct.unpack("<3I", rd(12))
+                out = list(struct.unpack("<37I", rd(37 * 4)))
+                n = struct.unpack("<I", rd(4))[0]
+                changed = {}
+                for _ in range(n):
+                    addr = struct.unpack("<I", rd(4))[0]
+                    changed[addr] = rd(32)
+                results.put((status, out, changed))
+        except (EOFError, OSError, ValueError):
+            results.put(None)  # the harness exited (or was killed)
 
     def run(self, fn, regs, writes, timeout=20):
         """The result, or None if the lifted code didn't finish in time (the harness is restarted)."""
@@ -201,23 +248,19 @@ class Lifted:
             msg += struct.pack("<II", addr, len(blob)) + blob
         self.p.stdin.write(msg)
         self.p.stdin.flush()
-        if not select.select([self.p.stdout], [], [], timeout)[0]:
+        try:
+            result = self.results.get(timeout=timeout)
+        except queue.Empty:
             self.p.kill()
             self.p.wait()
             self.start()
             return None
-        rd = self.p.stdout.read
-        status = struct.unpack("<3I", rd(12))
-        out = list(struct.unpack("<37I", rd(37 * 4)))
-        n = struct.unpack("<I", rd(4))[0]
-        changed = {}
-        for _ in range(n):
-            addr = struct.unpack("<I", rd(4))[0]
-            changed[addr] = rd(32)
-        return status, out, changed
+        if result is None:  # a crash in lifted code is a bug in it or in the lifter: stop
+            raise RuntimeError(f"qilin_difftest exited with status {self.p.wait()} running {fn:08X}")
+        return result
 
 
-def random_state(rng, image):
+def random_state(rng):
     def value():
         k = rng.random()
         if k < 0.35:
@@ -231,12 +274,18 @@ def random_state(rng, image):
     regs[1] = STACK_TOP - 8 * rng.randrange(0, 16)
     regs[2], regs[13] = R2, R13
     regs += [MAGIC, rng.getrandbits(32), rng.getrandbits(32), rng.getrandbits(32) & XER_MASK]
-    heap = bytearray(rng.getrandbits(8) for _ in range(HEAP_SIZE))
-    for off in range(0, HEAP_SIZE, 4):  # a third of the heap's words point back into it
-        if rng.random() < 0.33:
-            heap[off:off + 4] = struct.pack(">I", HEAP + rng.randrange(0, HEAP_SIZE - 0x100) & ~3)
-    stack = bytes(rng.getrandbits(8) for _ in range(STACK_FILL))
-    return regs, [(HEAP, bytes(heap)), (STACK_TOP - STACK_FILL, stack)]
+    # A third of the heap's words (84 in 256) point back into it, uniformly
+    # below its last 256 bytes. Drawn in bulk: per-word draws were most of a
+    # trial's time. Hosts are little-endian (see guest.hpp), so the arrays'
+    # byte order, and with it the trials, are the same on every host.
+    words = HEAP_SIZE // 4
+    heap = array.array("I", rng.randbytes(HEAP_SIZE))
+    pick, offset = rng.randbytes(words), array.array("H", rng.randbytes(2 * words))
+    for i in [i for i, p in enumerate(pick) if p < 84]:
+        heap[i] = HEAP + ((offset[i] * (HEAP_SIZE - 0x100)) >> 16 & ~3)
+    heap.byteswap()  # guest words are big-endian
+    stack = rng.randbytes(STACK_FILL)
+    return regs, [(HEAP, heap.tobytes()), (STACK_TOP - STACK_FILL, stack)]
 
 
 # Known differences, by design. Each returns a reason or None.
@@ -286,69 +335,121 @@ def compare(a, b):
     return "; ".join(diffs)
 
 
+# ---- Workers: each holds one Unicorn and one qilin_difftest for its lifetime ----
+_worker = {}
+
+
+def init_worker(harness, dol, not_lifted, time_fns, trials, seed):
+    image, text = load_dol(dol)
+    _worker.update(original=Original(image, text, not_lifted), lifted=Lifted(harness, dol), image=image,
+                   time=time_fns, trials=trials, seed=seed)
+
+
+def test_function(fn):
+    """All of one function's trials: (fn, outcome counts, how agreeing trials ended, first mismatch or None)."""
+    w = _worker
+    rng = random.Random(w["seed"] << 32 | fn)  # this function's trials, whatever else runs
+    counts, stops, bad = collections.Counter(), collections.Counter(), None
+    for _ in range(w["trials"]):
+        regs, writes = random_state(rng)
+        # Unicorn enters through the stub (see Original.run). It is part of the
+        # starting state on both sides, like the heap and stack: a function
+        # that reads memory down to it must see the same bytes either way.
+        writes.append((STUB, struct.pack(">4I", 0x7C0103A6, 0x3C000000 | regs[0] >> 16, 0x60000000 | regs[0] & 0xFFFF,
+                                         0x48000000 | (fn - (STUB + 12)) & 0x03FFFFFC)))
+        a = w["original"].run(fn, regs, writes)
+        if a is None:
+            counts["skipped: runs too long under Unicorn"] += 1
+            continue
+        b = w["lifted"].run(fn, regs, writes)
+        if b is None:
+            counts["MISMATCH"] += 1
+            bad = bad or "lifted code didn't finish; the original did"
+            continue
+        if a[0][0] == "error":
+            counts["skipped: Unicorn stopped (" + a[0][2].split('(')[0].strip() + ")"] += 1
+            continue
+        if b[0][0] == 6:
+            counts["skipped: unsupported special register or system call"] += 1
+            continue
+        why = compare(a, b)
+        known = known_difference(a, b, w["image"], w["original"].divided_by_zero, fn in w["time"]) if why else None
+        if known:
+            counts["known: " + known] += 1
+        elif why:
+            counts["MISMATCH"] += 1
+            bad = bad or why
+        else:
+            counts["agree"] += 1
+            stops[STATUS[a[0][0]]] += 1
+    return fn, counts, stops, bad
+
+
+def parse_hex_range(text):
+    lo, sep, hi = text.partition("-")
+    if not sep:
+        raise argparse.ArgumentTypeError("--range needs LO-HI (hex, HI exclusive)")
+    return int(lo, 16), int(hi, 16)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--harness", required=True)
     ap.add_argument("--dol", required=True)
     ap.add_argument("--gen", required=True)
-    ap.add_argument("--trials", type=int, default=8)
-    ap.add_argument("--only", help="one function (hex address)")
+    ap.add_argument("--trials", type=int, default=8, help="trials per function")
+    ap.add_argument("--only", help="these functions only (hex addresses, comma-separated)")
+    ap.add_argument("--range", type=parse_hex_range, help="functions starting in LO-HI (hex, HI exclusive)")
     ap.add_argument("--first", type=int, help="only the first N lifted functions")
     ap.add_argument("--seed", type=int, default=750)
+    ap.add_argument("--jobs", type=int, default=os.cpu_count() or 1, help="parallel workers (default: one per CPU)")
     ap.add_argument("--show", type=int, default=30, help="mismatching functions to print")
     args = ap.parse_args()
 
-    image = load_dol(args.dol)
     lifted, not_lifted = functions(args.gen)
     if args.only:
-        lifted = [int(args.only, 16)]
+        wanted = [int(x, 16) for x in args.only.split(",")]
+        missing = [x for x in wanted if x not in set(lifted)]
+        if missing:
+            sys.exit(f"difftest: not lifted functions: {', '.join(f'{x:08X}' for x in missing)}")
+        lifted = wanted
+    if args.range:
+        lifted = [fn for fn in lifted if args.range[0] <= fn < args.range[1]]
     if args.first:
         lifted = lifted[:args.first]
-    original = Original(image, not_lifted)
-    time = time_readers(args.gen)
-    harness = Lifted(args.harness, args.dol)
-    rng = random.Random(args.seed)
-    counts = collections.Counter()
-    stops = collections.Counter()
-    bad = {}
-    for k, fn in enumerate(lifted):
-        for _ in range(args.trials):
-            regs, writes = random_state(rng, image)
-            a = original.run(fn, regs, writes)
-            if a is None:
-                counts["skipped: runs too long under Unicorn"] += 1
-                continue
-            b = harness.run(fn, regs, writes)
-            if b is None:
-                counts["MISMATCH"] += 1
-                bad.setdefault(fn, "lifted code didn't finish; the original did")
-                continue
-            if a[0][0] == "error":
-                counts["skipped: Unicorn stopped (" + a[0][2].split('(')[0].strip() + ")"] += 1
-                continue
-            if b[0][0] == 6:
-                counts["skipped: unsupported special register or system call"] += 1
-                continue
-            why = compare(a, b)
-            known = known_difference(a, b, image, original.divided_by_zero, fn in time) if why else None
-            if known:
-                counts["known: " + known] += 1
-            elif why:
-                counts["MISMATCH"] += 1
-                bad.setdefault(fn, why)
-            else:
-                counts["agree"] += 1
-                stops[STATUS[a[0][0]]] += 1
-        if (k + 1) % 500 == 0:
-            print(f"  {k + 1}/{len(lifted)} functions, {counts['MISMATCH']} mismatching trials", file=sys.stderr)
+    if not lifted:
+        sys.exit("difftest: no functions selected")
+    jobs = max(1, min(args.jobs, len(lifted)))
+    init = (args.harness, args.dol, not_lifted, time_readers(args.gen), args.trials, args.seed)
+
+    counts, stops, bad = collections.Counter(), collections.Counter(), {}
+    started = time.monotonic()
+
+    def merge(results):
+        for k, (fn, c, s, why) in enumerate(results):
+            counts.update(c)
+            stops.update(s)
+            if why:
+                bad[fn] = why
+            if (k + 1) % 500 == 0:
+                print(f"  {k + 1}/{len(lifted)} functions, {counts['MISMATCH']} mismatching trials", file=sys.stderr)
+
+    if jobs == 1:  # in-process: plain tracebacks, easy to debug
+        init_worker(*init)
+        merge(map(test_function, lifted))
+    else:
+        with multiprocessing.Pool(jobs, init_worker, init) as pool:
+            merge(pool.imap_unordered(test_function, lifted, chunksize=4))
+    elapsed = time.monotonic() - started
+
     total = sum(counts.values())
-    print(f"{len(lifted)} functions, {total} trials:")
+    print(f"{len(lifted)} functions, {total} trials, {jobs} workers, {elapsed:.1f} s:")
     for key, n in sorted(counts.items()):
         print(f"  {n:7} {key}")
-    print("  agreeing trials ended: " + ", ".join(f"{STATUS_LABEL}: {n}" for STATUS_LABEL, n in stops.most_common()))
+    print("  agreeing trials ended: " + ", ".join(f"{label}: {n}" for label, n in stops.most_common()))
     print(f"{len(bad)} functions with a mismatch")
-    for fn, why in list(bad.items())[:args.show]:
-        print(f"  {fn:08X} {why}")
+    for fn in sorted(bad)[:args.show]:
+        print(f"  {fn:08X} {bad[fn]}")
     return 1 if bad else 0
 
 

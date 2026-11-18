@@ -7,7 +7,7 @@ if(APPLE AND NOT CMAKE_OSX_DEPLOYMENT_TARGET)
     set(CMAKE_OSX_DEPLOYMENT_TARGET 10.15 CACHE STRING "oldest macOS the runtime runs on")
 endif()
 # The single source of the version number (see CHANGELOG.md for the scheme).
-project(BeatTheBeatQilinComp VERSION 0.5.0 LANGUAGES C CXX)
+project(BeatTheBeatQilinComp VERSION 0.6.0 LANGUAGES C CXX)
 
 # ---- Language: C++23 everywhere (recompiler, runtime, generated code) ----
 set(CMAKE_CXX_STANDARD 23)
@@ -102,6 +102,12 @@ if(QILIN_GEN_DIR)
     target_include_directories(qilin_gen_checked PUBLIC "${QILIN_GEN_DIR}")
     target_compile_definitions(qilin_gen_checked PUBLIC QILIN_CHECKED_MEMORY)
     target_link_libraries(qilin_gen_checked PUBLIC qilin_runtime PRIVATE qilin_warnings)
+    if(MSVC)
+        # C4702 (unreachable code) comes from MSVC's optimiser after inlining,
+        # e.g. after a call to a lifted function that always stops: it follows
+        # inlining decisions, not anything the lifter can see or avoid.
+        target_compile_options(qilin_gen_checked PRIVATE /wd4702)
+    endif()
     add_executable(qilin_difftest tools/difftest/harness.cpp)
     target_link_libraries(qilin_difftest PRIVATE qilin_gen_checked qilin_dol qilin_warnings)
     qilin_tool(qilin_difftest)

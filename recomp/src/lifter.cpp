@@ -523,16 +523,15 @@ LiftResult Emitter::run() {
         if (targets_.contains(it->first)) body_.insert(it->second, label(it->first) + ":;\n");
 
     std::string code = std::format("void {}(rt::Context& c) {{\n", fn_name(f_.start));
+    // One declaration per local: MSVC applies [[maybe_unused]] only to the
+    // first declarator of a declaration (C4189 on the rest).
     if (!gprs_.empty()) {
-        code += "    [[maybe_unused]] uint32_t";
-        bool first = true;
-        for (unsigned g : gprs_) {
-            code += std::format("{} r{} = c.r[{}]", first ? "" : ",", g, g);
-            first = false;
-        }
-        code += ";\n";
+        code += "   ";
+        for (unsigned g : gprs_) code += std::format(" [[maybe_unused]] uint32_t r{0} = c.r[{0}];", g);
+        code += "\n";
     }
-    code += "    [[maybe_unused]] uint32_t lr = c.lr, ctr = c.ctr, cr = c.cr, xer = c.xer;\n";
+    code += "    [[maybe_unused]] uint32_t lr = c.lr; [[maybe_unused]] uint32_t ctr = c.ctr;"
+            " [[maybe_unused]] uint32_t cr = c.cr; [[maybe_unused]] uint32_t xer = c.xer;\n";
     auto sync = [&](bool to_context) {
         std::string s;
         for (unsigned g : gprs_) s += to_context ? std::format(" c.r[{0}] = r{0};", g) : std::format(" r{0} = c.r[{0}];", g);

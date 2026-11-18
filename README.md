@@ -17,7 +17,7 @@ Roadmap step 1, **analysis**, is nearly done; step 2, the **recompiler core**, i
 | Names from the Rhythm Heaven Fever decomp ported to PAL; library boundaries; what's lifted, replaced or dropped | ✅ 8,043 of the decomp's 8,103 functions match exactly; 74% of the code lifted (`docs/code-analysis.md`) |
 | Hardware-access profile, exception tables, timing model | next (see `docs/dol-analysis.md`) |
 | Lifter → C++, slice 1: integer, loads and stores, branches, calls, jump tables, the function table | ✅ 6,374 of 8,171 functions (the rest need floating point, or are privileged code that's replaced); generated code warning-free under GCC 14 and Clang 19 |
-| Differential test against the original code under Unicorn (PowerPC 750CL) | ✅ every lifted function, 25,496 trials, 0 unexplained mismatches; found and fixed one lifter bug |
+| Differential test against the original code under Unicorn (PowerPC 750CL) | ✅ every lifted function, 50,992 trials, 0 unexplained mismatches; found and fixed one lifter bug; parallel, about 2 minutes on 16 cores |
 | Lifter slices 3–4: floating point, paired singles | next |
 | Runtime: OS, DVD, NAND, GX on Vulkan, AX audio, input | later (see roadmap) |
 
@@ -66,9 +66,10 @@ build/qilin lift    path/to/main.dol --out gen            # lift to C++ (gen/ is
 ```sh
 cmake -S . -B build-gen -DQILIN_GEN_DIR=$PWD/gen && cmake --build build-gen --target qilin_difftest
 python3 tools/difftest/difftest.py --harness build-gen/qilin_difftest --dol path/to/main.dol --gen gen
+python3 tools/difftest/difftest.py ... --only 801E9140         # replays exactly that function's trials from the full run
 ```
 
-Runs every lifted function from random states, as lifted C++ and as the original code under Unicorn's PowerPC 750CL model (`pip install unicorn`), and compares registers, memory and how each stopped. Details in `docs/recompiler-core.md`.
+Runs every lifted function from random states, as lifted C++ and as the original code under Unicorn's PowerPC 750CL model (`pip install unicorn`), and compares registers, memory and how each stopped. It uses one worker per CPU (`--jobs`) and runs on Linux, macOS and Windows. Details in `docs/recompiler-core.md`.
 
 ### Decoder check
 
