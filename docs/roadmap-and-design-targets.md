@@ -1,0 +1,74 @@
+# Beat the Beat: Rhythm Paradise — Recomp Roadmap & Design Targets
+
+**Guiding principle: efficiency and reliability come first.** Every design choice is judged on whether it makes the game cheaper to run on low-end hardware and whether it fails loudly and predictably instead of silently misbehaving.
+
+The requirements and scope are the same as GBTG-Qilincomp's (Grabbed by the Ghoulies). Where the Wii differs from the Xbox, this document says how the same rule applies.
+
+## Targets
+- **Game:** *Beat the Beat: Rhythm Paradise*, Europe/Australia, disc `SOMP01`, revision 0, recognised by the SHA-256 of `main.dol`. Other regions are other binaries and out of scope for now.
+- **Platforms:** 64-bit Windows, Linux and macOS (Intel and Apple Silicon), on x86-64 or ARM64, with Vulkan. See *Hardware scope* below.
+- **Language:** **C++23** throughout (recompiler, generated code and runtime). Minimum compilers: GCC 14, Clang 19, Xcode 16, Visual Studio 2022 17.10.
+- **Graphics API:** **Vulkan 1.3, and only Vulkan.** We require the 1.3 core API, and only the optional features and limits that Mesa's v3dv driver on a Pi 4 provides, so one render path works everywhere (MoltenVK on macOS). See *Vulkan baseline* below.
+- **Reference:** Dolphin running the original game is ground truth for behaviour, visuals and audio. The Rhythm Heaven Fever decompilation (US build, CC0) is a second reference for what the code does and what it's called (see `prior-art.md`).
+- **Rhythm accuracy:** this is a rhythm game, so timing is behaviour. Cue-to-sound timing, judgement windows and input-to-audio latency are measured against Dolphin, and on the low-end reference hardware, at every milestone from step 5 on.
+- **Enhancement example target:** 3440×1440 (21:9) at 144 Hz.
+
+## Architecture
+- **Game code:** static recompilation, PowerPC (Broadway) → **generated C++**, compiled AOT by clang/GCC/MSVC for each target. No interpreter, no JIT, and no emulator underneath. Hand-written C++ replaces lifted functions over time (hot paths, bugs, enhancement hooks) through a function override table.
+- **Decoder:** **our own, table-driven** (`recomp/src/decoder.*`, done in v0.2.0). Broadway's encoding is fixed-width and small (222 instructions with the paired singles), and no proven, permissively licensed Broadway decoder exists to vendor the way Ghoulies vendors Zydis. It is **verified word by word against GNU binutils' `broadway` disassembler**: over every word of the game's text sections, and over a sweep of the encoding space in CI. Reserved bits set and invalid forms decode as invalid.
+- **Symbol naming:** the Rhythm Heaven Fever decomp (`conhlee/rhf`, CC0) names 8,103 functions of the US build and splits them by library. Its names are ported to the PAL build by masked-hash function signatures (relocated fields masked); our own signatures only where it has nothing.
+- **Register model:** guest registers held in host locals inside each lifted function and synced to a context struct only at call/indirect boundaries: 32 GPRs, 32 FPRs as paired-single pairs (`ps0`, `ps1`), CR fields, XER, LR, CTR. No global or thread-local register variables (that model blocks host register allocation).
+- **Calling conventions:** the game and its libraries are CodeWarrior-compiled PowerPC EABI code (arguments in `r3`–`r10` and `f1`–`f8`, small-data bases in `r2`/`r13`). Lifted code still keeps full register state across calls; ABI recovery only where hand-written C++ replaces a function.
+- **Fail loudly:** an undecodable or unsupported instruction is a build error, never a comment; an unknown indirect-call target at runtime traps with its address logged. Encodings a retail compiler never emits (reserved bits set, invalid forms) count as undecodable.
+- **Control flow:** recursive-descent CFG with resolved switch tables (CodeWarrior's `lis`/`addi`/`lwzx`/`mtctr`/`bctr` pattern). Indirect calls (`bctrl` through function pointers and vtables) dispatch through a generated sorted function table; an unknown target traps with the address logged (never silently continues), and the address is added as a seed.
+- **Endianness:** the guest is big-endian and every host is little-endian. Guest memory keeps the guest's byte order, so file data and bulk copies need no conversion; each lifted load and store swaps bytes, a single instruction on x86-64 (`movbe`/`bswap`) and ARM64 (`rev`).
+- **Lifter efficiency:** CR and XER elimination through dataflow analysis (compute only the CR bits a branch or `mfcr` reads; summary overflow only where read). Floating point is native `double`/`float`, bit-exact: Broadway's `fmadd` family is fused (one rounding), so it becomes `std::fma`, and `-ffp-contract=off` keeps the host compiler from fusing anything else. Broadway's quirks (the 25-bit rounding of `frC` in single-precision and paired-single multiplies, the `fres`/`frsqrte`/`ps_res`/`ps_rsqrte` estimate tables, non-IEEE mode) are reproduced and proven by the differential test. GQR-quantised `psq_l`/`psq_st` become inline conversions. Flat memory (4 GB host reservation, `base + addr`, no bounds checks).
+- **Memory map and mirrors:** the game sees MEM1 (24 MB at `0x80000000`) and MEM2 (64 MB at `0x90000000`), each with an uncached mirror (`0xC0000000`, `0xD0000000`), plus hardware registers at `0xCC000000`/`0xCD000000`. Because we replace the hardware-facing SDK libraries, during bring-up any access to a mirror or a hardware register traps, so we learn exactly which ones lifted code uses. Only those get aliased mappings (file mapping / memfd) or native handling. Known case: the GX write-gather pipe at `0xCC008000` (see *Graphics*).
+- **Exceptions:** CodeWarrior C++ exception tables (`extab`, `extabindex`) are read in analysis. Whether the game ever throws, and what the runtime does if it does, is decided there, as Ghoulies did in v0.7.0.
+- **System software (the Wii's "kernel and XDK"):** there is no kernel on the PowerPC side. The Revolution SDK is linked into `main.dol` and drives the hardware registers and IOS (the ARM co-processor that owns storage, USB and Bluetooth) directly. Its hardware-facing libraries are **replaced natively at their API**, not recompiled: OS (threads, mutexes, message queues, alarms, interrupts, caches, time), DVD (files over the extracted disc), VI (presentation), GX (Vulkan), AX/DSP (native mixer), WPAD/KPAD/WUD/BTE (input), NAND/IPC/ES/FS (saves in a host folder), SC (console settings). Libraries whose exact behaviour matters more than native speed are **lifted** with the game: the C and C++ runtime (MSL, PowerPC EABI runtime), the pure-software SDK libraries (MTX/VEC maths, MEM heaps) and NintendoWare for Revolution (NW4R: sound sequencer, layout, g3d, utilities), which sits on GX and AX. This is the starting boundary; analysis confirms it library by library, as Ghoulies moved the CRT and XAPI to the lifted side in v0.11.0 and v0.12.0. Hot, simple lifted functions can still get native versions, each checked against the lifted original.
+- **Graphics:** GX API-level translation to Vulkan, not Hollywood GPU emulation. **Plus a GX command-stream decoder** for what reaches the write-gather pipe directly: CodeWarrior inlines GX's vertex macros (`GXPosition3f32` …) into game code as stores to `0xCC008000`, and display lists (`GXCallDisplayList`) are raw command streams. Both become draws with the current vertex format; unknown commands assert. TEV stage and blend configurations are collected in analysis and converted to SPIR-V offline; prebuilt pipeline cache (no runtime compile stutter). Embedded-framebuffer copies (render to texture) are handled explicitly.
+- **Audio/Input:** AX voices (ADPCM and PCM, mixed by the DSP on the Wii) → native mixer on SDL3 or miniaudio; the DSP microcode is not emulated. Output latency is a first-class target. Wii Remote buttons → SDL3 (gamepad, keyboard).
+- **Assets:** Yaz0-compressed U8 archives (`.szs`) and NW4R formats are read by the lifted game and NW4R code over the native DVD layer. Yaz0 decompression is lifted, or native if it's hot, checked against the lifted original.
+- **Threads:** audio mixing and Vulkan submission off the game thread. Guest OS threads run with the Wii's single-core, priority-based semantics (host threads under one run lock, or fibers); the choice is recorded when the scheduler is written.
+- **Portability rules:** no inline asm or host intrinsics in the runtime; ARM64 Linux builds from day one.
+
+## Hardware scope
+**Supported: 64-bit hosts with a Vulkan 1.3 driver.** In practice that means:
+- **Windows and Linux** on x86-64 or ARM64 with a Vulkan-capable GPU and driver;
+- **macOS on Intel and Apple Silicon Macs**, through MoltenVK (Vulkan on top of Metal): any 64-bit Mac with a Metal GPU running macOS 10.15 (Catalina) or later: officially the 2012 and later Intel models, and every Apple Silicon Mac. MoltenVK has Vulkan 1.3 from v1.3.0, and its releases up to v1.4.1 still run on 10.15 (v1.4.2 raised the floor to 12), so Macs on 10.15–11 get one of those. The runtime (what players run) is built for macOS 10.15, and CI builds both architectures. It doesn't use `std::format`, which Apple's libc++ only has from macOS 13.3. The developer tools (`qilin`, the tests) use `std::format` and need macOS 13.3;
+- **ARM boards** with Vulkan 1.3 drivers, e.g. Raspberry Pi 4 and newer (Mesa v3dv, Mesa 24.3 or later).
+
+**Out of scope:** anything without Vulkan 1.3 (or, on Apple, a Vulkan translation layer that provides it), 32-bit hosts, and phones and tablets (iOS, iPadOS, Android). That rules out the Raspberry Pi 1–3 and Zero (OpenGL ES 2 only), the first Intel Macs (32-bit Core Duo, 2006), and Macs without a Metal GPU or that can't run macOS 10.15. Because of this there is one renderer (Vulkan) and one memory model: the Wii's 32-bit address space mapped flat into a 64-bit host's address space, with no windowing cost on memory accesses.
+
+### Vulkan baseline: 1.3
+The renderer targets **Vulkan 1.3** as its minimum API version, chosen for how widely it's supported:
+- **Raspberry Pi 4 and 5:** Mesa's v3dv driver is Vulkan 1.3 conformant from Mesa 24.3.
+- **macOS:** MoltenVK supports Vulkan 1.3 from v1.3.0, on Intel and Apple GPUs alike. Older Intel GPUs may lack some of the v3dv feature set; the start-up check names what's missing.
+- **Windows and Linux:** current desktop GPU drivers (AMD, Intel, NVIDIA, Mesa) all ship 1.3.
+
+1.3 makes several things core that would otherwise be extensions to probe for, and the renderer is designed around them:
+- **Dynamic rendering:** no render pass or framebuffer objects. That suits GX's embedded framebuffer and its copies to textures.
+- **Synchronization2:** simpler, less error-prone barriers.
+- **Extended dynamic state:** cull mode, depth test and write, compare op, topology and stencil can be set per draw. That cuts down how many pipelines GX's state needs, which matters for the prebuilt pipeline cache.
+- **Timeline semaphores** (core since 1.2): CPU–GPU pacing for frame timing.
+- **Others:** `maintenance4`, inline uniform blocks, and pipeline creation cache control.
+
+1.3 core is the floor, but optional features and device limits aren't: v3dv is the reference for those. The renderer checks the features it uses at startup and fails with a clear message if one is missing, rather than taking a fallback path. Nothing beyond 1.3 core and the v3dv feature set is used without a decision recorded here. Vulkan 1.4 is out of scope for the baseline.
+
+**Low-end reference:** a Raspberry Pi 4–class board is our reference for typical low-end hardware. It's what we measure efficiency and rhythm timing against and test on. It is not a floor: anything with Vulkan 1.3 that's slower is fair game if the efficiency work gets us there. The Vulkan feature set we use is kept small (1.3 core, plus what v3dv on a Pi 4 supports) so the one render path runs on all of it.
+
+## Settings, not platform branches
+All enhancements live behind a settings file with presets, e.g.:
+- *Low-end:* 1× resolution, no AF, no MSAA, original aspect and frame rate.
+- *Desktop:* scaled resolution, 16× AF, MSAA, widescreen, high refresh rate.
+
+## Roadmap
+1. **Analysis:** 🔨 in progress (`dol-analysis.md`, `recompiler-core.md`). ✅ DOL loader (sections, BSS, the PAL build recognised by SHA-256); ✅ Broadway decoder, all 222 instructions with the paired singles, 0 unexplained disagreements with binutils over ~38 million words; ✅ `qilin info`, `insns`, `profile`; ✅ CI on six configurations, warnings as errors, plus the decoder sweep. To do, on the PAL `main.dol`: confirm the build hash, the decoder cross-check over every text word, function discovery and CFG, library boundaries (the decomp's splits and names ported to PAL), the hardware-access profile (write-gather pipe stores, other MMIO, uncached mirrors), C++ exception tables, and the frame and audio timing model.
+2. **Recompiler core (C++23):** CFG + data-as-code validation, every byte of the lifted code accounted for, jump tables with proven sizes; lifter slices: integer with CR/XER, calls and the function table, floating point, paired singles with GQR quantisation; a differential test against the original code on a reference executor (candidates: Unicorn's PowerPC 750 for the base instruction set; for paired singles and GQRs, which it lacks, a test-only reference model from the 750CL manual checked against Dolphin), whole call trees, under UBSan too.
+3. **Runtime skeleton:** `qilin_run` loads the DOL into MEM1, sets up MEM2 and the boot information the loader leaves in low memory (memory sizes, arena bounds, bus and CPU clocks, console type), and runs start-up as the SDK runs it; a replacement registry that stops on anything unregistered, naming it and its caller; the OS, DVD and NAND replacements.
+4. **Boot to first frame:** GX on Vulkan, the first copy to the external framebuffer presented.
+5. **Playable at original spec:** original resolution, aspect and frame rate; matches Dolphin, rhythm timing included; tested on low-end reference hardware at every milestone.
+6. **Resolution / AF / MSAA:** scaled embedded framebuffer, copies to textures at the scaled resolution where that's safe, layout half-pixel fixups.
+7. **Widescreen 16:9 → 21:9:** Hor+ projection, layout panes re-anchored, pillarboxing where a scene can't widen.
+8. **High refresh rate:** investigate the game's tick model first. A rhythm engine is usually driven by the audio clock or a fixed tick, which decides whether higher refresh rates need interpolation or just pacing.
+9. **Extras:** texture replacement packs (hash on upload), etc.
