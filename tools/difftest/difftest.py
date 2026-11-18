@@ -42,6 +42,9 @@ from unicorn import Uc, UcError, UC_ARCH_PPC, UC_MODE_PPC32, UC_MODE_BIG_ENDIAN,
     UC_HOOK_BLOCK, UC_HOOK_CODE, UC_PROT_ALL
 from unicorn import ppc_const as P
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # paired.py, under python -I too
+import paired  # noqa: E402
+
 MEM1, MEM1_SIZE = 0x80000000, 24 << 20
 MAGIC = 0x80003000          # the return address the caller gives: zero memory below the image
 STUB = 0x80002F00           # sets XER with mtxer (see Original.run), then branches to the function
@@ -70,27 +73,6 @@ def load_dol(path):
             if i < 7:
                 text.append((addr, addr + size))
     return bytes(image), text
-
-
-def time_readers(gen):
-    """Lifted functions whose call tree reads the time base or a special register the runtime models."""
-    calls, direct = {}, set()
-    for name in os.listdir(gen):
-        if not name.startswith("lifted_"):
-            continue
-        for m in re.finditer(r"void fn_([0-9A-F]{8})\(rt::Context& c\) \{\n(.*?)\n\}\n", open(os.path.join(gen, name)).read(), re.S):
-            fn = int(m[1], 16)
-            calls[fn] = {int(x, 16) for x in re.findall(r"fn_([0-9A-F]{8})\(c\)", m[2])}
-            if "rt::mftb" in m[2] or "rt::mfspr(" in m[2]:
-                direct.add(fn)
-    reach, grew = set(direct), True
-    while grew:
-        grew = False
-        for fn, callees in calls.items():
-            if fn not in reach and callees & reach:
-                reach.add(fn)
-                grew = True
-    return reach
 
 
 def functions(gen):
@@ -122,15 +104,41 @@ class Original:
         self.mu.hook_add(UC_HOOK_BLOCK, self._block)
         # Every divw/divwu: did a trial divide by zero (or 0x80000000 by -1)?
         # Every fctiwz, and the instruction after it: see _fctiwz.
-        self.fctiwz = {}
+        self.fctiwz, self.divides = {}, {}
         for lo, hi in text:
             for i, (w,) in enumerate(struct.iter_unpack(">I", image[lo - MEM1:hi - MEM1])):
                 if w >> 26 == 31 and (w >> 1) & 0x1FF in (459, 491) and (w >> 1) & 0x3FF != 0x3FF:
-                    self.mu.hook_add(UC_HOOK_CODE, self._divide, w, lo + 4 * i, lo + 4 * i)
+                    self.divides[lo + 4 * i] = w
                 if w >> 26 == 63 and (w >> 1) & 0x3FF == 15:
                     self.fctiwz[lo + 4 * i] = ((w >> 21) & 31, (w >> 11) & 31)
-        for at in sorted(set(self.fctiwz) | {a + 4 for a in self.fctiwz}):
-            self.mu.hook_add(UC_HOOK_CODE, self._fctiwz, None, at, at)
+        # Paired singles, which Unicorn lacks: the model in paired.py.
+        self.kind = {}
+        for lo, hi in text:
+            for i, (w,) in enumerate(struct.iter_unpack(">I", image[lo - MEM1:hi - MEM1])):
+                k = paired.classify(w)
+                if k:
+                    self.kind[lo + 4 * i] = (k, w)
+        self.model = paired.Paired(self.mu, P, self._read, self._write)
+        after = {a + 4 for a in self.fctiwz} | {a + 4 for a, (k, _) in self.kind.items() if k == "dup"}
+        # One code hook per text section, filtered here: Unicorn scans its
+        # list of code hooks linearly, and one hook per address (thousands)
+        # made trials 30 times slower than this.
+        # Instructions whose results differ from Unicorn's by design: the time
+        # base, and special registers the runtime models (other than LR, CTR,
+        # XER and the GQRs, which the model above keeps). A trial that runs
+        # one is flagged, whatever path got it there.
+        self.time = set()
+        for lo, hi in text:
+            for i, (w,) in enumerate(struct.iter_unpack(">I", image[lo - MEM1:hi - MEM1])):
+                if w >> 26 == 31 and (w >> 1) & 0x3FF == 371:  # mftb
+                    self.time.add(lo + 4 * i)
+                elif w >> 26 == 31 and (w >> 1) & 0x3FF == 339:  # mfspr
+                    spr = ((w >> 16) & 31) | ((w >> 11) & 31) << 5
+                    if spr not in (1, 8, 9) and not 912 <= spr <= 919:
+                        self.time.add(lo + 4 * i)
+        self.hooked = set(self.fctiwz) | set(self.kind) | after | set(self.divides) | self.time
+        for lo, hi in text:
+            self.mu.hook_add(UC_HOOK_CODE, self._code, None, lo, hi - 4)
 
     def _unmapped(self, mu, access, address, size, value, data):
         self.stop = (1, mu.reg_read(P.UC_PPC_REG_PC), address)
@@ -142,11 +150,49 @@ class Original:
         if b == 0 or ((word >> 1) & 0x1FF == 491 and a == 0x80000000 and b == 0xFFFFFFFF):
             self.divided_by_zero = True
 
-    def _fctiwz(self, mu, address, size, data):
+    def _read(self, ea, n):
+        if MEM1 <= ea and ea + n <= MEM1 + MEM1_SIZE:
+            return bytes(self.mu.mem_read(ea, n))
+        return None
+
+    def _write(self, ea, blob):
+        if MEM1 <= ea and ea + len(blob) <= MEM1 + MEM1_SIZE:
+            self.mu.mem_write(ea, blob)
+            return True
+        return False
+
+    def _code(self, mu, address, size, data):
+        if address not in self.hooked:
+            return
+        if address in self.divides:
+            self._divide(mu, address, size, self.divides[address])
+        if address in self.time:
+            self.read_time = True
+        if self.dup is not None:  # the instruction before wrote both halves
+            self.model.ps1[self.dup] = mu.reg_read(P.UC_PPC_REG_FPR0 + self.dup)
+            self.dup = None
+        self._fctiwz(mu, address)
+        k = self.kind.get(address)
+        if k is None:
+            return
+        kind, w = k
+        if kind == "dup":
+            self.dup = (w >> 21) & 31
+            return
+        stop = paired.execute_spr(self.model, address, w) if w >> 26 == 31 else self.model.execute(address, w)
+        if stop is not None:
+            self.stop = stop
+            mu.emu_stop()
+            return
+        mu.reg_write(P.UC_PPC_REG_PC, address + 4)  # emulated: skip it
+
+    def _fctiwz(self, mu, address):
         # QEMU 5 (Unicorn 2.1) leaves fctiwz's high word 0, which the
         # architecture leaves undefined and the 750 family sets to 0xFFF80000,
         # and gives 0x80000000 for a positive overflow, where the architecture
         # says 0x7FFFFFFF. The hook on the next instruction puts both right.
+        if address not in self.fctiwz and self.pending is None:
+            return
         if self.pending is not None:
             frd, overflow = self.pending
             low = 0x7FFFFFFF if overflow else mu.reg_read(P.UC_PPC_REG_FPR0 + frd) & 0xFFFFFFFF
@@ -162,7 +208,8 @@ class Original:
             self.stop = (5, address, 0)
             mu.emu_stop()
 
-    def run(self, fn, regs, fprs, writes):
+    def run(self, fn, regs, fp, writes):
+        fprs, ps1, gqr = fp
         # Unicorn 2.1's write hook misses dcbz, stmw and stswi, so changes are
         # found by comparing all of MEM1 with the trial's starting state.
         mu = self.mu
@@ -179,6 +226,9 @@ class Original:
         for i in range(32):
             mu.reg_write(P.UC_PPC_REG_FPR0 + i, fprs[i])
         self.pending = None
+        self.dup = None
+        self.model.ps1 = list(ps1)
+        self.model.gqr = list(gqr)
         # Unicorn 2.1's register API stores XER without setting the SO, OV
         # and CA flags the instructions use, so XER goes in through mtxer:
         # r0 carries it to the stub, which then restores r0.
@@ -186,6 +236,7 @@ class Original:
         mu.ctl_remove_cache(STUB, STUB + 16)  # it changed since Unicorn last translated it
         self.stop = None
         self.divided_by_zero = False
+        self.read_time = False
         self.entry = fn
         timeout = False
         try:
@@ -230,7 +281,7 @@ class Original:
             initial[addr - MEM1:addr - MEM1 + len(blob)] = original
         if timeout:
             return None
-        return status, out, changed, [mu.reg_read(P.UC_PPC_REG_FPR0 + i) for i in range(32)], 0
+        return status, out, changed, [mu.reg_read(P.UC_PPC_REG_FPR0 + i) for i in range(32)], 0, list(self.model.ps1)
 
 
 class Lifted:
@@ -258,19 +309,22 @@ class Lifted:
                 status = struct.unpack("<3I", rd(12))
                 out = list(struct.unpack("<37I", rd(37 * 4)))
                 fprs = list(struct.unpack("<32Q", rd(32 * 8)))
+                ps1 = list(struct.unpack("<32Q", rd(32 * 8)))
                 flushes = struct.unpack("<I", rd(4))[0]
                 n = struct.unpack("<I", rd(4))[0]
                 changed = {}
                 for _ in range(n):
                     addr = struct.unpack("<I", rd(4))[0]
                     changed[addr] = rd(32)
-                results.put((status, out, changed, fprs, flushes))
+                results.put((status, out, changed, fprs, flushes, ps1))
         except (EOFError, OSError, ValueError):
             results.put(None)  # the harness exited (or was killed)
 
-    def run(self, fn, regs, fprs, writes, timeout=20):
+    def run(self, fn, regs, fp, writes, timeout=20):
         """The result, or None if the lifted code didn't finish in time (the harness is restarted)."""
-        msg = struct.pack("<37I", fn, *regs) + struct.pack("<32Q", *fprs) + struct.pack("<I", len(writes))
+        fprs, ps1, gqr = fp
+        msg = (struct.pack("<37I", fn, *regs) + struct.pack("<32Q", *fprs) + struct.pack("<32Q", *ps1) +
+               struct.pack("<8I", *gqr) + struct.pack("<I", len(writes)))
         for addr, blob in writes:
             msg += struct.pack("<II", addr, len(blob)) + blob
         self.p.stdin.write(msg)
@@ -312,7 +366,24 @@ def random_state(rng):
         heap[i] = HEAP + ((offset[i] * (HEAP_SIZE - 0x100)) >> 16 & ~3)
     heap.byteswap()  # guest words are big-endian
     stack = rng.randbytes(STACK_FILL)
-    return regs, [fpr_value(rng) for _ in range(32)], [(HEAP, heap.tobytes()), (STACK_TOP - STACK_FILL, stack)]
+    fp = ([fpr_value(rng) for _ in range(32)], [fpr_value(rng) for _ in range(32)], gqr_values(rng))
+    return regs, fp, [(HEAP, heap.tobytes()), (STACK_TOP - STACK_FILL, stack)]
+
+
+def gqr_values(rng):
+    """GQR0 is 0 (single, unscaled) most of the time, as the OS sets it and
+    compiled code assumes; the rest get random types and scales (no reserved
+    type)."""
+    def one():
+        def half():
+            return rng.choice([0, 0, 4, 5, 6, 7]), rng.choice([0, 0, rng.randrange(-8, 9), rng.randrange(-32, 32)]) & 0x3F
+        lt, ls = half()
+        st, ss = half()
+        return ls << 24 | lt << 16 | ss << 8 | st
+    g = [one() for _ in range(8)]
+    if rng.random() < 0.7:
+        g[0] = 0
+    return g
 
 
 def fpr_value(rng):
@@ -345,7 +416,7 @@ def known_difference(a, b, image, divided_by_zero, reads_time):
         return ("divide by zero: undefined in the architecture; lifted code gives Broadway's result, "
                 "Unicorn leaves the dividend")
     if reads_time:
-        return "the call tree reads the time base or a special register, which differ from Unicorn's by design"
+        return "the trial read the time base or a special register, which differ from Unicorn's by design"
     if sa[0] == 1 and MEM1 <= sa[1] < MEM1 + MEM1_SIZE:
         word = struct.unpack(">I", image[sa[1] - MEM1:sa[1] - MEM1 + 4])[0]
         if (word >> 26, (word >> 1) & 0x3FF) in CACHE_OPS:
@@ -364,7 +435,7 @@ def known_difference(a, b, image, divided_by_zero, reads_time):
 
 def compare(a, b):
     """'' if equal, else what differs."""
-    (sa, oa, ma, fa, _), (sb, ob, mb, fb, _) = a, b
+    (sa, oa, ma, fa, _, qa), (sb, ob, mb, fb, _, qb) = a, b
     if sa[0] != sb[0]:
         return f"stopped differently: original {STATUS[sa[0]] if isinstance(sa[0], int) else sa}, lifted {STATUS[sb[0]]} ({sb[1]:08X} {sb[2]:08X})"
     if sa[0] in (1, 5) and (sa[1], sa[2]) != (sb[1], sb[2]):
@@ -382,6 +453,8 @@ def compare(a, b):
     for i in range(32):
         if fa[i] != fb[i]:
             diffs.append(f"f{i} {fa[i]:016X}/{fb[i]:016X}")
+        if qa[i] != qb[i]:
+            diffs.append(f"ps1 f{i} {qa[i]:016X}/{qb[i]:016X}")
     if ma != mb:
         addrs = sorted(set(ma) ^ set(mb) | {k for k in ma if k in mb and ma[k] != mb[k]})
         diffs.append(f"memory at {', '.join(f'{x:08X}' for x in addrs[:4])}")
@@ -392,10 +465,10 @@ def compare(a, b):
 _worker = {}
 
 
-def init_worker(harness, dol, not_lifted, time_fns, trials, seed):
+def init_worker(harness, dol, not_lifted, trials, seed):
     image, text = load_dol(dol)
     _worker.update(original=Original(image, text, not_lifted), lifted=Lifted(harness, dol), image=image,
-                   time=time_fns, trials=trials, seed=seed)
+                   trials=trials, seed=seed)
 
 
 def test_function(fn):
@@ -404,17 +477,17 @@ def test_function(fn):
     rng = random.Random(w["seed"] << 32 | fn)  # this function's trials, whatever else runs
     counts, stops, bad = collections.Counter(), collections.Counter(), None
     for _ in range(w["trials"]):
-        regs, fprs, writes = random_state(rng)
+        regs, fp, writes = random_state(rng)
         # Unicorn enters through the stub (see Original.run). It is part of the
         # starting state on both sides, like the heap and stack: a function
         # that reads memory down to it must see the same bytes either way.
         writes.append((STUB, struct.pack(">4I", 0x7C0103A6, 0x3C000000 | regs[0] >> 16, 0x60000000 | regs[0] & 0xFFFF,
                                          0x48000000 | (fn - (STUB + 12)) & 0x03FFFFFC)))
-        a = w["original"].run(fn, regs, fprs, writes)
+        a = w["original"].run(fn, regs, fp, writes)
         if a is None:
             counts["skipped: runs too long under Unicorn"] += 1
             continue
-        b = w["lifted"].run(fn, regs, fprs, writes)
+        b = w["lifted"].run(fn, regs, fp, writes)
         if b is None:
             counts["MISMATCH"] += 1
             bad = bad or "lifted code didn't finish; the original did"
@@ -427,7 +500,7 @@ def test_function(fn):
                                   if b[0][2] == 0xFFFFFFFF else "unsupported special register or system call")] += 1
             continue
         why = compare(a, b)
-        known = known_difference(a, b, w["image"], w["original"].divided_by_zero, fn in w["time"]) if why else None
+        known = known_difference(a, b, w["image"], w["original"].divided_by_zero, w["original"].read_time) if why else None
         if known:
             counts["known: " + known] += 1
         elif why:
@@ -474,7 +547,7 @@ def main():
     if not lifted:
         sys.exit("difftest: no functions selected")
     jobs = max(1, min(args.jobs, len(lifted)))
-    init = (args.harness, args.dol, not_lifted, time_readers(args.gen), args.trials, args.seed)
+    init = (args.harness, args.dol, not_lifted, args.trials, args.seed)
 
     counts, stops, bad = collections.Counter(), collections.Counter(), {}
     started = time.monotonic()

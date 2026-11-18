@@ -11,6 +11,19 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-11-18
+Lifter slice 4, paired singles: 8,103 of the game's 8,171 functions lift (554 more). The rest are privileged code and FPSCR access in libraries that get replaced, plus five functions that use Broadway's estimate instructions. A reference model stands in for Unicorn, which has no paired singles: 64,824 trials, 0 unexplained mismatches.
+
+### Added
+- **Lifter, slice 4**, from IBM's 750CL user's manual: each FPR's ps1 (`c.ps1[]`); quantised loads and stores through the GQRs (types, scales, rounding toward zero, clamping, NaN and infinity by sign, W = 1); paired arithmetic, multiply-adds, sums, merges, moves and compares. `lfs` and single-precision results now fill both halves; double-precision instructions leave ps1 alone, which CodeWarrior's FPR saves in prologues rely on. A reserved GQR type, or a multiplier lane that isn't a single, stops.
+- **`fsel`**, which stops on a denormal selector under non-IEEE mode.
+- **Difftest reference model for paired singles** (`tools/difftest/paired.py`), independent of the lifted code's helpers: emulates paired-single instructions and GQR moves in a code hook and keeps ps1. Trials get random ps1 values and GQRs; ps1 is compared bit for bit.
+- **Tests** for GQR decoding, quantisation, `psq_l`/`psq_st` and the lifter's paired-single output.
+
+### Changed
+- **Difftest hooks:** one code hook per text section, filtered in the driver, where there was one per instruction of interest. Unicorn scans its hooks linearly; trials are now faster than before slice 4 (19 ms on one core).
+- **Time-base and special-register reads are found dynamically**, in the trial that makes them, replacing a static call-tree analysis that couldn't see calls through function tables and excused whole call trees.
+
 ## [0.7.0] - 2026-11-18
 Lifter slice 3, floating point: 7,549 of the game's 8,171 functions lift (1,175 more), in the non-IEEE mode the game sets, and every one runs against the original code: 60,392 trials, 0 unexplained mismatches.
 

@@ -27,7 +27,8 @@ struct Context {
     uint32_t reserve = 0;        // lwarx reservation held
     uint32_t reserve_addr = 0;
     uint32_t spr[1024] = {};     // other special-purpose registers (GQRs, HID2, ...), by number
-    double f[32] = {};           // FPRs (paired singles' second halves come with slice 4)
+    double f[32] = {};           // FPRs; in paired-single mode, each one's ps0
+    double ps1[32] = {};         // each FPR's ps1 (a single-precision value, held as a double)
 };
 
 // What stops lifted code: an invalid memory access, an unknown indirect target,
@@ -355,6 +356,76 @@ inline uint32_t stfs(double d) {
     if (e < 874) return sign;
     const uint64_t frac = 0x8000000000000000ull | (x << 11);  // 1.f, left-aligned
     return sign | static_cast<uint32_t>((frac >> (897 - e)) >> 40);
+}
+
+// ---- paired singles (slice 4) ----
+// Lifted code runs in paired-single mode (HID2[PSE] = 1, set by the OS at
+// boot; the replacing runtime must keep it so). Each FPR holds a pair: ps0 is
+// the FPR as double-precision instructions see it, ps1 a second value. From
+// the 750CL user's manual: single-precision arithmetic, frsp and lfs write
+// their result to both halves; double-precision instructions and fmr write ps0
+// and leave ps1 alone (CodeWarrior's prologues and epilogues rely on this when
+// they save an FPR with stfd and psq_st and restore it with psq_l then lfd);
+// stfs stores ps0. The manual leaves ps1 after frsp undefined: it gets the
+// result, as for the other single-precision instructions.
+//
+// psq_l/psq_st convert through a GQR (SPR 912-919): a type (0 single,
+// 4 u8, 5 u16, 6 s8, 7 s16; 1-3 reserved) and a signed 6-bit scale S, for
+// loads and stores separately. A load gives I * 2^-S; a store gives
+// I * 2^S rounded toward zero and clamped to the type, where +inf and NaNs
+// with sign 0 clamp high, -inf and NaNs with sign 1 low. A single passes
+// through unconverted, except that a store of a denormal stores 0.0.
+inline unsigned gqr_ld_type(uint32_t g) { return (g >> 16) & 7; }
+inline int gqr_ld_scale(uint32_t g) { return static_cast<int32_t>(g << 2) >> 26; }
+inline unsigned gqr_st_type(uint32_t g) { return g & 7; }
+inline int gqr_st_scale(uint32_t g) { return static_cast<int32_t>(g << 18) >> 26; }
+inline uint32_t quant_size(unsigned type) { return type == 0 ? 4 : (type & 1) ? 2 : 1; }
+
+inline double dequantize(uint32_t ea, unsigned type, int scale) {
+    switch (type) {
+    case 4: return std::ldexp(static_cast<double>(ld8(ea)), -scale);
+    case 5: return std::ldexp(static_cast<double>(ld16(ea)), -scale);
+    case 6: return std::ldexp(static_cast<double>(static_cast<int8_t>(ld8(ea))), -scale);
+    case 7: return std::ldexp(static_cast<double>(static_cast<int16_t>(ld16(ea))), -scale);
+    default: return lfs(ld32(ea));
+    }
+}
+inline void quantize(uint32_t ea, double v, unsigned type, int scale) {
+    if (type == 0) {
+        uint32_t w = stfs(v);
+        if ((w & 0x7F800000u) == 0 && (bits(v) & 0x7FFFFFFFFFFFFFFFull) != 0) w = 0;  // a denormal stores 0.0
+        st32(ea, w);
+        return;
+    }
+    const double lo = type == 6 ? -128.0 : type == 7 ? -32768.0 : 0.0;
+    const double hi = type == 4 ? 255.0 : type == 5 ? 65535.0 : type == 6 ? 127.0 : 32767.0;
+    double x;
+    if (std::isnan(v)) x = std::signbit(v) ? lo : hi;
+    else {
+        x = std::trunc(std::ldexp(v, scale));
+        x = x < lo ? lo : x > hi ? hi : x;
+    }
+    const auto i = static_cast<uint32_t>(static_cast<int32_t>(x));
+    if (type & 1) st16(ea, i);
+    else st8(ea, i);
+}
+// psq_l: W = 1 loads ps0 only, and ps1 becomes 1.0. Both loads happen before
+// either half is written, so a fault leaves frD as it was.
+inline void psq_l(double& p0, double& p1, uint32_t ea, bool w, uint32_t gqr, uint32_t pc) {
+    const unsigned t = gqr_ld_type(gqr);
+    if (t >= 1 && t <= 3) fp_unknown(pc);  // reserved type
+    const int s = gqr_ld_scale(gqr);
+    const double a = dequantize(ea, t, s);
+    const double b = w ? 1.0 : dequantize(ea + quant_size(t), t, s);
+    p0 = a;
+    p1 = b;
+}
+inline void psq_st(double p0, double p1, uint32_t ea, bool w, uint32_t gqr, uint32_t pc) {
+    const unsigned t = gqr_st_type(gqr);
+    if (t >= 1 && t <= 3) fp_unknown(pc);
+    const int s = gqr_st_scale(gqr);
+    quantize(ea, p0, t, s);
+    if (!w) quantize(ea + quant_size(t), p1, t, s);
 }
 
 // ---- provided by the runtime (dispatch.cpp and the host) ----

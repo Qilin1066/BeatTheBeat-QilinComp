@@ -47,16 +47,21 @@ private:
     std::string ret();
     void record(const Insn& in, const std::string& rd);
     void floating(uint32_t pc, const Insn& in);
+    void paired(uint32_t pc, const Insn& in);
     void use(unsigned r) { gprs_.insert(r); }
-    std::string F(unsigned n) {
+    std::string F(unsigned n) {  // an FPR (its ps0)
         fprs_.insert(n);
         return std::format("f{}", n);
+    }
+    std::string P(unsigned n) {  // an FPR's ps1
+        ps1_.insert(n);
+        return std::format("p{}", n);
     }
 
     const Cfg& cfg_;
     const Function& f_;
     std::string body_;
-    std::set<unsigned> gprs_, fprs_;
+    std::set<unsigned> gprs_, fprs_, ps1_;
     std::set<uint32_t> targets_;  // labels that something jumps to
     bool out_ = false, in_ = false;
 };
@@ -119,7 +124,7 @@ void Emitter::record(const Insn& in, const std::string& rd) {
 void Emitter::instruction(uint32_t pc, const Insn& in) {
     const ppc::Spec& s = ppc::spec(in.op);
     if (s.flags & ppc::kPrivileged) throw Unsupported{std::format("privileged: {}", s.name)};
-    if (s.flags & ppc::kPaired) throw Unsupported{std::format("paired single (slice 4): {}", s.name)};
+    if (s.flags & ppc::kPaired) return paired(pc, in);
     if (s.flags & ppc::kFloat) return floating(pc, in);
 
     const unsigned rd = in.rd(), ra = in.ra(), rb = in.rb();
@@ -502,9 +507,10 @@ void Emitter::floating(uint32_t pc, const Insn& in) {
 
     auto load = [&](const std::string& ea, bool update, bool single) {
         if (a) use(a);
-        line(std::format("{{ const uint32_t ea = {}; QILIN_PC({}); {} = {};{} }}", ea, hex(pc), F(d),
+        // In paired-single mode lfs fills both halves; lfd writes ps0 only.
+        line(std::format("{{ const uint32_t ea = {}; QILIN_PC({}); {} = {};{}{} }}", ea, hex(pc), F(d),
                          single ? "rt::lfs(rt::ld32(ea))" : "rt::dbl(rt::ld64(ea))",
-                         update ? std::format(" {} = ea;", R(a)) : ""));
+                         single ? std::format(" {} = {};", P(d), F(d)) : "", update ? std::format(" {} = ea;", R(a)) : ""));
     };
     auto store = [&](const std::string& ea, bool update, const char* how) {
         if (a) use(a);
@@ -516,6 +522,8 @@ void Emitter::floating(uint32_t pc, const Insn& in) {
                          update ? std::format(" {} = ea;", R(a)) : ""));
     };
     auto set = [&](const std::string& expr) { line(std::format("{} = {};", F(d), expr)); };
+    // Single-precision results go to both halves in paired-single mode.
+    auto set_s = [&](const std::string& expr) { line(std::format("{0} = {1}; {2} = {0};", F(d), expr, P(d))); };
     // A single-precision multiply: Broadway rounds frC first, by a rule no
     // source here pins down, so lifted code only goes on when that's a no-op.
     auto single_frc = [&] { line(std::format("if (!rt::single_significand({})) rt::fp_unknown({});", F(cc), hex(pc))); };
@@ -544,19 +552,19 @@ void Emitter::floating(uint32_t pc, const Insn& in) {
     case Op::fsub: set(std::format("rt::fsub({}, {})", x(a), x(b))); break;
     case Op::fmul: set(std::format("rt::fmul({}, {})", x(a), x(cc))); break;
     case Op::fdiv: set(std::format("rt::fdiv({}, {})", x(a), x(b))); break;
-    case Op::fadds: set(std::format("rt::fadds({}, {})", x(a), x(b))); break;
-    case Op::fsubs: set(std::format("rt::fsubs({}, {})", x(a), x(b))); break;
-    case Op::fmuls: single_frc(); set(std::format("rt::fmuls({}, {})", x(a), x(cc))); break;
-    case Op::fdivs: set(std::format("rt::fdivs({}, {})", x(a), x(b))); break;
+    case Op::fadds: set_s(std::format("rt::fadds({}, {})", x(a), x(b))); break;
+    case Op::fsubs: set_s(std::format("rt::fsubs({}, {})", x(a), x(b))); break;
+    case Op::fmuls: single_frc(); set_s(std::format("rt::fmuls({}, {})", x(a), x(cc))); break;
+    case Op::fdivs: set_s(std::format("rt::fdivs({}, {})", x(a), x(b))); break;
     case Op::fmadd: set(std::format("rt::fma_({}, {}, {}, false, false)", x(a), x(cc), x(b))); break;
     case Op::fmsub: set(std::format("rt::fma_({}, {}, {}, true, false)", x(a), x(cc), x(b))); break;
     case Op::fnmadd: set(std::format("rt::fma_({}, {}, {}, false, true)", x(a), x(cc), x(b))); break;
     case Op::fnmsub: set(std::format("rt::fma_({}, {}, {}, true, true)", x(a), x(cc), x(b))); break;
-    case Op::fmadds: single_frc(); set(std::format("rt::fmas({}, {}, {}, false, false)", x(a), x(cc), x(b))); break;
-    case Op::fmsubs: single_frc(); set(std::format("rt::fmas({}, {}, {}, true, false)", x(a), x(cc), x(b))); break;
-    case Op::fnmadds: single_frc(); set(std::format("rt::fmas({}, {}, {}, false, true)", x(a), x(cc), x(b))); break;
-    case Op::fnmsubs: single_frc(); set(std::format("rt::fmas({}, {}, {}, true, true)", x(a), x(cc), x(b))); break;
-    case Op::frsp: set(std::format("rt::frsp({})", x(b))); break;
+    case Op::fmadds: single_frc(); set_s(std::format("rt::fmas({}, {}, {}, false, false)", x(a), x(cc), x(b))); break;
+    case Op::fmsubs: single_frc(); set_s(std::format("rt::fmas({}, {}, {}, true, false)", x(a), x(cc), x(b))); break;
+    case Op::fnmadds: single_frc(); set_s(std::format("rt::fmas({}, {}, {}, false, true)", x(a), x(cc), x(b))); break;
+    case Op::fnmsubs: single_frc(); set_s(std::format("rt::fmas({}, {}, {}, true, true)", x(a), x(cc), x(b))); break;
+    case Op::frsp: set_s(std::format("rt::frsp({})", x(b))); break;
     case Op::fctiwz: set(std::format("rt::fctiwz({})", x(b))); break;
     case Op::fmr: set(x(b)); break;
     case Op::fneg: set(std::format("rt::fneg({})", x(b))); break;
@@ -570,6 +578,14 @@ void Emitter::floating(uint32_t pc, const Insn& in) {
                          "cr = rt::set_crf(cr, {3}, rt::fcmp({0}, {1}));",
                          x(a), x(b), hex(pc), in.crfd()));
         break;
+    case Op::fsel:
+        // frA >= 0 (either zero included) selects frC, anything else (NaN
+        // too) frB. A denormal frA under non-IEEE mode could be read either
+        // way, so it stops. ps1 is undefined after fsel in the manual; as a
+        // double-precision instruction, it leaves it alone.
+        line(std::format("if (rt::denormal_d({0})) rt::fp_unknown({1}); {2} = {0} >= 0.0 ? {3} : {4};", x(a), hex(pc), F(d),
+                         x(cc), x(b)));
+        break;
     case Op::fres:
     case Op::frsqrte:
         throw Unsupported{std::format("floating-point estimate (Broadway's table not known): {}", s.name)};
@@ -582,6 +598,110 @@ void Emitter::floating(uint32_t pc, const Insn& in) {
         throw Unsupported{std::format("FPSCR access (only in replaced code; FPSCR not modelled): {}", s.name)};
     default:
         throw Unsupported{std::format("floating point not used by the game's lifted code: {}", s.name)};
+    }
+}
+
+// Slice 4: paired singles. Each lane works as the single-precision
+// instruction of the same name does (rt::fadds and friends: non-IEEE mode,
+// NaNs, rounding to single); a pair is computed into temporaries before
+// either half is written, since frD may also be a source.
+void Emitter::paired(uint32_t pc, const Insn& in) {
+    const ppc::Spec& s = ppc::spec(in.op);
+    if ((s.flags & ppc::kRc) && in.rc())
+        throw Unsupported{std::format("paired-single record form (CR1 from FPSCR, not modelled): {}.", s.name)};
+    const unsigned d = in.rd(), a = in.ra(), b = in.rb(), cc = in.rc_reg();
+    auto pair = [&](const std::string& x0, const std::string& x1) {
+        line(std::format("{{ const double x0 = {}, x1 = {}; {} = x0; {} = x1; }}", x0, x1, F(d), P(d)));
+    };
+    // The multiplier lanes a multiply uses must be singles (see single_frc in floating()).
+    auto frc = [&](const std::vector<std::string>& lanes) {
+        std::string cond;
+        for (const std::string& l : lanes) cond += (cond.empty() ? "" : " || ") + std::format("!rt::single_significand({})", l);
+        line(std::format("if ({}) rt::fp_unknown({});", cond, hex(pc)));
+    };
+    auto quant = [&](bool load, const std::string& ea, unsigned w, unsigned i, bool update) {
+        if (a) use(a);
+        const std::string gqr = std::format("c.spr[{}]", 912 + i);
+        const std::string op = load ? std::format("rt::psq_l({}, {}, ea, {}, {}, {});", F(d), P(d), w ? "true" : "false", gqr, hex(pc))
+                                    : std::format("rt::psq_st({}, {}, ea, {}, {}, {});", F(d), P(d), w ? "true" : "false", gqr, hex(pc));
+        line(std::format("{{ const uint32_t ea = {}; QILIN_PC({}); {}{} }}", ea, hex(pc), op,
+                         update ? std::format(" {} = ea;", R(a)) : ""));
+    };
+    const std::string ea12 = a ? std::format("r{} + {}", a, hex(static_cast<uint32_t>(in.psq_d()))) : hex(static_cast<uint32_t>(in.psq_d()));
+    auto cmp = [&](const std::string& x, const std::string& y) {
+        line(std::format("if (rt::denormal_d({0}) || rt::denormal_d({1})) rt::fp_unknown({2}); "
+                         "cr = rt::set_crf(cr, {3}, rt::fcmp({0}, {1}));",
+                         x, y, hex(pc), in.crfd()));
+    };
+    // Registers are named (and so declared) only where an instruction uses them.
+    auto fa = [&] { return F(a); };
+    auto fb = [&] { return F(b); };
+    auto fc = [&] { return F(cc); };
+    auto pa = [&] { return P(a); };
+    auto pb = [&] { return P(b); };
+    auto pc_ = [&] { return P(cc); };
+    switch (in.op) {
+    case Op::psq_l: quant(true, ea12, in.psq_w(), in.psq_i(), false); break;
+    case Op::psq_lu: quant(true, ea12, in.psq_w(), in.psq_i(), true); break;
+    case Op::psq_st: quant(false, ea12, in.psq_w(), in.psq_i(), false); break;
+    case Op::psq_stu: quant(false, ea12, in.psq_w(), in.psq_i(), true); break;
+    case Op::psq_lx: use(b); quant(true, ea_x(in), in.psqx_w(), in.psqx_i(), false); break;
+    case Op::psq_lux: use(b); quant(true, ea_x(in), in.psqx_w(), in.psqx_i(), true); break;
+    case Op::psq_stx: use(b); quant(false, ea_x(in), in.psqx_w(), in.psqx_i(), false); break;
+    case Op::psq_stux: use(b); quant(false, ea_x(in), in.psqx_w(), in.psqx_i(), true); break;
+
+    case Op::ps_add: pair(std::format("rt::fadds({}, {})", fa(), fb()), std::format("rt::fadds({}, {})", pa(), pb())); break;
+    case Op::ps_sub: pair(std::format("rt::fsubs({}, {})", fa(), fb()), std::format("rt::fsubs({}, {})", pa(), pb())); break;
+    case Op::ps_div: pair(std::format("rt::fdivs({}, {})", fa(), fb()), std::format("rt::fdivs({}, {})", pa(), pb())); break;
+    case Op::ps_mul:
+        frc({fc(), pc_()});
+        pair(std::format("rt::fmuls({}, {})", fa(), fc()), std::format("rt::fmuls({}, {})", pa(), pc_()));
+        break;
+    case Op::ps_muls0:
+        frc({fc()});
+        pair(std::format("rt::fmuls({}, {})", fa(), fc()), std::format("rt::fmuls({}, {})", pa(), fc()));
+        break;
+    case Op::ps_muls1:
+        frc({pc_()});
+        pair(std::format("rt::fmuls({}, {})", fa(), pc_()), std::format("rt::fmuls({}, {})", pa(), pc_()));
+        break;
+    case Op::ps_madd:
+    case Op::ps_msub:
+    case Op::ps_nmadd:
+    case Op::ps_nmsub: {
+        const bool sub = in.op == Op::ps_msub || in.op == Op::ps_nmsub, neg = in.op == Op::ps_nmadd || in.op == Op::ps_nmsub;
+        frc({fc(), pc_()});
+        pair(std::format("rt::fmas({}, {}, {}, {}, {})", fa(), fc(), fb(), sub, neg),
+             std::format("rt::fmas({}, {}, {}, {}, {})", pa(), pc_(), pb(), sub, neg));
+        break;
+    }
+    case Op::ps_madds0:
+        frc({fc()});
+        pair(std::format("rt::fmas({}, {}, {}, false, false)", fa(), fc(), fb()), std::format("rt::fmas({}, {}, {}, false, false)", pa(), fc(), pb()));
+        break;
+    case Op::ps_madds1:
+        frc({pc_()});
+        pair(std::format("rt::fmas({}, {}, {}, false, false)", fa(), pc_(), fb()), std::format("rt::fmas({}, {}, {}, false, false)", pa(), pc_(), pb()));
+        break;
+    case Op::ps_sum0: pair(std::format("rt::fadds({}, {})", fa(), pb()), pc_()); break;
+    case Op::ps_sum1: pair(fc(), std::format("rt::fadds({}, {})", fa(), pb())); break;
+    case Op::ps_merge00: pair(fa(), fb()); break;
+    case Op::ps_merge01: pair(fa(), pb()); break;
+    case Op::ps_merge10: pair(pa(), fb()); break;
+    case Op::ps_merge11: pair(pa(), pb()); break;
+    case Op::ps_mr: pair(fb(), pb()); break;
+    case Op::ps_neg: pair(std::format("rt::fneg({})", fb()), std::format("rt::fneg({})", pb())); break;
+    case Op::ps_abs: pair(std::format("rt::fabs_({})", fb()), std::format("rt::fabs_({})", pb())); break;
+    case Op::ps_nabs: pair(std::format("rt::fneg(rt::fabs_({}))", fb()), std::format("rt::fneg(rt::fabs_({}))", pb())); break;
+    case Op::ps_cmpu0:
+    case Op::ps_cmpo0: cmp(fa(), fb()); break;
+    case Op::ps_cmpu1:
+    case Op::ps_cmpo1: cmp(pa(), pb()); break;
+    case Op::ps_res:
+    case Op::ps_rsqrte:
+        throw Unsupported{std::format("floating-point estimate (Broadway's table not known): {}", s.name)};
+    default:
+        throw Unsupported{std::format("paired single not used by the game's lifted code: {}", s.name)};
     }
 }
 
@@ -634,12 +754,18 @@ LiftResult Emitter::run() {
         for (unsigned g : fprs_) code += std::format(" [[maybe_unused]] double f{0} = c.f[{0}];", g);
         code += "\n";
     }
+    if (!ps1_.empty()) {
+        code += "   ";
+        for (unsigned g : ps1_) code += std::format(" [[maybe_unused]] double p{0} = c.ps1[{0}];", g);
+        code += "\n";
+    }
     code += "    [[maybe_unused]] uint32_t lr = c.lr; [[maybe_unused]] uint32_t ctr = c.ctr;"
             " [[maybe_unused]] uint32_t cr = c.cr; [[maybe_unused]] uint32_t xer = c.xer;\n";
     auto sync = [&](bool to_context) {
         std::string s;
         for (unsigned g : gprs_) s += to_context ? std::format(" c.r[{0}] = r{0};", g) : std::format(" r{0} = c.r[{0}];", g);
         for (unsigned g : fprs_) s += to_context ? std::format(" c.f[{0}] = f{0};", g) : std::format(" f{0} = c.f[{0}];", g);
+        for (unsigned g : ps1_) s += to_context ? std::format(" c.ps1[{0}] = p{0};", g) : std::format(" p{0} = c.ps1[{0}];", g);
         s += to_context ? " c.lr = lr; c.ctr = ctr; c.cr = cr; c.xer = xer;" : " lr = c.lr; ctr = c.ctr; cr = c.cr; xer = c.xer;";
         return s;
     };

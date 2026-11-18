@@ -7,10 +7,11 @@
 // Guest memory is MEM1 (24 MB at 0x80000000) holding the DOL image, as in
 // the Unicorn run; anything else stops with a memory fault (checked memory).
 // All integers are little-endian u32.
-//   case:   fn, r0..r31, lr, ctr, cr, xer, f0..f31 (u64 bits), n, then n x (addr, len, bytes)
+//   case:   fn, r0..r31, lr, ctr, cr, xer, f0..f31 and ps1 0..31 (u64 bits), GQR0..7, n, then
+//           n x (addr, len, bytes)
 //           written over the image
 //   result: status (0 = returned, else 1 + rt::Stop::Kind), stop pc, stop value,
-//           r0..r31, lr, ctr, cr, xer, ret, f0..f31 (u64 bits), how many values non-IEEE
+//           r0..r31, lr, ctr, cr, xer, ret, f0..f31 and ps1 0..31 (u64 bits), how many values non-IEEE
 //           mode flushed to zero, then the changed 32-byte blocks of MEM1:
 //           count, count x (addr, 32 bytes)
 #include <cstdio>
@@ -112,6 +113,8 @@ int main(int argc, char** argv) {
         for (uint32_t& r : c.r) read_u32(r);
         read_u32(c.lr), read_u32(c.ctr), read_u32(c.cr), read_u32(c.xer);
         for (double& f : c.f) read_f64(f);
+        for (double& f : c.ps1) read_f64(f);
+        for (unsigned i = 0; i < 8; ++i) read_u32(c.spr[912 + i]);
         uint32_t writes = 0;
         read_u32(writes);
         written.clear();
@@ -144,6 +147,7 @@ int main(int argc, char** argv) {
         for (uint32_t r : c.r) write_u32(r);
         write_u32(c.lr), write_u32(c.ctr), write_u32(c.cr), write_u32(c.xer), write_u32(c.ret);
         for (double f : c.f) write_f64(f);
+        for (double f : c.ps1) write_f64(f);
         write_u32(rt::g_ni_flushes);
         changed.clear();
         for (uint32_t page = 0; page < kMem1Size; page += kPage) {

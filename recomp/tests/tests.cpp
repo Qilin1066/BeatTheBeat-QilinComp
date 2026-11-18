@@ -663,6 +663,75 @@ void test_float() {
     CHECK(rt::single_significand(1.5) && rt::single_significand(rt::lfs(0x3DCCCCCDu)) && !rt::single_significand(0.1));
 }
 
+void test_paired() {
+    using rt::bits;
+    using rt::dbl;
+    // GQR fields (750CL manual, table 2-19): LD_SCALE bits 2-7, LD_TYPE 13-15, ST_SCALE 18-23, ST_TYPE 29-31.
+    const uint32_t g = 0x3F07'0205u;  // load: scale -1, type 7 (s16); store: scale 2, type 5 (u16)
+    CHECK(rt::gqr_ld_scale(g) == -1 && rt::gqr_ld_type(g) == 7 && rt::gqr_st_scale(g) == 2 && rt::gqr_st_type(g) == 5);
+    CHECK(rt::quant_size(0) == 4 && rt::quant_size(4) == 1 && rt::quant_size(5) == 2 && rt::quant_size(6) == 1 &&
+          rt::quant_size(7) == 2);
+
+    std::vector<uint8_t> mem(0x100, 0);
+    uint8_t* const saved = rt::g_mem;
+    rt::g_mem = mem.data() - 0x1000;  // guest 0x1000-0x10FF (unchecked memory in this build)
+    // Stores: round toward zero, then clamp; +inf and positive NaNs clamp high, -inf and negative NaNs low.
+    auto st = [&](double v, unsigned type, int scale) {
+        rt::quantize(0x1000, v, type, scale);
+        return type == 0 ? uint32_t(mem[0]) << 24 | uint32_t(mem[1]) << 16 | uint32_t(mem[2]) << 8 | mem[3]
+               : (type & 1) ? uint32_t(mem[0]) << 8 | mem[1]
+                            : uint32_t(mem[0]);
+    };
+    CHECK(st(100.0, 4, 1) == 200 && st(100.0, 4, 2) == 255 && st(100.0, 6, 1) == 127 && st(100.0, 5, 2) == 400);
+    CHECK(st(100.0, 4, -2) == 25 && st(2.9, 4, 0) == 2 && st(-2.9, 6, 0) == 0xFE && st(-5.0, 4, 0) == 0);
+    CHECK(st(-1e9, 7, 0) == 0x8000 && st(1e9, 7, 0) == 0x7FFF && st(1e9, 5, 0) == 0xFFFF);
+    CHECK(st(dbl(0x7FF0000000000000ull), 6, 0) == 127 && st(dbl(0xFFF0000000000000ull), 6, 0) == 0x80);
+    CHECK(st(dbl(0x7FF8000000000000ull), 7, 0) == 0x7FFF && st(dbl(0xFFF8000000000000ull), 7, 0) == 0x8000);
+    CHECK(st(1.5, 0, 5) == 0x3FC00000u);  // single: no scaling, no conversion
+    CHECK(st(1e-40, 0, 0) == 0 && st(-1e-40, 0, 0) == 0);  // a denormal stores 0.0
+    CHECK(st(-0.0, 0, 0) == 0x80000000u);
+    // Loads: I * 2^-S; W = 1 loads one value and sets ps1 to 1.0.
+    mem[0] = 0xFF, mem[1] = 0x80;  // s16 -128, or u8 255 and 128
+    double p0 = 0, p1 = 0;
+    rt::psq_l(p0, p1, 0x1000, false, 4u << 16 | 1u << 24, 0);  // u8, scale 1
+    CHECK(p0 == 127.5 && p1 == 64.0);
+    rt::psq_l(p0, p1, 0x1000, true, 7u << 16 | 0x3Fu << 24, 0);  // s16, scale -1, W = 1
+    CHECK(p0 == -256.0 && p1 == 1.0);
+    rt::psq_l(p0, p1, 0x1000, false, 6u << 16, 0);  // s8: -1, -128
+    CHECK(p0 == -1.0 && p1 == -128.0);
+    rt::psq_st(3.0, -2.0, 0x1000, false, 0x0000'0007u | 0x01u << 8, 0);  // s16, scale 1
+    CHECK(mem[0] == 0x00 && mem[1] == 0x06 && mem[2] == 0xFF && mem[3] == 0xFC);
+    rt::g_mem = saved;
+
+    // The lifter: GQRs from the context, both halves of a pair, frD written after both lanes.
+    auto lift_one = [](std::initializer_list<uint32_t> words) {
+        Program q;
+        uint32_t at = 0x80003260;
+        for (uint32_t w : words) q.word(at, w), at += 4;
+        q.word(0x80005020, 0x80003260);
+        auto d = Dol::parse(q.bytes);
+        CHECK(d.has_value());
+        if (!d) return LiftResult{};
+        Cfg c(*d);
+        c.run();
+        return Lifter(c).lift(c.functions().at(0x80003260));
+    };
+    LiftResult r = lift_one({0xF3E10028,    // psq_st f31,40(r1),0,0
+                             0xE3E1F028,    // psq_l f31,40(r1),1,7
+                             0x102214A0,    // ps_merge10 f1,f2,f2
+                             0xC0230000,    // lfs f1,0(r3)
+                             0xFC40F890,    // fmr f2,f31
+                             0x4E800020});  // blr
+    CHECK(r.ok);
+    CHECK(r.code.contains("rt::psq_st(f31, p31, ea, false, c.spr[912], 0x80003260u);"));
+    CHECK(r.code.contains("rt::psq_l(f31, p31, ea, true, c.spr[919], 0x80003264u);"));
+    CHECK(r.code.contains("{ const double x0 = p2, x1 = f2; f1 = x0; p1 = x1; }"));
+    CHECK(r.code.contains("f1 = rt::lfs(rt::ld32(ea)); p1 = f1;"));  // lfs fills both halves
+    CHECK(r.code.contains("f2 = f31;") && !r.code.contains("p2 = f2;"));  // fmr leaves ps1 alone
+    r = lift_one({0x10200834, 0x4E800020});  // ps_rsqrte f1,f1
+    CHECK(!r.ok && r.why == "floating-point estimate (Broadway's table not known): ps_rsqrte");
+}
+
 void test_runtime() {
     // add3: carry out and signed overflow.
     auto s = rt::add3(0xFFFFFFFFu, 1, 0);
@@ -728,6 +797,7 @@ int main() {
     test_lifter();
     test_runtime();
     test_float();
+    test_paired();
     if (failures) {
         std::println(stderr, "{} check(s) failed", failures);
         return 1;
