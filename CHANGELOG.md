@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Added a C++23 startup probe that runs locally compiled PAL `SOMP01` code and stops at the first unsupported operation.
+- Lowered `dcbf` and `dcbst` at compile time for the native probe's coherent RAM model.
+- Verified that Windows x64 passes the initial cache-flush loop and reaches the SDK's `mfhid0` instruction.
+
 ## 0.1.0-alpha.1 — 2026-11-18
 
 - Added the initial build for PAL `SOMP01` revision 0 with a C++23 host and a Windows x64 ahead-of-time module.

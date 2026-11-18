@@ -13,6 +13,7 @@
 #include <math.h>
 #include <string.h>
 
+#include "aot_cache.hpp"
 #include "moderngekko/sha256.hpp"
 
 extern "C" {
@@ -113,6 +114,10 @@ void run_probe(CPUState& cpu) {
 }
 
 }  // namespace
+
+[[noreturn]] void qilin::unsupported_cache_address(u32 pc, u32 address) {
+    throw Stop{"cache operation outside native RAM", pc, address};
+}
 
 int main(int argc, char** argv) {
     if (argc != 2) {

@@ -1,14 +1,14 @@
 # BeatTheBeat-QilinComp
 
-Experimental ahead-of-time recompilation of the Europe/Australia release of *Beat the Beat: Rhythm Paradise*. The first tested revision is `SOMP01`, disc revision 0. It uses a C++23 host, a Vulkan 1.3 graphics backend, and a native module built from the game’s Wii PowerPC executable. The recompiler emits C for that module. The host retains Wii hardware services and CPU fallback paths.
+Ahead-of-time recompilation of the Europe/Australia release of *Beat the Beat: Rhythm Paradise*, disc ID `SOMP01`, revision 0. The [native port](docs/NATIVE-PORT.md) builds the translated executable as C++23 and stops when it reaches a game operation without a native implementation. Its Vulkan 1.3 target matrix covers Windows, Linux, Raspberry Pi 4, Intel and Apple Silicon Macs, and iPadOS. The native startup probe is currently headless.
 
-Version `0.1.0-alpha.1` reached save-slot selection on Windows x64 after a scripted Wii Remote A+B press. Linux x64, Linux ARM64 and Apple Silicon are target platforms. The source includes the MoltenVK integration for macOS. See [validation and next milestone](docs/VALIDATION.md) for the measured results and remaining coverage.
+## Native startup probe
 
-The [native port](docs/NATIVE-PORT.md) has a separate C++23 startup probe and a target matrix for Windows, Linux, Raspberry Pi 4, Intel and Apple Silicon Macs, and iPadOS.
+Build the probe from your local PAL WBFS image or extracted data partition. The build verifies the executable and translates it locally. See the [native build and validation instructions](docs/NATIVE-PORT.md).
 
-## Build and run
+## Earlier preview
 
-Use a local PAL WBFS image or its extracted data partition. The build validates the disc ID, revision and executable hash before translating it. Follow the [Windows build guide](docs/BUILD.md). The launcher maps **X** to Wii Remote A and **Z** to B. Press **X + Z** at the title screen.
+The separate `0.1.0-alpha.1` preview uses a C++23 host, Vulkan 1.3 and a recompiled module with Wii hardware services and CPU fallback paths. It reached save-slot selection on Windows x64. See the [Windows preview build guide](docs/BUILD.md) and [validation](docs/VALIDATION.md).
 
 This repository tracks build scripts, patches, and documentation. Your disc image, extracted files, generated code, native module, and save data live in your local build directory.
 

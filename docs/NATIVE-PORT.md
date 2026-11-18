@@ -16,7 +16,7 @@ The renderer targets Vulkan 1.3 with the feature subset supported by the target 
 
 The iPadOS target will link its precompiled game code into the app during the build. MoltenVK’s Metal layer handles graphics on Apple platforms. The app loads disc data supplied by the user.
 
-## First native startup check
+## Native startup probe
 
 The command-line probe is a Windows-tested development target. It verifies the PAL `SOMP01` revision 0 DOL checksum, loads its sections directly into memory, and invokes the statically linked C++23 code at the game entry point. The target links the generated code and fixed arithmetic and state helpers. Missing native operations stop the probe with exit code 3. Graphics, audio and playable startup remain development work.
 
@@ -29,4 +29,6 @@ From the repository root on Windows, with Git for Windows, Ninja, CMake and the 
 
 The CMake target under `native/` takes `QILIN_PREPARED_BUILD`, the directory containing the locally generated `SOMP01` chunks and the pinned helper sources. The probe’s diagnostic gives the game address and operation that need native support before startup can progress.
 
-The Windows x86-64 run entered at `0x80004050` and stopped at `0x800041DC`, where the translation requests the Wii `dcbf` cache operation. A same-size input with a different SHA-256 was rejected before execution. The ARM64 loader and entry chunk pass a Clang syntax check. Device testing for the rest of the platform matrix remains open.
+The probe lowers `dcbf` and `dcbst` at compile time. It checks that the addressed 32-byte block is mapped. Compiled loads and stores share a single RAM backing, so the block’s contents are already in memory when the cache operation runs. The generated `sync` and `isync` operations retain their host fences. Instruction-cache invalidation is still unsupported. [PowerPC `dcbf`](https://www.ibm.com/docs/en/aix/7.2.0?topic=set-dcbf-data-cache-block-flush-instruction) · [PowerPC `dcbst`](https://www.ibm.com/docs/en/aix/7.1.0?topic=set-dcbst-data-cache-block-store-instruction)
+
+The Windows x86-64 build entered at `0x80004050`, passed the `dcbf` loop at `0x800041DC`, and stopped at `0x800041E8` on `mfhid0` (`0x7CD0FAA6`). The next startup step is to replace the SDK cache-control sequence around that instruction. A same-size input with a different SHA-256 failed before execution. The Windows ARM64 loader and entry chunk passed a Clang syntax check. Playable startup and testing on the other target platforms remain open.

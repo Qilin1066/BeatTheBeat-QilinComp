@@ -34,7 +34,15 @@ foreach(chunk IN LISTS chunks)
     get_filename_component(name "${chunk}" NAME_WE)
     set(wrapper "${CMAKE_CURRENT_BINARY_DIR}/chunks/${name}.cpp")
     file(GENERATE OUTPUT "${wrapper}"
-        CONTENT "#include <math.h>\n#include <string.h>\nextern \"C\" {\n#include \"${chunk}\"\n}\n")
+        CONTENT "#include <math.h>
+#include <string.h>
+#include \"aot_cache.hpp\"
+#define ppc_fallback_instruction(cpu, instruction, pc) qilin::lower_generated_operation<instruction, pc>(cpu)
+extern \"C\" {
+#include \"${chunk}\"
+}
+#undef ppc_fallback_instruction
+")
     list(APPEND translated_sources "${wrapper}")
 endforeach()
 
@@ -48,7 +56,7 @@ set_source_files_properties(${helpers} PROPERTIES LANGUAGE CXX)
 add_executable(qilin-native-boot boot_probe.cpp ${helpers} ${translated_sources})
 set_target_properties(qilin-native-boot PROPERTIES
     CXX_STANDARD 23 CXX_STANDARD_REQUIRED ON CXX_EXTENSIONS OFF)
-target_include_directories(qilin-native-boot PRIVATE "${generated}"
+target_include_directories(qilin-native-boot PRIVATE "${generated}" "${CMAKE_CURRENT_SOURCE_DIR}"
     "${runtime_helpers}/include" "${host_headers}")
 target_compile_definitions(qilin-native-boot PRIVATE DOLRECOMP_CPU_HEADER="core/cpu.h"
     QILIN_SOMP01_SHA256="${somp01_sha256}")
