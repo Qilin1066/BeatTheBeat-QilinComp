@@ -11,6 +11,12 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+### Added
+- **`tools/analysis/lowmem.py`**: reads a Dolphin MEM1 dump taken at the entry point and prints the low-memory words `OSInit` and `__start` read, next to the runtime's values, flagging those that differ. For confirming the boot values in `docs/runtime.md`.
+
+### Fixed
+- **`guest.hpp` on zig's macOS target:** with `<chrono>` included before `<cfloat>`, zig's bundled macOS headers lose `DBL_MIN` and `FLT_MIN`, so `dispatch.cpp` didn't compile. The smallest normal values now come from `std::numeric_limits`: same values, no macros. Found by cross-compiling the runtime for Linux and macOS on x86-64 and ARM64 with zig, which now all pass (the first check of `machine.cpp`'s non-Windows memory mapping).
+
 ## [0.12.0] - 2026-11-18
 The runtime skeleton: `qilin_run` starts the game. It runs `OSInit` natively and the static constructors as lifted code, and stops at the first replaced function it has no native code for, naming it and its caller.
 

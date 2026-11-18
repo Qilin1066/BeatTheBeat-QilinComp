@@ -22,6 +22,7 @@ Static recompilation of **Beat the Beat: Rhythm Paradise** (Wii, PAL `SOMP01` re
 - `tools/check/verify_decoder.py`: compares the decoder with binutils objdump.
 - `tools/difftest/`: runs lifted code and the original under Unicorn and compares the results, one worker per CPU. Runs on Linux, macOS and Windows. Trials are seeded per function, so `--only`/`--range` replay a full run's trials exactly.
 - `tools/analysis/port_symbols.py`: ports US decomp names to PAL.
+- `tools/analysis/lowmem.py`: boot values from a Dolphin MEM1 dump, against the runtime's.
 - `recomp/src/hwaccess.*` (`qilin hwaccess`) and `tools/analysis/runtime_todo.py`: the runtime's to-do list (replaced functions lifted code calls, its direct hardware accesses). Their output is game-derived: never commit it.
 - `tools/difftest/build_ubsan.py`: the UBSan harness through zig's Clang, on any host.
 - `docs/`: design and results. Keep them current. `recompiler-core.md` covers the decoder, CFG, lifter and difftest; `runtime.md` the runtime; `roadmap-and-design-targets.md` is the roadmap.
@@ -80,7 +81,8 @@ Before a milestone commit, all of these must hold: tests pass, warnings are clea
   - it reports the `dcbz` fault address differently
 - Bring-up loop: run `qilin_run`, read the stop (`no native code yet for X [lib], called from Y`), add `QILIN_NATIVE(X)` or, if X only works on guest structures, add its name to `lift_anyway` and lift again. Check what X does in the listing (`qilin insns`) before writing it.
 - The native functions register from static initialisers, so their sources are `qilin_run`'s own (a static library would drop them).
-- `OSInit`'s arenas come from low memory that IOS and the apploader fill in. The runtime's values are from `OSInit`'s own defaults and are still to be confirmed with a Dolphin memory dump at the entry point (`docs/runtime.md`).
+- `OSInit`'s arenas come from low memory that IOS and the apploader fill in. The runtime's values are from `OSInit`'s own defaults and are still to be confirmed with a Dolphin memory dump at the entry point: `tools/analysis/lowmem.py mem1.raw` compares (`docs/runtime.md`).
+- Cross-compile check without Linux or a Mac: `python -m ziglang c++ -target {x86_64,aarch64}-{linux-gnu,macos} ...` with the flags above, per source file. zig's macOS headers lose `DBL_MIN` if `<chrono>` comes first, so the runtime uses `std::numeric_limits`, not the `<cfloat>` macros.
 - `OSLockMutex` and the thread, message and alarm code are bookkeeping on guest structures over `OSDisableInterrupts`, the context switch (`SelectThread`) and the time base. `OSGetCurrentThread` and the SDK's inlined clock macros read low memory.
 - Library split (`docs/code-analysis.md`): lift game/NW4R/MSL/runtime/etc. (74%); replace OS, DVD, GX, AX, pad, WPAD, NAND… (25%); drop MetroTRK/NdevExi2A (1%).
 

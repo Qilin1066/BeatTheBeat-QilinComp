@@ -25,6 +25,8 @@
 /generated/
 /gen/
 /gen-rt/
+*.raw
+pal_symbols.txt
 *.insns.txt
 cfg.json
 cfg.json.gz

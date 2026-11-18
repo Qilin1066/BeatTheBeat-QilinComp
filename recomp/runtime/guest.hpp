@@ -8,10 +8,10 @@
 #pragma once
 
 #include <bit>
-#include <cfloat>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 
 namespace qilin::rt {
 
@@ -230,22 +230,29 @@ inline uint32_t g_ni_flushes = 0;  // the differential test: Unicorn ignores NI,
 #define QILIN_NI_FLUSHED() ((void)0)
 #endif
 
+// The smallest normal double and single. Not DBL_MIN/FLT_MIN: zig's macOS
+// headers lose those macros when <chrono> comes before <cfloat>. The
+// parentheses keep <windows.h>'s min macro out (the difftest harness
+// includes it first).
+inline constexpr double kMinNormalD = (std::numeric_limits<double>::min)();
+inline constexpr double kMinNormalS = (std::numeric_limits<float>::min)();
+
 // Non-IEEE mode: a denormal (in the given format) becomes zero of its sign.
 inline double ni_d(double x) {
-    if (std::fabs(x) < DBL_MIN && x != 0.0) [[unlikely]] {
+    if (std::fabs(x) < kMinNormalD && x != 0.0) [[unlikely]] {
         QILIN_NI_FLUSHED();
         return std::copysign(0.0, x);
     }
     return x;
 }
 inline double ni_s(double x) {
-    if (std::fabs(x) < double(FLT_MIN) && x != 0.0) [[unlikely]] {
+    if (std::fabs(x) < kMinNormalS && x != 0.0) [[unlikely]] {
         QILIN_NI_FLUSHED();
         return std::copysign(0.0, x);
     }
     return x;
 }
-inline bool denormal_d(double x) { return std::fabs(x) < DBL_MIN && x != 0.0; }
+inline bool denormal_d(double x) { return std::fabs(x) < kMinNormalD && x != 0.0; }
 // frC of a single-precision multiply: exactly a single's 24-bit significand.
 inline bool single_significand(double x) { return (bits(x) & 0x1FFFFFFFu) == 0; }
 

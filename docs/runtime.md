@@ -51,6 +51,14 @@ build-rt/qilin_run path/to/main.dol
 | MEM2 arena start | `0x90000800` | `OSInit` raises a lower start to this |
 | MEM2 arena end | `0x933E0000` | The documented start of IOS's own heap at the top of MEM2 |
 
+**Checking them:** in Dolphin, turn on the debugging interface, set a breakpoint at the entry point `0x80004050` in the code view, start the game, and when it stops dump MEM1 from the memory view (it writes `mem1.raw` into Dolphin's dump folder; menu names vary between versions). Then:
+
+```sh
+python3 tools/analysis/lowmem.py path/to/mem1.raw
+```
+
+It prints every low-memory word `OSInit` and `__start` read (arenas, clocks, console type, IOS version, the boot information) next to the runtime's value, and flags the ones that differ. The dump holds the whole game image, so it stays out of git (`*.raw` is ignored).
+
 ## Where bring-up stands
 
 The static constructors run until one calls `OSInitMutex`. That function, like `OSLockMutex` and the thread, message-queue and alarm code around it, is bookkeeping on structures in guest memory: it reaches the hardware only through the interrupt enable (`OSDisableInterrupts`, native already), the context switch and the time base.
