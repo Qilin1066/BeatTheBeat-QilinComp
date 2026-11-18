@@ -11,6 +11,18 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-18
+The decomp's names on the PAL build, and the library boundaries: 8,043 of the decomp's 8,103 functions match ours exactly, and every library has a PAL range and a plan (lift, replace or drop).
+
+### Added
+- **`third_party/rhf`:** the Rhythm Heaven Fever decomp's `symbols.txt` and `splits.txt` (US build, CC0).
+- **`tools/analysis/port_symbols.py`:** ports the names to the PAL build by aligning function size sequences, classifies every difference (split, merge, regional change, one side only), and prints each library's PAL range. `--symbols-out` writes a PAL symbol list (derived from the game: not committed).
+- **`docs/code-analysis.md`:** the 44 library ranges of the PAL build with function, instruction, floating-point, paired-single and privileged counts, and the lifted/replaced/dropped boundary: 74% of the code lifted, 25% replaced, 1% dropped. Every privileged instruction and every unknown word is on the replaced or dropped side.
+- **Tests** for the new CFG rules.
+
+### Fixed
+- **Function boundaries, checked against the decomp's:** the `blr` CodeWarrior keeps after a final tail call or trap, and the epilogue after a final call through `bctr`, belong to the function (dead code), not to a new one; a branch to a stack-frame set-up is a tail call to a new function, even inside the branching function's range. 8,301 functions became 8,171, and exact matches with the decomp rose from 7,849 to 8,043.
+
 ## [0.3.0] - 2026-11-18
 Function discovery and control flow, and the first analysis of the PAL `main.dol`: the build hash confirmed, the decoder agreeing with binutils on every word of the game's code, 8,301 functions, every jump table proven, and every word of the code accounted for.
 

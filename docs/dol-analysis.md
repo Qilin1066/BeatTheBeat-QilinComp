@@ -1,6 +1,6 @@
 # main.dol: analysis (roadmap step 1)
 
-Last updated 2026-11-18 (v0.3.0: the PAL `main.dol` run through every tool: hash, sections, instruction profile, decoder cross-check, functions and coverage).
+Last updated 2026-11-18 (v0.4.0: function boundaries checked against the decomp's; libraries in `code-analysis.md`. v0.3.0: the PAL `main.dol` run through every tool: hash, sections, instruction profile, decoder cross-check, functions and coverage).
 
 ## Getting main.dol
 
@@ -55,7 +55,7 @@ The header's BSS range is `0x803217E0`, 744,616 bytes: it spans `.sbss`, `.sdata
 
 ## Functions and coverage
 
-`qilin cfg` (1.2 s): **8,301 functions** (1 entry, 4,906 call targets, 231 reached only by tail calls, 681 only through `lis`/`addi` pointers, 2,127 only through pointers in data such as vtables, 355 found in gaps), 505,266 reachable instructions, **157 jump tables, all proven** by their bound check, 2,560 indirect calls, 219 indirect tail calls (calls through a vtable or callback that end the function, and the runtime's pointer-to-member call), 816 tail calls, and 29 functions that fall into the next one (the runtime's register save/restore chains). The decomp names 8,103 functions in the US build; the two counts will be compared when its names are ported.
+`qilin cfg` (1.2 s): **8,171 functions** (1 entry, 4,906 call targets, 260 reached only by tail calls, 682 only through `lis`/`addi` pointers, 2,127 only through pointers in data such as vtables, 195 found in gaps), 505,117 reachable instructions, **157 jump tables, all proven** by their bound check, 2,560 indirect calls, 219 indirect tail calls (calls through a vtable or callback that end the function, and the runtime's pointer-to-member call), 845 tail calls, and 29 functions that fall into the next one (the runtime's register save/restore chains). The decomp names 8,103 functions in the US build, and **8,043 of them match ours exactly** in the PAL build (`code-analysis.md`); the rest are regional changes, the save/restore routines (one function per entry here) and debugger code.
 
 **One suspect:** the debugger stub's register restore (`0x80116064`) reaches the `lmw` invalid form. **Five starts rejected** by validation, each data or a template: `__init_data`'s two tables, the SDK's `bla 0x60` template, a `nop` before the OS's context code, and the debugger stub's exception entry.
 
@@ -63,10 +63,10 @@ The header's BSS range is `0x803217E0`, 744,616 bytes: it spans `.sbss`, `.sdata
 
 | Section | Code | Padding | Dead | Unknown |
 |---|---|---|---|---|
-| `.init` (2,504 words) | 816 | 1,640 | 0 | 48 |
-| `.text` (510,440 words) | 504,450 (98.83%) | 5,377 | 559 | 54 |
+| `.init` (2,504 words) | 815 | 1,640 | 1 | 48 |
+| `.text` (510,440 words) | 504,302 (98.80%) | 5,377 | 707 | 54 |
 
-Padding is zero words and `nop`s that nothing reaches. Dead code is 559 words that the compiler left unreachable inside functions (typically a `b` right after another unconditional branch, or a switch case nothing selects); nothing branches to them and no pointer in data points into them. **The 102 unknown words are all identified, and none of them is code we lift:**
+Padding is zero words and `nop`s that nothing reaches. Dead code is 708 words that the compiler left unreachable: inside functions (typically a `b` right after another unconditional branch, or a switch case nothing selects), and just past a function's end (the `blr` CodeWarrior keeps after a final tail call, the epilogue after a final call through `bctr`). Nothing branches to them and no pointer in data points into them. **The 102 unknown words are all identified, and none of them is code we lift:**
 
 | Where | Words | What |
 |---|---|---|
@@ -95,7 +95,7 @@ Other observations:
 
 ## To do
 
-1. Port the decomp's US function names and library splits to PAL addresses (masked-hash signatures), compare the function lists, and record the library boundaries (start and end of each library's code) as `code-analysis.md` does for Ghoulies.
+1. ✅ (v0.4.0) The decomp's names and library splits ported to PAL, and the library boundaries recorded: `code-analysis.md`.
 2. Hardware access: every store to the write-gather pipe (`0xCC008000`) and every other access to `0xCC000000`–`0xCDFFFFFF` or an uncached mirror from code we'll lift.
 3. C++ exception tables (`extab`, 832 bytes, and `extabindex`, 1,184 bytes): which functions have them, and does the game throw?
 4. The timing model: what drives the rhythm engine (frame count, audio position, or the time base) and how it handles 50 Hz and 60 Hz.

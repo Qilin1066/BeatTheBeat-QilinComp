@@ -84,9 +84,10 @@ struct Suspect {
 // Word-level accounting of each text section. Every word is
 //   code     reached by some function;
 //   padding  not reached, and zero or a nop (CodeWarrior's alignment);
-//   dead     not reached, inside a function, starting right after code that
-//            can't fall through, and no branch anywhere nor any pointer in data
-//            targets any word of it (code the compiler left unreachable);
+//   dead     not reached, and no branch in reached code nor any pointer in data
+//            targets any word of it: inside a function right after code that
+//            can't fall through, or CodeWarrior's leftovers just past a
+//            function's end (a lone blr, or an epilogue after a final bctr);
 //   unknown  anything else. Done means unknown == 0 in every lifted library.
 struct Coverage {
     std::string section;
@@ -125,6 +126,8 @@ private:
     uint32_t prologue_before(uint32_t lo, uint32_t a) const;
     bool clean_boundary(uint32_t a) const;
     bool inside_span(uint32_t a) const;  // strictly inside an explored function's [start, end)
+    bool sets_up_frame(uint32_t a) const;
+    uint32_t leftover_words(uint32_t a) const;
     uint32_t bound_of(uint32_t start) const;
     bool explore_all();  // returns true if new starts were found
     void add_start(uint32_t a, Origin o);

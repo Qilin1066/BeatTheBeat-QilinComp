@@ -102,6 +102,40 @@ bool Cfg::is_terminator(const Insn& in) {
     }
 }
 
+bool Cfg::sets_up_frame(uint32_t a) const {
+    // stwu r1,-n(r1), possibly after mflr r0 (mfspr r0,LR)
+    for (uint32_t p = a; p < a + 8; p += 4) {
+        const Insn in = insn(p);
+        if (in.op == Op::stwu && in.rd() == 1 && in.ra() == 1 && in.simm() < 0) return true;
+        if (!(in.op == Op::mfspr && in.spr() == 8 && in.rd() == 0)) return false;
+    }
+    return false;
+}
+
+// Unreachable code CodeWarrior leaves right after a function's last
+// instruction, which belongs to that function: a lone blr (after a final tail
+// call, a trap, or another blr), or an epilogue that tears the frame down
+// (`addi r1, r1, n` ... `blr`) after a final call through `bctr`. Returns its
+// length in words, 0 if `a` isn't such code. Callers check that nothing
+// branches to it or points at it: then it's a function of its own.
+uint32_t Cfg::leftover_words(uint32_t a) const {
+    auto it = funcs_.upper_bound(a - 4);
+    if (!in_text(a - 4) || it == funcs_.begin()) return 0;
+    --it;
+    if (it->second.end != a || !is_terminator(insn(a - 4))) return 0;
+    if (insn(a).word == 0x4E800020u) return 1;
+    const Insn last = insn(a - 4);
+    if (!((last.op == Op::b || last.op == Op::bcctr) && !last.lk())) return 0;
+    bool teardown = false;
+    for (uint32_t p = a, n = 1; n <= 16 && in_text(p); p += 4, ++n) {
+        const Insn in = insn(p);
+        if (!in.valid() || (in.op == Op::stwu && in.ra() == 1)) return 0;
+        if (in.op == Op::addi && in.rd() == 1 && in.ra() == 1 && in.simm() > 0) teardown = true;
+        if (is_terminator(in)) return teardown && in.op == Op::bclr ? n : 0;
+    }
+    return 0;
+}
+
 bool Cfg::clean_boundary(uint32_t a) const {
     const DolSection* s = in_text(a) ? dol_.text_section_at(a) : nullptr;
     if (!s || !insn(a).valid()) return false;
@@ -305,6 +339,14 @@ Cfg::Explored Cfg::explore(uint32_t start, uint32_t bound) const {
     // Where an unconditional or conditional branch goes; returns the address
     // to explore, if it's inside this function.
     auto branch_to = [&](uint32_t from, uint32_t target) -> std::optional<uint32_t> {
+        // A stack frame is only ever set up at a function's entry, so a
+        // branch to a frame set-up at a clean boundary is a tail call, even
+        // into what looked like this function.
+        if (target > start && target < bound && sets_up_frame(target) && clean_boundary(target)) {
+            f.tails.insert(target);
+            r.new_tails.emplace_back(from, target);
+            return std::nullopt;
+        }
         if (target >= start && target < bound && in_text(target)) {
             f.leaders.insert(target);
             return target;
@@ -508,6 +550,11 @@ void Cfg::seed_gaps() {
             // The first word of each run of unreached code, if it starts at
             // a boundary and isn't unreachable code inside a function. The
             // next round sees the new function's extent and seeds the rest.
+            if (const uint32_t n = leftover_words(a)) {  // part of the previous function; ends in blr
+                a += 4 * (n - 1);
+                after_boundary = true;
+                continue;
+            }
             if (after_boundary && in.valid() && !starts_.contains(a) && !inside_span(a)) add_start(a, Origin::Gap);
             after_boundary = false;
         }
@@ -610,7 +657,8 @@ std::vector<Coverage> Cfg::coverage() const {
             const uint32_t words = (b - a) / 4;
             uint32_t before = a;  // the last word before the run that isn't padding
             while (before > s->address && padding(insn(before - 4))) before -= 4;
-            const bool dead = before > s->address && is_terminator(insn(before - 4)) && inside_span(a) && !targeted;
+            const bool dead = !targeted && ((before > s->address && is_terminator(insn(before - 4)) && inside_span(a)) ||
+                                            leftover_words(a) == words);
             if (dead) {
                 c.dead += words;
             } else {

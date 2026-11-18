@@ -419,12 +419,28 @@ struct Program {
         word(0x80003210, 0x81830000);                     // lwz r12,0(r3)
         word(0x80003214, 0x7D8903A6);                     // mtctr r12
         word(0x80003218, 0x4E800420);                     // bctr: an indirect tail call
+        // 80003220 tail-calls a function that sets up a frame inside its own
+        // bound, leaving its blr unreachable after the tail call.
+        word(0x80003220, li(3, 1));
+        word(0x80003224, b(0x80003224, 0x8000322C));
+        word(0x80003228, 0x4E800020);                     // leftover blr: dead
+        word(0x8000322C, 0x9421FFF0);                     // stwu r1,-16(r1): a function
+        word(0x80003230, 0x38210010);
+        word(0x80003234, 0x4E800020);
+        // 80003240 ends with a call through bctr; its epilogue stays behind.
+        word(0x80003240, 0x9421FFF0);
+        word(0x80003244, 0x7C6903A6);                     // mtctr r3
+        word(0x80003248, 0x4E800420);                     // bctr
+        word(0x8000324C, 0x38210010);                     // leftover epilogue: dead
+        word(0x80003250, 0x4E800020);
 
         word(0x80005000, 0x80003160);                     // the switch's table
         word(0x80005004, 0x80003168);
         word(0x80005008, 0x80003178);
         word(0x8000500C, 0x800031E0);                     // a vtable
         word(0x80005010, 0x80003210);
+        word(0x80005014, 0x80003220);
+        word(0x80005018, 0x80003240);
     }
 };
 
@@ -440,7 +456,8 @@ void test_cfg() {
         {0x80003100, Origin::Entry},   {0x80003140, Origin::Call},    {0x80003180, Origin::Call},
         {0x80003184, Origin::Call},    {0x800031A0, Origin::Call},    {0x800031C0, Origin::TailCall},
         {0x800031D0, Origin::ImmPtr},  {0x800031E0, Origin::DataPtr}, {0x80003200, Origin::Gap},
-        {0x80003210, Origin::DataPtr},
+        {0x80003210, Origin::DataPtr}, {0x80003220, Origin::DataPtr}, {0x8000322C, Origin::TailCall},
+        {0x80003240, Origin::DataPtr},
     };
     CHECK(fs.size() == expected.size());
     for (const auto& [start, origin] : expected) {
@@ -468,16 +485,18 @@ void test_cfg() {
     CHECK(fs.at(0x800031A0).calls.empty() && fs.at(0x800031A0).insns.size() == 3);
     CHECK(fs.at(0x800031E0).insns.size() == 3);
     CHECK(fs.at(0x80003210).itails == (std::vector<uint32_t>{0x80003218}));
+    CHECK(fs.at(0x80003220).tails == (std::set<uint32_t>{0x8000322C}) && fs.at(0x80003220).insns.size() == 2);
+    CHECK(fs.at(0x80003240).itails == (std::vector<uint32_t>{0x80003248}));
     CHECK(cfg.suspects().empty());
     CHECK(cfg.rejected().empty());
 
     const auto cov = cfg.coverage();
     CHECK(cov.size() == 1);
     if (cov.size() == 1) {
-        CHECK(cov[0].code == 43);
-        CHECK(cov[0].dead == 1);  // 800031E8
+        CHECK(cov[0].code == 51);
+        CHECK(cov[0].dead == 4);  // 800031E8, the leftover blr at 80003228, the epilogue at 8000324C
         CHECK(cov[0].unknown == 0);
-        CHECK(cov[0].padding == 128 - 44);
+        CHECK(cov[0].padding == 128 - 55);
     }
     CHECK(cfg.to_json().contains("\"falls_into\": \"0x80003184\""));
     CHECK(percent(1, 3, 2) == "33.33%" && percent(2, 3, 0) == "67%" && percent(0, 0, 1) == "n/a");
@@ -485,16 +504,16 @@ void test_cfg() {
     // Weak evidence that reaches an invalid word is rejected: a data pointer
     // to a clean boundary whose code runs into a reserved encoding.
     Program q;
-    q.word(0x80003230, Program::li(3, 1));
-    q.word(0x80003234, 0x7C83202F);  // lwzx with the record bit: invalid
-    q.word(0x80005014, 0x80003230);
+    q.word(0x80003260, Program::li(3, 1));
+    q.word(0x80003264, 0x7C83202F);  // lwzx with the record bit: invalid
+    q.word(0x80005020, 0x80003260);
     auto dol2 = Dol::parse(q.bytes);
     CHECK(dol2.has_value());
     if (!dol2) return;
     Cfg cfg2(*dol2);
     cfg2.run();
-    CHECK(!cfg2.functions().contains(0x80003230));
-    CHECK(cfg2.rejected() == (std::vector<uint32_t>{0x80003230}));
+    CHECK(!cfg2.functions().contains(0x80003260));
+    CHECK(cfg2.rejected() == (std::vector<uint32_t>{0x80003260}));
     CHECK(cfg2.coverage()[0].unknown == 2);
 }
 

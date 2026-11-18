@@ -21,7 +21,7 @@ The repository started with work by ChatGPT, in two parts. Both are retired; the
 - US addresses seen so far: `__start` at `0x80004050` (the PAL entry point too), `OSInit` at `0x800D9AB0`, `PPCMthid4` at `0x800D8FA0`.
 - An older disassembly of the US build (`EstexNT/rhf`) and the RHModding community's documentation of Fever's tickflow bytecode (the scripts that drive each rhythm game) also exist.
 
-**Takeaways:** the best naming source we could have, and CC0, so it can be vendored like Ghoulies vendors nxdk's kernel export table. The PAL build is a different binary, so names are ported by function signature (§ *Decisions*). The library split confirms the boundary in `roadmap-and-design-targets.md`: the Bluetooth stack (`bte`), the Home Button Menu (`hbm`) and MetroTRK (the debugger stub) are large and are replaced or dropped, not lifted.
+**Takeaways:** the best naming source we could have, and CC0, so it can be vendored like Ghoulies vendors nxdk's kernel export table. The PAL build is a different binary, so names are ported by aligning function sizes (§ *Decisions*). The library split confirms the boundary in `roadmap-and-design-targets.md`: the Bluetooth stack (`bte`), the Home Button Menu (`hbm`) and MetroTRK (the debugger stub) are large and are replaced or dropped, not lifted.
 
 ## 4. CastawayRecomp and BlackKnightRecomp (yunophilia) — Wii, static, C++
 - *The Sims 2: Castaway* statically recompiled to C++ for Windows x64 and Linux x64; the recompiler and most of the runtime come from the same author's BlackKnightRecomp. Function names and starts come from a linker ELF the disc happens to ship.
@@ -52,6 +52,6 @@ The repository started with work by ChatGPT, in two parts. Both are retired; the
 
 ## Decisions changed or added
 1. **Decoder:** our own (no Zydis-like library exists for Broadway), cross-checked against binutils on every word, in CI over a sweep of the encoding space.
-2. **Names:** the CC0 Rhythm Heaven Fever decomp, ported from US to PAL by masked-hash function signatures. Vendor its `symbols.txt` and `splits.txt` when the porting pass is written.
+2. **Names:** the CC0 Rhythm Heaven Fever decomp, vendored (`third_party/rhf`) and ported from US to PAL by aligning function size sequences (v0.4.0; without the US executable there are no US bytes to sign).
 3. **System boundary:** replace the SDK's hardware-facing libraries at their API (no hardware register emulation beyond the write-gather pipe); lift the C/C++ runtime, the pure-software SDK libraries and NW4R. Confirm per library in analysis.
 4. **References:** Dolphin for behaviour and timing; the decomp for meaning and names; CastawayRecomp's TAS test as the model for our end-to-end test.

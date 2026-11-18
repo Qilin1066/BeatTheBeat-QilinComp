@@ -12,9 +12,10 @@ Roadmap step 1, **analysis**, is in progress; the recompiler core (step 2) has i
 |---|---|
 | DOL loader (sections, BSS, entry point, flat image; the PAL build recognised by SHA-256) | ✅ |
 | Broadway decoder (all 222 instructions of the 750CL with the paired singles; reserved bits and invalid forms rejected) | ✅ 0 unexplained disagreements with GNU binutils over ~38 million swept words and all 512,944 words of the game's code |
-| Function discovery + CFG (tail calls, vtables and callbacks, CodeWarrior jump tables, register save/restore chains) | ✅ 8,301 functions, all 157 jump tables proven; every word of the code accounted for (`qilin coverage`: 98.83% code, the rest padding, dead code and 102 identified words of data and debugger stub, none of it lifted) |
+| Function discovery + CFG (tail calls, vtables and callbacks, CodeWarrior jump tables, register save/restore chains) | ✅ 8,171 functions, all 157 jump tables proven; every word of the code accounted for (`qilin coverage`: 98.80% code, the rest padding, dead code and 102 identified words of data and debugger stub, none of it lifted) |
 | CI: Linux x64 (GCC 14, Clang 19), Linux ARM64, macOS ARM64 and x64, Windows x64, warnings as errors, plus the decoder sweep | ✅ |
-| Library boundaries and names from the Rhythm Heaven Fever decomp, ported to PAL | next (see `docs/dol-analysis.md`) |
+| Names from the Rhythm Heaven Fever decomp ported to PAL; library boundaries; what's lifted, replaced or dropped | ✅ 8,043 of the decomp's 8,103 functions match exactly; 74% of the code lifted (`docs/code-analysis.md`) |
+| Hardware-access profile, exception tables, timing model | next (see `docs/dol-analysis.md`) |
 | Lifter → C++, differential test | later (see roadmap) |
 | Runtime: OS, DVD, NAND, GX on Vulkan, AX audio, input | later (see roadmap) |
 
@@ -64,6 +65,14 @@ python3 tools/check/verify_decoder.py --qilin build/qilin --dol path/to/main.dol
 python3 tools/check/verify_decoder.py --qilin build/qilin --sweep                  # the encoding space (CI runs this)
 ```
 
+### Names and libraries
+
+```sh
+python3 tools/analysis/port_symbols.py --qilin build/qilin --dol path/to/main.dol [--symbols-out pal_symbols.txt]
+```
+
+Ports the decomp's US function names to PAL addresses and prints each library's PAL range (`docs/code-analysis.md`). The symbol list is derived from the game: don't commit it.
+
 This compares the decoder with GNU objdump (`-M broadway,raw`): mnemonic and every operand must match, and a word must be valid for both or neither. It needs Python 3 and a PowerPC objdump: `apt install binutils-powerpc-linux-gnu`, or devkitPPC's `powerpc-eabi-objdump` with `OBJDUMP` set. Reviewed differences (binutils accepts some encodings Broadway reserves and lacks `mftb`) are counted by class; anything else fails.
 
 ## Layout
@@ -73,6 +82,8 @@ This compares the decoder with GNU objdump (`-M broadway,raw`): mnemonic and eve
 | `recomp/src/` | Recompiler core: `dol` loader, `sha256`, `decoder` (Broadway), `cfg` (function discovery + control flow), `main` (CLI) |
 | `recomp/tests/` | Unit tests on a synthetic in-memory DOL, the decoder and a synthetic program, so they need no game files |
 | `tools/check/` | The decoder cross-check against GNU objdump |
+| `tools/analysis/` | `port_symbols.py`: the decomp's names and libraries ported to PAL |
+| `third_party/rhf/` | The Rhythm Heaven Fever decomp's symbols and splits (CC0) |
 | `docs/` | Roadmap and design targets, prior art, analysis and status notes |
 
 ## Design targets (short version)
