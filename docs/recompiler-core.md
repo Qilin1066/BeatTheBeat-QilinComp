@@ -108,6 +108,16 @@ The source is IBM's **750CL RISC Microprocessor User's Manual** (preliminary v1.
 - **Arithmetic:** each lane is the single-precision instruction of the same kind (`rt::fadds`, `rt::fmas` and so on), so non-IEEE mode, NaNs and rounding to single are slice 3's. The lane mappings of `ps_sum0/1`, `ps_muls0/1`, `ps_madds0/1` and the merges are the manual's. A pair is computed into temporaries before frD is written, since frD can also be a source. As with `fmuls`, a multiply stops if a multiplier lane it uses isn't a single. Compares (`ps_cmpu0/1`, `ps_cmpo0/1`) set the CR field from their lane and stop on a denormal.
 - **Not lifted:** `ps_res` and `ps_rsqrte` (Broadway's estimate table), record forms, `ps_sel` and `dcbz_l` (none in the game's lifted code).
 
+### Register dataflow around calls (`recomp/src/lifter.cpp`, v0.9.0)
+Lifted code caches guest registers in host locals, and the context (`rt::Context`) must hold them wherever something outside the function looks: before a call, a return or a tail call, and after a call. Until 0.9.0 every such point wrote back, and reloaded, every register the function used. Now the emitter marks each sync point, and two dataflow passes over the function's instructions decide what each one moves:
+
+- **Dirty** (forward, may): a register written since the last sync on some path. Only these are stored before a call, return or tail call; the context already holds the rest. A register counts as written only where the code can write it: an assignment target (`=`, compound assignments, `++`, `--`) or an argument of `rt::psq_l`, the one runtime helper that writes locals through references. A new helper like it must be added to `writes()`.
+- **Live** (backward): read before being overwritten, where a store at a later sync counts as a read. Only these are reloaded after a call. Any other local is stale after the call, but nothing reads or stores it before it is overwritten. That second condition is why later stores count as reads: a stale local is never written back over the callee's value.
+
+Reads and certain writes come from the emitted text, statement by statement. In `x = expr` only `expr` is read. From the first condition in an instruction's code on, everything mentioned counts as read and nothing as certainly written. Every approximation errs on the side of a store or reload too many. A conditional call or return keeps the path that skips it.
+
+On the game, the lifted code's objects are 10.6% smaller (Clang 22, `-O2`). The differential test gives exactly the same results as before. A planted bug in the dataflow (no reloads after calls) shows up as mismatches in 24 functions of the first 414.
+
 ### Differential test (`tools/difftest/`)
 `qilin_difftest` (built with `-DQILIN_GEN_DIR=…`) runs lifted functions on test cases; `difftest.py` runs the original code under Unicorn's PowerPC 750CL model from the same state and compares. Each trial gives the function random registers (a third of them pointers into a 64 KB random heap whose words point back into it a third of the time, some small integers, some near `r13`), the game's real `r2`/`r13`, a random stack, and MEM1 holding the DOL image. It compares all 32 GPRs, LR, CTR, CR, XER, where the function returned to, every changed 32-byte block of MEM1, and how it stopped: a memory fault (instruction and address), a trap, or a call into a function that isn't lifted yet (on both sides, the call is where the trial ends). Whole call trees run on both sides.
 
@@ -162,6 +172,6 @@ The many trials that end in a memory fault come from random pointers; better-sha
 `info` (JSON), `insns` (every word of the text sections: address, word, text), `disasm` (a raw file of big-endian words, for the sweep), `profile` (instruction mix of the text sections, with paired-single, floating-point and privileged counts), `cfg` (summary, `--json` for every function), `coverage` (exit status 3 while any word is unknown), `suspects` and `lift` (`--out <dir>`, `--range lo-hi`, `--only addr`; writes only files whose content changed). Exit status is non-zero on any error.
 
 ## Next
-1. Slice 2's register-model work: liveness, so locals are written back only where a callee or the caller can read them, and CR bits computed only where read.
+1. CR bits computed only where read (a branch, `mfcr`, a sync), the rest of slice 2's register work.
 2. Broadway's open FP questions, from hardware or a clean source: frC rounding in single-precision and paired-single multiplies, the `fres`/`frsqrte`/`ps_res`/`ps_rsqrte` tables, `fctiwz`'s high word for negative inputs, non-IEEE compares and `fsel`.
 3. The difftest under UBSan; then the hardware-access profile and the runtime.

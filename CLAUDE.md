@@ -50,6 +50,8 @@ Before a milestone commit, all of these must hold: tests pass, warnings are clea
 - FPSCR is only touched by replaced or dropped code (base, OS, MetroTRK), so lifted code doesn't model it. `OSInit` calls `PPCSetFpNonIEEEMode`: the game runs with NI = 1 (denormal operands and results become signed zero, per the IBM 750GX/GL manual).
 - Where Broadway's FP result has no source (fmuls-family frC that isn't a single, compares of denormals, `fres`/`frsqrte` tables), lifted code stops (`rt::fp_unknown`) or the function isn't lifted. Don't guess these, and don't take them from Dolphin's code (it's GPL).
 - Paired singles follow IBM's 750CL user's manual (fail0verflow.com/media/files/ppc_750cl.pdf): `lfs` and single-precision results fill ps0 and ps1; `lfd`, double ops and `fmr` leave ps1 alone (CodeWarrior saves FPRs with `stfd` and `psq_st`); GQR quantisation rounds toward zero and clamps. Unicorn has none: `tools/difftest/paired.py` is the reference model (keep it independent of `guest.hpp`).
+- Register dataflow (`run()` in `lifter.cpp`): sync points are `@OUT@`/`@IN@` markers; stores are the dirty registers, reloads the live ones. Any runtime helper that writes a local by reference must be listed in `writes()` (today only `rt::psq_l`).
+- Clang on Windows without installing LLVM: `pip install ziglang`, then `python -m ziglang c++ -std=c++23 -O2 -Wall -Wextra -Wpedantic -Wshadow -Werror -ffp-contract=off -fno-fast-math -Igen -Irecomp/runtime -c gen/x.cpp -o x.o` (not `-fsyntax-only`: zig adds `-c`). GCC 14 still has to be checked on Linux.
 - Unicorn scans code hooks linearly: register one hook per text section and filter in Python, never one per address (30x slower).
 - Time-base and special-register reads are detected dynamically in the difftest (calls through function tables, such as `__init_cpp`'s constructors, defeat static call trees).
 - Unicorn's FP: it ignores NI (the harness counts flushes, so these are known differences), and `fctiwz` gives a 0 high word and `0x80000000` on positive overflow (corrected by hooks).
@@ -62,16 +64,18 @@ Before a milestone commit, all of these must hold: tests pass, warnings are clea
   - it reports the `dcbz` fault address differently
 - Library split (`docs/code-analysis.md`): lift game/NW4R/MSL/runtime/etc. (74%); replace OS, DVD, GX, AX, pad, WPAD, NAND… (25%); drop MetroTRK/NdevExi2A (1%).
 
-## Status (v0.8.0)
+## Status (v0.9.0)
 
 - 8,171 functions, all 157 jump tables proven, 98.80% of `.text` reached as code (the rest is identified as padding, dead code or data).
 - 8,103 functions lifted (slices 1, 3 and 4: integer, floating point, paired singles). Left: 56 privileged and 7 FPSCR (replaced libraries), 5 `fres`/`frsqrte`.
-- Difftest: 64,824 trials (8 per function), 0 unexplained mismatches; 174 s on 16 workers.
+- Difftest: 64,824 trials (8 per function), 0 unexplained mismatches; 170 s on 16 workers.
+- Calls store only dirty registers and reload only live ones (lifted objects 10.6% smaller).
+- Generated code is warning-free under MSVC 17.14 and Clang 22; GCC 14 is unchecked (no Linux here), so v0.6.0-v0.9.0 aren't pushed yet.
 - `qilin lift` output is in fixed 256-function chunks and only changed files are rewritten, so rebuilds are incremental.
 
 ## Next steps, in order
 
-1. Register liveness, to cut `out()`/`in()` syncing around calls; difftest under UBSan.
+1. CR bits computed only where read; difftest under UBSan.
 2. Hardware-access profile, exception tables, timing model; then the runtime (OS, DVD, NAND, GX on Vulkan, AX, input).
 
 ## Conventions

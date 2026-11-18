@@ -410,7 +410,9 @@ inline void quantize(uint32_t ea, double v, unsigned type, int scale) {
     else st8(ea, i);
 }
 // psq_l: W = 1 loads ps0 only, and ps1 becomes 1.0. Both loads happen before
-// either half is written, so a fault leaves frD as it was.
+// either half is written, so a fault leaves frD as it was. It writes lifted
+// code's locals through references: the lifter's register dataflow knows
+// (writes() in lifter.cpp); any new helper like it must be added there.
 inline void psq_l(double& p0, double& p1, uint32_t ea, bool w, uint32_t gqr, uint32_t pc) {
     const unsigned t = gqr_ld_type(gqr);
     if (t >= 1 && t <= 3) fp_unknown(pc);  // reserved type

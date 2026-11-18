@@ -11,6 +11,16 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-11-18
+Register dataflow around calls: lifted code stores only the registers it changed since the last sync, and reloads only those it reads before overwriting. The game's lifted objects are 10.6% smaller, and the differential test results are unchanged (64,824 trials, 0 unexplained mismatches).
+
+### Changed
+- **Sync points** (before a call, return or tail call; after a call) move what two dataflow passes over the function choose, where they used to move every register the function uses: the dirty registers (forward, may) are stored; the live ones (backward, a later store counting as a read) are reloaded. Reads and certain writes come from the emitted code statement by statement, erring towards one store or reload too many. The `out()`/`in()` lambdas are gone.
+
+### Added
+- **Tests** for the minimal stores and reloads on the synthetic program. A planted dataflow bug (no reloads after calls) shows up in the difftest as 24 mismatching functions.
+- **A Clang check on Windows** without installing LLVM (`ziglang`), described in CLAUDE.md: the generated code is warning-free under Clang 22 with `-Werror`.
+
 ## [0.8.0] - 2026-11-18
 Lifter slice 4, paired singles: 8,103 of the game's 8,171 functions lift (554 more). The rest are privileged code and FPSCR access in libraries that get replaced, plus five functions that use Broadway's estimate instructions. A reference model stands in for Unicorn, which has no paired singles: 64,824 trials, 0 unexplained mismatches.
 

@@ -545,19 +545,23 @@ void test_lifter() {
         CHECK(ok);
     };
     has(0x80003100, "void fn_80003100(rt::Context& c) {");
-    has(0x80003100, "lr = 0x80003108u; out(); fn_80003140(c); in(); if (c.ret != 0x80003108u) rt::bad_return(0x80003104u, c.ret);");
+    // Register dataflow: a call stores only what changed since the last sync
+    // and reloads only what is read before being overwritten.
+    has(0x80003100, "lr = 0x80003108u; c.r[1] = r1; c.lr = lr; fn_80003140(c); if (c.ret != 0x80003108u) rt::bad_return(0x80003104u, c.ret);");
+    has(0x80003100, "lr = 0x8000310Cu; c.lr = lr; fn_80003180(c); if");          // r1 is already in the context
+    has(0x80003100, "fn_800031A0(c); r1 = c.r[1]; if");                         // r1 is read afterwards, r3 overwritten
     has(0x80003100, "r3 = 0x80000000u;");                      // lis r3,0x8000
-    has(0x80003100, "out(); fn_800031C0(c); return;");          // tail call
+    has(0x80003100, "c.r[1] = r1; c.r[3] = r3; fn_800031C0(c); return;");          // tail call
     has(0x80003140, "switch (ctr) { case 0x80003160u: goto L_80003160; case 0x80003168u: goto L_80003168; "
                     "case 0x80003178u: goto L_80003178; default: rt::bad_jump(0x8000315Cu, ctr); }");
     has(0x80003140, "if (rt::crb(cr, 1)) { goto L_80003170; }");  // bgt
     has(0x80003140, "L_80003170:;");
-    has(0x80003140, "out(); c.ret = lr; return;");
-    has(0x80003180, "out(); fn_80003184(c); return;");          // falls into the next entry
+    has(0x80003140, "c.r[3] = r3; c.cr = cr; c.ret = lr; return;");  // xer is only read
+    has(0x80003180, "    fn_80003184(c); return;");                  // nothing written          // falls into the next entry
     has(0x800031A0, "lr = 0x800031A4u;");                       // the get-PC idiom
     CHECK(!code[0x800031A0].contains("rt::bad_return"));
-    has(0x80003210, "out(); rt::call(c, ctr, 0x80003218u); return;");
-    has(0x80003220, "out(); fn_8000322C(c); return;");
+    has(0x80003210, "c.r[12] = r12; c.ctr = ctr; rt::call(c, ctr, 0x80003218u); return;");
+    has(0x80003220, "c.r[3] = r3; fn_8000322C(c); return;");
 
     // ori/xori have no record bit: an odd immediate must not update CR0
     // (found by the differential test).

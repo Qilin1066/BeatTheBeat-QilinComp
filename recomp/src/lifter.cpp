@@ -1,9 +1,14 @@
 #include "lifter.hpp"
 
 #include <algorithm>
+#include <bitset>
+#include <cctype>
 #include <format>
+#include <map>
 #include <optional>
 #include <set>
+#include <string_view>
+#include <vector>
 
 namespace qilin {
 
@@ -63,7 +68,10 @@ private:
     std::string body_;
     std::set<unsigned> gprs_, fprs_, ps1_;
     std::set<uint32_t> targets_;  // labels that something jumps to
-    bool out_ = false, in_ = false;
+    // The instruction being emitted: where it can jump, and whether it can't
+    // go on to the next one. For the register dataflow in run().
+    std::vector<uint32_t> jumps_;
+    bool stops_ = false;
 };
 
 std::string Emitter::ea_d(const Insn& in) const {
@@ -76,25 +84,21 @@ std::string Emitter::ea_x(const Insn& in) const {
 }
 
 std::string Emitter::ret() {
-    out_ = true;
-    return "out(); c.ret = lr; return;";
+    return "@OUT@ c.ret = lr; return;";
 }
 
 std::string Emitter::call_direct(uint32_t pc, uint32_t target) {
-    out_ = in_ = true;
-    return std::format("lr = {0}; out(); {1}(c); in(); if (c.ret != {0}) rt::bad_return({2}, c.ret);", hex(pc + 4),
+    return std::format("lr = {0}; @OUT@ {1}(c); @IN@ if (c.ret != {0}) rt::bad_return({2}, c.ret);", hex(pc + 4),
                        fn_name(target), hex(pc));
 }
 
 std::string Emitter::call_indirect(uint32_t pc, const std::string& target) {
-    out_ = in_ = true;
-    return std::format("out(); rt::call(c, {1}, {2}); in(); if (c.ret != {0}) rt::bad_return({2}, c.ret);", hex(pc + 4),
+    return std::format("@OUT@ rt::call(c, {1}, {2}); @IN@ if (c.ret != {0}) rt::bad_return({2}, c.ret);", hex(pc + 4),
                        target, hex(pc));
 }
 
 std::string Emitter::tail_direct(uint32_t target) {
-    out_ = true;
-    return std::format("out(); {}(c); return;", fn_name(target));
+    return std::format("@OUT@ {}(c); return;", fn_name(target));
 }
 
 // The condition of a bc/bclr/bcctr; "" if it always branches. Emits the CTR
@@ -335,8 +339,7 @@ void Emitter::instruction(uint32_t pc, const Insn& in) {
     case Op::stswx:
         // The byte count is in XER at run time: through the context.
         for (unsigned r = 0; r < 32; ++r) use(r);
-        out_ = in_ = true;
-        line(std::format("{{ const uint32_t ea = {}; QILIN_PC({}); out(); rt::{}(c, {}, ea); in(); }}", ea_x(in), hex(pc),
+        line(std::format("{{ const uint32_t ea = {}; QILIN_PC({}); @OUT@ rt::{}(c, {}, ea); @IN@ }}", ea_x(in), hex(pc),
                          in.op == Op::lswx ? "lswx" : "stswx", rd));
         break;
     case Op::lwarx:
@@ -405,9 +408,8 @@ void Emitter::instruction(uint32_t pc, const Insn& in) {
     case Op::mftb: use(rd); line(std::format("{} = rt::mftb(c, {});", D, in.spr())); break;
     // ---- system ----
     case Op::sc:
-        out_ = in_ = true;
         for (unsigned r = 0; r < 32; ++r) use(r);
-        line(std::format("out(); rt::syscall(c, {}); in();", hex(pc)));
+        line(std::format("@OUT@ rt::syscall(c, {}); @IN@", hex(pc)));
         break;
     case Op::tw:
     case Op::twi: {
@@ -415,6 +417,7 @@ void Emitter::instruction(uint32_t pc, const Insn& in) {
         const std::string a = A, b = in.op == Op::tw ? (use(rb), B) : imm;
         const unsigned to = rd;
         if (to == 31) {
+            stops_ = true;
             line(std::format("rt::trap({});", hex(pc)));
             break;
         }
@@ -449,10 +452,12 @@ void Emitter::instruction(uint32_t pc, const Insn& in) {
         } else if (std::ranges::binary_search(f_.insns, target)) {
             go = std::format("goto {};", label(target));
             targets_.insert(target);
+            jumps_.push_back(target);
         } else {
             throw Unsupported{std::format("branch to {:08X}, outside the function and not a tail call", target)};
         }
         line(cond.empty() ? go : std::format("if ({}) {{ {} }}", cond, go));
+        stops_ = cond.empty();
         break;
     }
     case Op::bclr: {
@@ -466,6 +471,7 @@ void Emitter::instruction(uint32_t pc, const Insn& in) {
         }
         go = ret();
         line(cond.empty() ? go : std::format("if ({}) {{ {} }}", cond, go));
+        stops_ = cond.empty();
         break;
     }
     case Op::bcctr: {
@@ -482,13 +488,15 @@ void Emitter::instruction(uint32_t pc, const Insn& in) {
             for (uint32_t t : jt->targets) {
                 sw += std::format(" case {}: goto {};", hex(t), label(t));
                 targets_.insert(t);
+                jumps_.push_back(t);
             }
+            stops_ = true;
             line(sw + std::format(" default: rt::bad_jump({}, ctr); }}", hex(pc)));
             break;
         }
-        out_ = true;
-        const std::string go = std::format("out(); rt::call(c, ctr, {}); return;", hex(pc));
+        const std::string go = std::format("@OUT@ rt::call(c, ctr, {}); return;", hex(pc));
         line(cond.empty() ? go : std::format("if ({}) {{ {} }}", cond, go));
+        stops_ = cond.empty();
         break;
     }
     default:
@@ -705,13 +713,156 @@ void Emitter::paired(uint32_t pc, const Insn& in) {
     }
 }
 
+// ---- Register dataflow around sync points ----
+// Locals cache the guest registers; the context holds them where something
+// outside the function looks: before a call, a return, a tail call (the
+// @OUT@ markers in the emitted text) and after a call (@IN@). Two passes
+// decide what each sync point moves, so most calls move a few registers
+// instead of every one the function uses:
+//  - dirty (forward, may): written since the last sync on some path. Only
+//    these are stored at @OUT@; the context already holds the rest.
+//  - live (backward): read before being overwritten, where a store at a
+//    later @OUT@ counts as a read. Only these are reloaded at @IN@; any other
+//    local is stale after the call but is overwritten before anything reads
+//    or stores it.
+// The emitted text is scanned for the registers it mentions: any mention
+// dirties a register and counts as a read, and only a plain assignment that
+// isn't inside a condition kills. Both approximations err on the safe side,
+// a store or a reload too many.
+constexpr unsigned kRegCount = 100;  // r0-31, f0-31 (ps0), p0-31 (ps1), lr, ctr, cr, xer
+using Regs = std::bitset<kRegCount>;
+constexpr unsigned kLr = 96, kCtr = 97, kCr = 98, kXer = 99;
+
+int reg_index(std::string_view id) {
+    if (id == "lr") return kLr;
+    if (id == "ctr") return kCtr;
+    if (id == "cr") return kCr;
+    if (id == "xer") return kXer;
+    if (id.size() < 2 || id.size() > 3 || (id[0] != 'r' && id[0] != 'f' && id[0] != 'p')) return -1;
+    unsigned n = 0;
+    for (char ch : id.substr(1)) {
+        if (ch < '0' || ch > '9') return -1;
+        n = n * 10 + unsigned(ch - '0');
+    }
+    if (n > 31 || (id.size() == 3 && id[1] == '0')) return -1;
+    return static_cast<int>((id[0] == 'r' ? 0 : id[0] == 'f' ? 32 : 64) + n);
+}
+
+std::string local_name(unsigned i) {
+    if (i >= 96) return i == kLr ? "lr" : i == kCtr ? "ctr" : i == kCr ? "cr" : "xer";
+    return std::format("{}{}", i < 32 ? 'r' : i < 64 ? 'f' : 'p', i % 32);
+}
+
+std::string context_name(unsigned i) {
+    if (i >= 96) return "c." + local_name(i);
+    return std::format("c.{}[{}]", i < 32 ? "r" : i < 64 ? "f" : "ps1", i % 32);
+}
+
+bool word_char(char ch) { return std::isalnum(static_cast<unsigned char>(ch)) || ch == '_'; }
+
+// The registers a piece of generated code mentions (members like c.lr and
+// names like rt::crb aren't registers).
+Regs mentions(std::string_view t) {
+    Regs m;
+    for (size_t i = 0; i < t.size();) {
+        if (!word_char(t[i])) {
+            ++i;
+            continue;
+        }
+        size_t j = i;
+        while (j < t.size() && word_char(t[j])) ++j;
+        const char before = i ? t[i - 1] : ' ';
+        if (before != '.' && before != ':' && !std::isdigit(static_cast<unsigned char>(t[i])))
+            if (const int r = reg_index(t.substr(i, j - i)); r >= 0) m.set(static_cast<size_t>(r));
+        i = j;
+    }
+    return m;
+}
+
+// The registers a piece of generated code may write: assignment targets
+// (=, compound assignments, ++ and --) and the arguments of the runtime
+// helpers that take locals by reference (only rt::psq_l; a new one must be
+// added here, or the dataflow would skip storing what it writes).
+Regs writes(std::string_view t) {
+    Regs w;
+    if (t.find("rt::psq_l(") != std::string_view::npos) return mentions(t);
+    for (size_t i = 0; i < t.size();) {
+        if (!word_char(t[i])) {
+            ++i;
+            continue;
+        }
+        size_t j = i;
+        while (j < t.size() && word_char(t[j])) ++j;
+        const char before = i ? t[i - 1] : ' ';
+        const int r = before != '.' && before != ':' && !std::isdigit(static_cast<unsigned char>(t[i]))
+                          ? reg_index(t.substr(i, j - i))
+                          : -1;
+        if (r >= 0) {
+            size_t k = j;
+            while (k < t.size() && t[k] == ' ') ++k;
+            const std::string_view after = t.substr(k);
+            const bool assigned = (after.starts_with("=") && !after.starts_with("==")) || after.starts_with("|=") ||
+                                  after.starts_with("&=") || after.starts_with("^=") || after.starts_with("+=") ||
+                                  after.starts_with("-=") || after.starts_with("<<=") || after.starts_with(">>=") ||
+                                  after.starts_with("++") || after.starts_with("--");
+            const bool stepped = i >= 2 && (t.substr(i - 2, 2) == "--" || t.substr(i - 2, 2) == "++");
+            if (assigned || stepped) w.set(static_cast<size_t>(r));
+        }
+        i = j;
+    }
+    return w;
+}
+
+// What a piece of code reads before writing (gen) and certainly writes
+// (kill), statement by statement in order. A statement "x = expr" reads expr
+// and writes x; any other statement reads everything it mentions. From the
+// first condition on, everything mentioned is read and nothing counts as
+// written.
+struct UseDef {
+    Regs gen, kill;
+};
+UseDef use_def(std::string_view t) {
+    UseDef u;
+    std::string_view rest;
+    for (const std::string_view stop : {"if (", "switch ("})
+        if (const size_t at = t.find(stop); at != std::string_view::npos) {
+            rest = t.substr(at);
+            t = t.substr(0, at);
+        }
+    size_t start = 0;
+    for (size_t i = 0; i <= t.size(); ++i) {
+        if (i < t.size() && t[i] != ';' && t[i] != '{' && t[i] != '}') continue;
+        std::string_view st = t.substr(start, i - start);
+        start = i + 1;
+        while (!st.empty() && (st.front() == ' ' || st.front() == '\n')) st.remove_prefix(1);
+        size_t j = 0;
+        while (j < st.size() && word_char(st[j])) ++j;
+        const int r = reg_index(st.substr(0, j));
+        if (r >= 0 && st.substr(j).starts_with(" = ")) {
+            u.gen |= mentions(st.substr(j + 3)) & ~u.kill;
+            u.kill.set(static_cast<size_t>(r));
+        } else {
+            u.gen |= mentions(st) & ~u.kill;
+        }
+    }
+    u.gen |= mentions(rest) & ~u.kill;
+    return u;
+}
+
 LiftResult Emitter::run() {
     LiftResult r;
-    uint32_t prev = 0;
-    std::vector<std::pair<uint32_t, size_t>> label_spots;  // address, offset in body_
+    struct Node {
+        uint32_t pc = 0;
+        std::string text;
+        std::vector<uint32_t> jumps;
+        bool stops = false;
+    };
+    std::vector<Node> nodes;
     for (uint32_t pc : f_.insns) {
         const Insn in = cfg_.insn(pc);
-        label_spots.emplace_back(pc, body_.size());
+        body_.clear();
+        jumps_.clear();
+        stops_ = false;
         try {
             if (!in.valid()) throw Unsupported{"invalid instruction"};
             instruction(pc, in);
@@ -720,26 +871,111 @@ LiftResult Emitter::run() {
             r.why = u.why;
             return r;
         }
-        prev = pc;
+        nodes.push_back({pc, std::move(body_), jumps_, stops_});
     }
     // Execution that runs on into the next function.
-    if (!f_.insns.empty() && !Cfg::is_terminator(cfg_.insn(prev))) {
+    if (!nodes.empty() && !nodes.back().stops) {
+        const uint32_t prev = nodes.back().pc;
         const Insn last = cfg_.insn(prev);
         const bool always = (last.op == Op::bc || last.op == Op::bclr || last.op == Op::bcctr) && !last.lk() &&
                             (last.rd() & 0x14) == 0x14;
-        if (!always) {
+        if (!Cfg::is_terminator(last) && !always) {
             if (!f_.falls_into) {
                 r.fail_at = prev;
                 r.why = "runs off the end of the function";
                 return r;
             }
+            body_.clear();
             line(tail_direct(f_.falls_into));
+            nodes.push_back({0, std::move(body_), {}, true});
         }
     }
 
-    // Labels where something jumps, inserted from the end so offsets stay valid.
-    for (auto it = label_spots.rbegin(); it != label_spots.rend(); ++it)
-        if (targets_.contains(it->first)) body_.insert(it->second, label(it->first) + ":;\n");
+    // Each node: the text before @OUT@, between @OUT@ and @IN@ (or the end),
+    // and after @IN@; whether its sync is conditional; its successors.
+    const size_t n = nodes.size();
+    std::map<uint32_t, size_t> at;
+    for (size_t i = 0; i < n; ++i)
+        if (nodes[i].pc) at[nodes[i].pc] = i;
+    struct Part {
+        bool out = false, in = false, conditional = false;
+        Regs pre_w, mid_m, post_w;  // what may be written (for dirty); what the call reads (mid)
+        UseDef pre, post;           // reads and certain writes (for live)
+        std::vector<size_t> succ;
+    };
+    std::vector<Part> part(n);
+    for (size_t i = 0; i < n; ++i) {
+        const std::string_view t = nodes[i].text;
+        Part& p = part[i];
+        const size_t o = t.find("@OUT@"), g = t.find("@IN@");
+        p.out = o != std::string_view::npos;
+        p.in = g != std::string_view::npos;
+        const std::string_view pre = t.substr(0, p.out ? o : t.size());
+        p.conditional = p.out && pre.find("if (") != std::string_view::npos;
+        p.pre_w = writes(pre), p.pre = use_def(pre);
+        if (p.out) p.mid_m = mentions(t.substr(o + 5, p.in ? g - o - 5 : std::string_view::npos));
+        if (p.in) p.post_w = writes(t.substr(g + 4)), p.post = use_def(t.substr(g + 4));
+        if (!nodes[i].stops && i + 1 < n) p.succ.push_back(i + 1);
+        for (uint32_t target : nodes[i].jumps) p.succ.push_back(at.at(target));
+    }
+
+    // Dirty, forward to a fixpoint.
+    std::vector<Regs> dirty_in(n), dirty_out(n), dirty_at_out(n);
+    for (bool changed = true; changed;) {
+        changed = false;
+        for (size_t i = 0; i < n; ++i) {
+            const Part& p = part[i];
+            Regs d = dirty_in[i] | p.pre_w;
+            if (p.out) {
+                dirty_at_out[i] = d;
+                d = p.conditional ? d | p.post_w : p.post_w;
+            }
+            if (d != dirty_out[i]) dirty_out[i] = d, changed = true;
+            for (size_t s : p.succ)
+                if ((dirty_in[s] | d) != dirty_in[s]) dirty_in[s] |= d, changed = true;
+        }
+    }
+    // Live, backward to a fixpoint.
+    std::vector<Regs> live_in(n), reload(n);
+    for (bool changed = true; changed;) {
+        changed = false;
+        for (size_t k = n; k-- > 0;) {
+            const Part& p = part[k];
+            Regs l;
+            for (size_t s : p.succ) l |= live_in[s];
+            if (p.out) {
+                Regs after = l;  // what's live once the call returns
+                if (p.in) after = p.conditional ? after | p.post.gen : (after & ~p.post.kill) | p.post.gen;
+                reload[k] = p.in ? after : Regs{};
+                const Regs before_call = p.mid_m | dirty_at_out[k];
+                l = p.conditional ? (l | after | before_call) : before_call;
+            }
+            l = (l & ~p.pre.kill) | p.pre.gen;
+            if (l != live_in[k]) live_in[k] = l, changed = true;
+        }
+    }
+
+    // The text, with each sync point's stores and reloads, and the labels.
+    std::string body;
+    for (size_t i = 0; i < n; ++i) {
+        std::string t = std::move(nodes[i].text);
+        if (nodes[i].pc && targets_.contains(nodes[i].pc)) body += label(nodes[i].pc) + ":;\n";
+        auto sync = [](const Regs& set, bool store) {
+            std::string s;
+            for (unsigned g = 0; g < kRegCount; ++g)
+                if (set[g])
+                    s += store ? std::format("{} = {}; ", context_name(g), local_name(g))
+                               : std::format("{} = {}; ", local_name(g), context_name(g));
+            return s;
+        };
+        if (const size_t o = t.find("@OUT@ "); o != std::string::npos) t.replace(o, 6, sync(dirty_at_out[i], true));
+        if (const size_t g = t.find("@IN@"); g != std::string::npos) {
+            std::string s = sync(reload[i], false);
+            if (g + 4 < t.size() && t[g + 4] == ' ') t.erase(g + 4, 1);
+            t.replace(g, 4, s);
+        }
+        body += t;
+    }
 
     std::string code = std::format("void {}(rt::Context& c) {{\n", fn_name(f_.start));
     // One declaration per local: MSVC applies [[maybe_unused]] only to the
@@ -761,17 +997,7 @@ LiftResult Emitter::run() {
     }
     code += "    [[maybe_unused]] uint32_t lr = c.lr; [[maybe_unused]] uint32_t ctr = c.ctr;"
             " [[maybe_unused]] uint32_t cr = c.cr; [[maybe_unused]] uint32_t xer = c.xer;\n";
-    auto sync = [&](bool to_context) {
-        std::string s;
-        for (unsigned g : gprs_) s += to_context ? std::format(" c.r[{0}] = r{0};", g) : std::format(" r{0} = c.r[{0}];", g);
-        for (unsigned g : fprs_) s += to_context ? std::format(" c.f[{0}] = f{0};", g) : std::format(" f{0} = c.f[{0}];", g);
-        for (unsigned g : ps1_) s += to_context ? std::format(" c.ps1[{0}] = p{0};", g) : std::format(" p{0} = c.ps1[{0}];", g);
-        s += to_context ? " c.lr = lr; c.ctr = ctr; c.cr = cr; c.xer = xer;" : " lr = c.lr; ctr = c.ctr; cr = c.cr; xer = c.xer;";
-        return s;
-    };
-    if (out_) code += "    auto out = [&] {" + sync(true) + " };\n";
-    if (in_) code += "    auto in = [&] {" + sync(false) + " };\n";
-    code += body_ + "}\n";
+    code += body + "}\n";
     r.ok = true;
     r.code = std::move(code);
     return r;
