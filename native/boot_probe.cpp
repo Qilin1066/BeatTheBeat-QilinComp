@@ -37,6 +37,9 @@ constexpr std::uint32_t sdk_return_from_init_caches = 0x8000437C;
 constexpr std::uint32_t sdk_set_error_handler = 0x800DDF10;
 constexpr std::uint32_t sdk_dma_error_handler = 0x800DD240;
 constexpr std::uint32_t sdk_machine_check_error = 1;
+constexpr std::uint32_t sdk_write_monitor_control = 0x800DA760;
+constexpr std::uint32_t sdk_return_from_first_monitor_write = 0x800DB414;
+constexpr std::uint32_t sdk_after_monitor_reset = 0x800DB43C;
 
 struct Stop {
     std::string_view reason;
@@ -132,6 +135,12 @@ void start_from_loaded_image(CPUState& cpu) {
             cpu.gpr[3] = sdk_machine_check_error;
             cpu.gpr[4] = sdk_dma_error_handler;
             cpu.pc = sdk_set_error_handler;
+        } else if (cpu.pc == sdk_write_monitor_control &&
+                   cpu.lr == sdk_return_from_first_monitor_write && cpu.gpr[3] == 0) {
+            // OSInit clears two control registers and four counters in one sequence.
+            // The native probe starts with no active profiling session.
+            cpu.lr = sdk_after_monitor_reset;
+            cpu.pc = sdk_after_monitor_reset;
         }
         const auto start_pc = cpu.pc;
         cpu.downcount = 0;

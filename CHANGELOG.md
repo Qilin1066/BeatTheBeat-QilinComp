@@ -6,6 +6,7 @@
 - Lowered `dcbf` and `dcbst` at compile time for the native probe's coherent RAM model.
 - Verified that Windows x64 passes the initial cache-flush loop and reaches the SDK's `mfhid0` instruction.
 - Replaced the cold-boot data and cache setup with native initialization while retaining the SDK DMA error-handler registration. Verified that the PAL WBFS build reaches the performance monitor setup in `OSInit` on Windows x64.
+- Replaced the PAL startup monitor reset with an inactive native profiling state. The Windows x64 build now reaches the HID4 configuration in `OSInit`.
 
 ## 0.1.0-alpha.1 — 2026-11-18
 
