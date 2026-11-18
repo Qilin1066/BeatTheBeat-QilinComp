@@ -11,6 +11,19 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-18
+The lifter's first slice and the differential test: 6,374 of the game's functions become C++, and every one runs against the original code under Unicorn: 25,496 trials, 0 unexplained mismatches.
+
+### Added
+- **Lifter, slice 1** (`recomp/src/lifter.*`): integer arithmetic with carry and overflow, compares, logical, rotate and shift, every integer load and store, the condition-register and XER instructions, traps, `dcbz`, and all control flow: labels and `goto`, jump tables as a `switch`, direct calls with a check of the return address, tail calls, fall-through into the next function, indirect calls through the function table. Registers live in host locals and are written back only around calls and returns. Floating point, paired singles and privileged instructions stop the lifter with the reason.
+- **Runtime** (`recomp/runtime/`): `guest.hpp` (the context, big-endian memory, checked in bring-up builds, and the arithmetic and flag helpers, with Broadway's results for division by zero), `dispatch.cpp` (the function table, special registers, the time base).
+- **`qilin lift`:** C++ in 300-function files, stubs that stop for what isn't lifted, the function table, and `lift_report.txt` with the reasons.
+- **Differential test** (`tools/difftest/`): lifted functions against the original code under Unicorn's PowerPC 750CL model, from random states, comparing registers, memory and how each stopped; works around four Unicorn problems (XER flags, stale translations, a write hook that misses `dcbz`, `stmw` and `stswi`, `dcbz` fault addresses).
+- **Tests:** the lifter's output for the synthetic program, the runtime helpers.
+
+### Fixed
+- `ori`, `oris`, `xori` and `xoris` with an odd immediate no longer update CR0 (found by the differential test).
+
 ## [0.4.0] - 2026-11-18
 The decomp's names on the PAL build, and the library boundaries: 8,043 of the decomp's 8,103 functions match ours exactly, and every library has a PAL range and a plan (lift, replace or drop).
 

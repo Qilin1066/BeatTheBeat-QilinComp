@@ -1,6 +1,6 @@
 # Recompiler core: status (roadmap steps 1–2)
 
-Last updated 2026-11-18 (v0.4.0: function boundaries checked against the decomp's, three CodeWarrior habits handled; v0.3.0: function discovery and CFG, coverage accounting, everything run on the PAL `main.dol`; v0.2.0: DOL loader, Broadway decoder, the binutils cross-check, CI).
+Last updated 2026-11-18 (v0.5.0: lifter slice 1, integer and control flow, and the differential test against Unicorn; v0.4.0: function boundaries checked against the decomp's, three CodeWarrior habits handled; v0.3.0: function discovery and CFG, coverage accounting, everything run on the PAL `main.dol`; v0.2.0: DOL loader, Broadway decoder, the binutils cross-check, CI).
 
 ## Language and toolchain
 Everything is **C++23**: the recompiler, the runtime and the generated code. The C++23 features in use so far are `std::expected` (the DOL loader), `std::print`/`std::format` (the tools), `std::ranges` algorithms and `std::string::contains`.
@@ -69,8 +69,48 @@ CodeWarrior makes this simpler than on x86: every instruction is one aligned wor
 
 **Tests:** a synthetic program with a function found each way (entry, call, tail call, `lis`/`addi`, vtable, gap), a switch with its case after the default, a register-save chain, the get-PC idiom, an indirect tail call, a tail call into a frame set-up, the leftover `blr` and epilogue, padding and dead code, checked function by function and word by word; and a data pointer to code that runs into an invalid word, which validation must reject.
 
+### Lifter, slice 1 (`recomp/src/lifter.*`, runtime `recomp/runtime/guest.hpp` and `dispatch.cpp`)
+One C++ function per guest function, `void fn_80004050(rt::Context& c)`. Slice 1 covers the integer instruction set: arithmetic with carry and overflow, compares, logical, rotate and shift, every integer load and store (update, indexed, byte-reversed, multiple, string, `lwarx`/`stwcx.`), the condition-register instructions, `mfcr`/`mtcrf`/`mcrxr`, LR/CTR/XER moves, `mftb`, `dcbz`, traps and `sc`, and all control flow.
+
+- **Register model:** the GPRs a function uses, LR, CTR, CR and XER are host locals, loaded from the context on entry and written back only around calls and returns (`out()`/`in()`), so the compiler keeps them in host registers in between. CR is one 32-bit local in the architectural layout; XER holds SO, OV and CA.
+- **Memory:** `rt::ld32`/`st32`… byte-swap over `g_mem + addr`. With `QILIN_CHECKED_MEMORY` (bring-up and the differential test), every access is checked against the mapped regions and an access outside them stops with its guest address and instruction.
+- **Control flow:** labels on branch targets and `goto`; proven jump tables become a `switch` whose default stops (`rt::bad_jump`); direct calls are C++ calls; after each call the caller checks that the callee returned to the next instruction (`c.ret`), so a `longjmp`-style return stops instead of misbehaving; tail calls and fall-through into the next function are a call and `return`; `bctrl`, `blrl` and unresolved `bctr` dispatch through the generated sorted function table (`rt::call`), and an unknown target stops. `bl` to the next instruction just loads LR.
+- **Semantics** are the 750CL manual's, with Broadway's measured results where the architecture leaves them undefined: `divw` by zero or `0x80000000 / -1` gives all ones for a negative dividend and 0 otherwise, `divwu` by zero gives 0 (as Dolphin records them). Cache and synchronisation instructions other than `dcbz` are no-ops: there are no caches or reordering to manage. Special registers other than LR, CTR and XER go through `rt::mfspr`/`mtspr`, which allow only the GQRs, HID2 and the SPRGs and stop on anything else.
+- **Fail loudly:** a function is lifted whole or not at all. Floating point (slice 3), paired singles (slice 4) and privileged instructions make the lifter stop with the instruction and the reason; `qilin lift` writes a stub that stops with "not lifted" and lists the reasons in `lift_report.txt`.
+
+On the game, `qilin lift` takes 1.5 s: **6,374 of the 8,171 functions lift** (78%). The rest: 1,722 use floating point, 19 paired singles, 56 privileged instructions (the OS and the debugger stub, which are replaced). The generated code (25 files) compiles warning-free with `-Wall -Wextra -Wpedantic -Wshadow -Werror` under GCC 14 and Clang 19.
+
+### Differential test (`tools/difftest/`)
+`qilin_difftest` (built with `-DQILIN_GEN_DIR=…`) runs lifted functions on test cases; `difftest.py` runs the original code under Unicorn's PowerPC 750CL model from the same state and compares. Each trial gives the function random registers (a third of them pointers into a 64 KB random heap whose words point back into it a third of the time, some small integers, some near `r13`), the game's real `r2`/`r13`, a random stack, and MEM1 holding the DOL image. It compares all 32 GPRs, LR, CTR, CR, XER, where the function returned to, every changed 32-byte block of MEM1, and how it stopped: a memory fault (instruction and address), a trap, or a call into a function that isn't lifted yet (on both sides, the call is where the trial ends). Whole call trees run on both sides.
+
+```sh
+qilin lift main.dol --out gen
+cmake -S . -B build-gen -DQILIN_GEN_DIR=$PWD/gen && cmake --build build-gen --target qilin_difftest
+python3 tools/difftest/difftest.py --harness build-gen/qilin_difftest --dol main.dol --gen gen [--trials 4]
+```
+
+Four Unicorn 2.1 problems are worked around, each found as a run of false mismatches and confirmed with a minimal test:
+- Its register API stores XER without setting the SO, OV and CA flags the instructions use: XER goes in through a `mtxer` stub and comes out through `mfxer`.
+- It keeps translations of code that changed: the stub's translation is dropped each trial.
+- Its memory-write hook misses `dcbz`, `stmw` and `stswi`, so changes are found by comparing all of MEM1 with the trial's starting state (the harness does the same), and every changed page is restored. Before this, trials left memory behind for the next ones, which showed up as 80 mismatching functions in the OS, AX and GX.
+- For a `dcbz` that faults, it reports where its internal 8-byte zeroing loop faulted; the lifted code reports the address the instruction used, as the hardware's DAR does. A fault at the same `dcbz` in the same 32-byte block counts as agreement.
+
+Four differences are by design and counted, not failed:
+- a cache instruction on an unmapped address faults under Unicorn and is a no-op lifted;
+- an indirect call to an address that isn't a function stops lifted code (`bad_jump`) while Unicorn runs whatever is there;
+- a division by zero (or `0x80000000 / -1`), which the architecture leaves undefined: lifted code gives Broadway's result, Unicorn leaves the dividend in the target register (a code hook on each of the game's 184 `divw`/`divwu` notes when a trial divides by zero);
+- a call tree that reads the time base or a special register the runtime models (HID2, the GQRs), whose values differ from Unicorn's by design (653 functions reach one, through `OSGetTick` and the like). A trial whose lifted side doesn't finish in 20 s, when the original did, is a mismatch. Trials that loop for 400,000 instructions under Unicorn, or reach a special register or system call the runtime doesn't model, are skipped and counted.
+
+**It found one lifter bug:** `ori`, `oris`, `xori` and `xoris` have no record bit (bit 31 belongs to the immediate), but the lifter updated CR0 when the immediate was odd. Fixed, with a regression test.
+
+**Results on the game** (4 trials per function): **6,374 functions, 25,496 trials, 0 unexplained mismatches.** 24,888 trials agree exactly: 7,801 returned, 11,619 stopped at the same memory fault (instruction and address), 5,468 reached the same call to a function that isn't lifted yet. 349 are the known differences above (316 indirect jumps to non-functions, 17 time-base readers, 11 cache operations, 3 divisions by zero, 2 `dcbz` fault addresses), and 259 were skipped (82 Unicorn exceptions such as `sc`, 66 runaway loops on random input, 111 special registers or system calls the test runtime doesn't model). A full run takes about 45 minutes on two cores.
+
+The many trials that end in a memory fault come from random pointers; better-shaped inputs (real structures from a running game) will come with the runtime.
+
 ### `qilin` CLI (`recomp/src/main.cpp`)
-`info` (JSON), `insns` (every word of the text sections: address, word, text), `disasm` (a raw file of big-endian words, for the sweep), `profile` (instruction mix of the text sections, with paired-single, floating-point and privileged counts), `cfg` (summary, `--json` for every function), `coverage` (exit status 3 while any word is unknown) and `suspects`. Exit status is non-zero on any error.
+`info` (JSON), `insns` (every word of the text sections: address, word, text), `disasm` (a raw file of big-endian words, for the sweep), `profile` (instruction mix of the text sections, with paired-single, floating-point and privileged counts), `cfg` (summary, `--json` for every function), `coverage` (exit status 3 while any word is unknown), `suspects` and `lift` (`--out <dir>`, `--range lo-hi`, `--only addr`). Exit status is non-zero on any error.
 
 ## Next
-1. The lifter's first slice (integer, with CR/XER elimination), the generated function table for indirect calls, and the differential test's reference executor.
+1. Slice 2's register-model work: liveness, so locals are written back only where a callee or the caller can read them, and CR bits computed only where read.
+2. Slice 3, floating point: Broadway's FPU in native `double`/`float` with fused multiply-adds, FPSCR where read, the estimate tables; the differential test with FP state.
+3. Slice 4, paired singles and GQR quantisation, with a reference model where Unicorn has none.

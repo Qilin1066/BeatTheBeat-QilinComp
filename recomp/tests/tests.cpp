@@ -1,6 +1,8 @@
 // Self-contained tests: SHA-256, a synthetic DOL built in memory, the
-// Broadway decoder, and function discovery on a synthetic program. No game files required (runs in CI).
+// Broadway decoder, function discovery and the lifter on a synthetic
+// program, and the runtime helpers lifted code calls. No game files required (runs in CI).
 #include <algorithm>
+#include <map>
 #include <cstring>
 #include <print>
 #include <string>
@@ -10,6 +12,8 @@
 #include "cfg.hpp"
 #include "decoder.hpp"
 #include "dol.hpp"
+#include "guest.hpp"
+#include "lifter.hpp"
 #include "sha256.hpp"
 
 using namespace qilin;
@@ -517,6 +521,134 @@ void test_cfg() {
     CHECK(cfg2.coverage()[0].unknown == 2);
 }
 
+// ---------------------------------------------------------------- lifter
+
+void test_lifter() {
+    const Program p;
+    auto dol = Dol::parse(p.bytes);
+    CHECK(dol.has_value());
+    if (!dol) return;
+    Cfg cfg(*dol);
+    cfg.run();
+    const Lifter lifter(cfg);
+    std::map<uint32_t, std::string> code;
+    for (const auto& [start, f] : cfg.functions()) {
+        const LiftResult r = lifter.lift(f);
+        if (!r.ok) std::println(stderr, "  {:08x} not lifted: {} at {:08x}", start, r.why, r.fail_at);
+        CHECK(r.ok);
+        code[start] = r.code;
+    }
+    if (code.size() != cfg.functions().size()) return;
+    auto has = [&](uint32_t fn, std::string_view text) {
+        const bool ok = code[fn].contains(text);
+        if (!ok) std::println(stderr, "  {:08x} lacks: {}\n{}", fn, text, code[fn]);
+        CHECK(ok);
+    };
+    has(0x80003100, "void fn_80003100(rt::Context& c) {");
+    has(0x80003100, "lr = 0x80003108u; out(); fn_80003140(c); in(); if (c.ret != 0x80003108u) rt::bad_return(0x80003104u, c.ret);");
+    has(0x80003100, "r3 = 0x80000000u;");                      // lis r3,0x8000
+    has(0x80003100, "out(); fn_800031C0(c); return;");          // tail call
+    has(0x80003140, "switch (ctr) { case 0x80003160u: goto L_80003160; case 0x80003168u: goto L_80003168; "
+                    "case 0x80003178u: goto L_80003178; default: rt::bad_jump(0x8000315Cu, ctr); }");
+    has(0x80003140, "if (rt::crb(cr, 1)) { goto L_80003170; }");  // bgt
+    has(0x80003140, "L_80003170:;");
+    has(0x80003140, "out(); c.ret = lr; return;");
+    has(0x80003180, "out(); fn_80003184(c); return;");          // falls into the next entry
+    has(0x800031A0, "lr = 0x800031A4u;");                       // the get-PC idiom
+    CHECK(!code[0x800031A0].contains("rt::bad_return"));
+    has(0x80003210, "out(); rt::call(c, ctr, 0x80003218u); return;");
+    has(0x80003220, "out(); fn_8000322C(c); return;");
+
+    // ori/xori have no record bit: an odd immediate must not update CR0
+    // (found by the differential test).
+    CHECK(!code[0x800031A0].contains("set_cr0"));
+    {
+        Program o;
+        o.word(0x80003260, 0x60630001);  // ori r3,r3,1
+        o.word(0x80003264, 0x68630001);  // xori r3,r3,1
+        o.word(0x80003268, 0x4E800020);
+        o.word(0x80005020, 0x80003260);
+        auto d = Dol::parse(o.bytes);
+        CHECK(d.has_value());
+        if (d) {
+            Cfg c(*d);
+            c.run();
+            const LiftResult lr = Lifter(c).lift(c.functions().at(0x80003260));
+            CHECK(lr.ok && lr.code.contains("r3 = r3 | 0x1u;") && !lr.code.contains("set_cr0"));
+        }
+    }
+
+    // Floating point waits for slice 3, and says so.
+    Program q;
+    q.word(0x80003260, 0xC0230000);  // lfs f1,0(r3)
+    q.word(0x80003264, 0x4E800020);
+    q.word(0x80005020, 0x80003260);
+    auto dol2 = Dol::parse(q.bytes);
+    CHECK(dol2.has_value());
+    if (!dol2) return;
+    Cfg cfg2(*dol2);
+    cfg2.run();
+    const LiftResult r = Lifter(cfg2).lift(cfg2.functions().at(0x80003260));
+    CHECK(!r.ok && r.fail_at == 0x80003260 && r.why == "floating point (slice 3): lfs");
+}
+
+// ---------------------------------------------------------------- runtime helpers
+
+void test_runtime() {
+    // add3: carry out and signed overflow.
+    auto s = rt::add3(0xFFFFFFFFu, 1, 0);
+    CHECK(s.v == 0 && s.carry == 1 && !s.ov);
+    s = rt::add3(0x7FFFFFFFu, 1, 0);
+    CHECK(s.v == 0x80000000u && s.carry == 0 && s.ov);
+    s = rt::add3(~5u, 7, 1);  // subf: 7 - 5
+    CHECK(s.v == 2 && s.carry == 1);
+    s = rt::add3(~7u, 5, 1);  // 5 - 7 borrows: CA = 0
+    CHECK(s.v == 0xFFFFFFFEu && s.carry == 0);
+    s = rt::add3(~0x80000000u, 0, 1);  // neg 0x80000000 overflows
+    CHECK(s.v == 0x80000000u && s.ov);
+    // Broadway's divide-by-zero and overflow results.
+    CHECK(rt::divw(7, 0) == 0 && rt::divw(0xFFFFFFF9u, 0) == 0xFFFFFFFFu);
+    CHECK(rt::divw(0x80000000u, 0xFFFFFFFFu) == 0xFFFFFFFFu && rt::divw_ov(0x80000000u, 0xFFFFFFFFu));
+    CHECK(rt::divw(0xFFFFFFF9u, 2) == 0xFFFFFFFDu);  // -7 / 2 = -3, truncated
+    CHECK(rt::divwu(7, 0) == 0 && rt::divwu(0xFFFFFFFFu, 2) == 0x7FFFFFFFu);
+    CHECK(rt::mulhw(0xFFFFFFFFu, 0xFFFFFFFFu) == 0 && rt::mulhwu(0xFFFFFFFFu, 0xFFFFFFFFu) == 0xFFFFFFFEu);
+    CHECK(rt::mullw_ov(0x10000u, 0x8000u) && !rt::mullw_ov(0xFFFFFFFFu, 0x7FFFFFFFu));
+    // Shifts by 32-63 give 0 (or all sign bits); only bits 0-5 of the count matter.
+    CHECK(rt::slw(1, 32) == 0 && rt::slw(1, 31) == 0x80000000u && rt::slw(1, 64) == 1);
+    CHECK(rt::srw(0x80000000u, 63) == 0 && rt::srw(0x80000000u, 31) == 1);
+    auto a = rt::sraw(0x80000001u, 1);
+    CHECK(a.v == 0xC0000000u && a.carry == 1);  // negative, a 1 shifted out
+    a = rt::sraw(0x80000000u, 1);
+    CHECK(a.v == 0xC0000000u && a.carry == 0);  // nothing lost
+    a = rt::sraw(0x80000000u, 40);
+    CHECK(a.v == 0xFFFFFFFFu && a.carry == 1);
+    a = rt::sraw(0x7FFFFFFFu, 40);
+    CHECK(a.v == 0 && a.carry == 0);
+    // Condition register: field layout, SO from XER.
+    CHECK(rt::cmps(0xFFFFFFFFu, 1, 0) == rt::kLt && rt::cmpu(0xFFFFFFFFu, 1, 0) == rt::kGt);
+    CHECK(rt::cmps(3, 3, rt::kXerSo) == (rt::kEq | rt::kSo));
+    CHECK(rt::set_crf(0, 0, rt::kLt) == 0x80000000u && rt::set_crf(0, 7, rt::kSo) == 1);
+    CHECK(rt::set_cr0(0x0FFFFFFFu, 0, 0) == 0x2FFFFFFFu);
+    CHECK(rt::crb(0x20000000u, 2) == 1 && rt::set_crb(0, 31, 1) == 1);
+    CHECK(rt::set_ov(0, true) == (rt::kXerOv | rt::kXerSo) && rt::set_ov(rt::kXerOv | rt::kXerSo, false) == rt::kXerSo);
+    CHECK(rt::ca(rt::set_ca(0, 1)) == 1);
+
+    // Big-endian guest memory over a little-endian host.
+    std::vector<uint8_t> mem(64, 0);
+    uint8_t* saved = rt::g_mem;
+    rt::g_mem = mem.data() - 0x100;  // guest 0x100 is mem[0]
+    rt::st32(0x100, 0x11223344u);
+    CHECK(mem[0] == 0x11 && mem[3] == 0x44 && rt::ld32(0x100) == 0x11223344u);
+    CHECK(rt::ld16(0x102) == 0x3344 && rt::ld8(0x101) == 0x22);
+    CHECK(rt::ld32r(0x100) == 0x44332211u && rt::ld16r(0x100) == 0x2211);
+    rt::st16(0x104, 0xFFFE);
+    CHECK(rt::lha(0x104) == 0xFFFFFFFEu);
+    rt::st32(0x120, 0xFFFFFFFFu);
+    rt::dcbz(0x13F);  // zeroes the block 0x120-0x13F
+    CHECK(rt::ld32(0x120) == 0 && rt::ld32(0x13C) == 0 && rt::ld32(0x100) == 0x11223344u);
+    rt::g_mem = saved;
+}
+
 }  // namespace
 
 int main() {
@@ -524,6 +656,8 @@ int main() {
     test_dol();
     test_decoder();
     test_cfg();
+    test_lifter();
+    test_runtime();
     if (failures) {
         std::println(stderr, "{} check(s) failed", failures);
         return 1;
