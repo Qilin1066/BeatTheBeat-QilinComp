@@ -21,6 +21,8 @@ Static recompilation of **Beat the Beat: Rhythm Paradise** (Wii, PAL `SOMP01` re
 - `tools/check/verify_decoder.py`: compares the decoder with binutils objdump.
 - `tools/difftest/`: runs lifted code and the original under Unicorn and compares the results, one worker per CPU. Runs on Linux, macOS and Windows. Trials are seeded per function, so `--only`/`--range` replay a full run's trials exactly.
 - `tools/analysis/port_symbols.py`: ports US decomp names to PAL.
+- `recomp/src/hwaccess.*` (`qilin hwaccess`) and `tools/analysis/runtime_todo.py`: the runtime's to-do list (replaced functions lifted code calls, its direct hardware accesses). Their output is game-derived: never commit it.
+- `tools/difftest/build_ubsan.py`: the UBSan harness through zig's Clang, on any host.
 - `docs/`: design and results. Keep them current. `recompiler-core.md` covers the decoder, CFG, lifter and difftest; `roadmap-and-design-targets.md` is the roadmap.
 
 ## Build and check
@@ -68,19 +70,20 @@ Before a milestone commit, all of these must hold: tests pass, warnings are clea
   - it reports the `dcbz` fault address differently
 - Library split (`docs/code-analysis.md`): lift game/NW4R/MSL/runtime/etc. (74%); replace OS, DVD, GX, AX, pad, WPAD, NAND… (25%); drop MetroTRK/NdevExi2A (1%).
 
-## Status (v0.10.0)
+## Status (v0.11.0)
 
 - 8,171 functions, all 157 jump tables proven, 98.80% of `.text` reached as code (the rest is identified as padding, dead code or data).
 - 8,103 functions lifted (slices 1, 3 and 4: integer, floating point, paired singles). Left: 56 privileged and 7 FPSCR (replaced libraries), 5 `fres`/`frsqrte`.
 - Difftest: 64,824 trials (8 per function), 0 unexplained mismatches; 170 s on 16 workers.
 - Calls store only dirty registers and reload only live ones (lifted objects 10.6% smaller).
 - Difftest under UBSan: no undefined behaviour.
+- Runtime to-do list: lifted code calls 309 replaced functions (GX 111, OS 63, WPAD 44, AX 27, NAND 23, ...); its only direct hardware access is the GX FIFO (322 stores in 12 functions); 5 lift-side functions (PSMTXInverse, PSMTXInvXpose, PSVECNormalize, PSVECMag, FrSqrt) need the estimate tables.
 - Generated code is warning-free under MSVC 17.14 and Clang 22; GCC 14 is unchecked (no Linux here), so v0.6.0-v0.10.0 aren't pushed yet.
 - `qilin lift` output is in fixed 256-function chunks and only changed files are rewritten, so rebuilds are incremental.
 
 ## Next steps, in order
 
-1. Hardware-access profile, exception tables, timing model; then the runtime (OS, DVD, NAND, GX on Vulkan, AX, input).
+1. The runtime, from its to-do list: OS first (threads, time, memory, interrupts as the lifted code calls them), then GX on Vulkan (including the FIFO stores), AX, DVD, NAND, input. Exception tables and a timing model as the runtime needs them.
 
 ## Conventions
 

@@ -11,6 +11,8 @@
 //   qilin suspects <main.dol>                    functions with problems, for review
 //   qilin lift    <main.dol> --out <dir> [--range lo-hi] [--only addr]
 //                                                lift to C++ (generated code: never commit it)
+//   qilin hwaccess <main.dol> [--json out.json]  loads and stores at constant addresses outside
+//                                                cached MEM1 (hardware, GX FIFO, MEM2...), per function
 //
 // Listings are one line per word: address, word, text ("8000310c 4e800020 bclr 20,lt,0").
 // Exit status is non-zero on any error; nothing fails silently.
@@ -36,6 +38,7 @@
 #include "cfg.hpp"
 #include "decoder.hpp"
 #include "dol.hpp"
+#include "hwaccess.hpp"
 #include "lifter.hpp"
 
 #ifndef QILIN_VERSION
@@ -62,6 +65,7 @@ int usage() {
                "  qilin coverage <main.dol> [--list]\n"
                "  qilin suspects <main.dol>\n"
                "  qilin lift    <main.dol> --out <dir> [--range lo-hi] [--only addr]\n"
+               "  qilin hwaccess <main.dol> [--json out.json]\n"
                "  qilin --version\n");
     return 2;
 }
@@ -348,6 +352,41 @@ int cmd_lift(const Args& a) {
     return 0;
 }
 
+// Constant-address accesses outside cached MEM1, by region; --json lists
+// them per function. Derived from the game: never commit the output.
+int cmd_hwaccess(const Args& a) {
+    const Dol dol = load_dol(a.input);
+    Cfg cfg(dol);
+    cfg.run();
+    std::map<std::string, std::pair<size_t, std::set<uint32_t>>> by_region;  // accesses, functions
+    std::string json = "{\n  \"functions\": [";
+    bool first = true;
+    for (const auto& [start, f] : cfg.functions()) {
+        const std::vector<HwAccess> found = hardware_accesses(cfg, f);
+        if (found.empty()) continue;
+        json += std::format("{}\n    {{\"start\": \"0x{:08X}\", \"accesses\": [", first ? "" : ",", start);
+        first = false;
+        for (size_t i = 0; i < found.size(); ++i) {
+            const HwAccess& h = found[i];
+            const std::string region(hw_region(h.ea));
+            auto& [count, fns] = by_region[region];
+            ++count;
+            fns.insert(start);
+            json += std::format("{}{{\"pc\": \"0x{:08X}\", \"ea\": \"0x{:08X}\", \"size\": {}, \"store\": {}, \"region\": \"{}\"}}",
+                                i ? ", " : "", h.pc, h.ea, h.size, h.store ? "true" : "false", region);
+        }
+        json += "]}";
+    }
+    json += "\n  ]\n}\n";
+    for (const auto& [region, cf] : by_region)
+        std::println("{:6} accesses in {:5} functions: {}", cf.first, cf.second.size(), region);
+    if (a.json) {
+        std::ofstream out(*a.json, std::ios::binary);
+        if (!(out << json)) throw Failure{std::format("cannot write {}", *a.json)};
+    }
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -366,6 +405,7 @@ int main(int argc, char** argv) {
         if (a.command == "coverage") return cmd_coverage(a);
         if (a.command == "suspects") return cmd_suspects(a);
         if (a.command == "lift") return cmd_lift(a);
+        if (a.command == "hwaccess") return cmd_hwaccess(a);
         return usage();
     } catch (const Failure& f) {
         std::println(stderr, "qilin: {}", f.message);

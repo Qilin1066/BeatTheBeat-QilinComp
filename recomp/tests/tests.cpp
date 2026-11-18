@@ -13,6 +13,7 @@
 #include "decoder.hpp"
 #include "dol.hpp"
 #include "guest.hpp"
+#include "hwaccess.hpp"
 #include "lifter.hpp"
 #include "sha256.hpp"
 
@@ -667,6 +668,44 @@ void test_float() {
     CHECK(rt::single_significand(1.5) && rt::single_significand(rt::lfs(0x3DCCCCCDu)) && !rt::single_significand(0.1));
 }
 
+void test_hwaccess() {
+    // Regions of the address map.
+    CHECK(hw_region(0x80001234u).empty() && hw_region(0x817FFFFFu).empty());
+    CHECK(hw_region(0xCC008000u) == "GX FIFO (write-gather pipe)" && hw_region(0xCC002000u) == "VI (video interface)");
+    CHECK(hw_region(0xCD006C00u) == "AI (audio interface)" && hw_region(0xCD000004u) == "Hollywood registers (IPC and others)");
+    CHECK(hw_region(0x90000000u) == "MEM2" && hw_region(0xC0001000u) == "MEM1 uncached" && hw_region(0x12345678u) == "unmapped");
+
+    // Constant propagation: lis/ori addresses are followed, a cached MEM1
+    // store isn't reported, and a call makes registers unknown.
+    Program q;
+    const uint32_t words[] = {
+        0x3C60CC01,  // lis r3,0xCC01
+        0xD0238000,  // stfs f1,-0x8000(r3)   -> GX FIFO store at 0xCC008000
+        0x3C80CC00,  // lis r4,0xCC00
+        0x60842000,  // ori r4,r4,0x2000
+        0xA0A40000,  // lhz r5,0(r4)          -> VI load at 0xCC002000
+        0x3CC08000,  // lis r6,0x8000
+        0x90A60000,  // stw r5,0(r6)          -> cached MEM1: not reported
+        0x48000085,  // bl 0x80003300
+        0x90A30004,  // stw r5,4(r3)          -> r3 unknown after the call: not reported
+        0x4E800020,  // blr
+    };
+    uint32_t at = 0x80003260;
+    for (uint32_t w : words) q.word(at, w), at += 4;
+    q.word(0x80003300, 0x4E800020);  // the callee: blr
+    q.word(0x80005020, 0x80003260);
+    auto d = Dol::parse(q.bytes);
+    CHECK(d.has_value());
+    if (!d) return;
+    Cfg c(*d);
+    c.run();
+    const std::vector<HwAccess> found = hardware_accesses(c, c.functions().at(0x80003260));
+    CHECK(found.size() == 2);
+    if (found.size() != 2) return;
+    CHECK(found[0].pc == 0x80003264u && found[0].ea == 0xCC008000u && found[0].size == 4 && found[0].store);
+    CHECK(found[1].pc == 0x80003270u && found[1].ea == 0xCC002000u && found[1].size == 2 && !found[1].store);
+}
+
 void test_paired() {
     using rt::bits;
     using rt::dbl;
@@ -802,6 +841,7 @@ int main() {
     test_runtime();
     test_float();
     test_paired();
+    test_hwaccess();
     if (failures) {
         std::println(stderr, "{} check(s) failed", failures);
         return 1;

@@ -181,9 +181,8 @@ Previously (v0.6.0, slice 1 only): **6,374 functions, 50,992 trials, 0 unexplain
 The many trials that end in a memory fault come from random pointers; better-shaped inputs (real structures from a running game) will come with the runtime.
 
 ### `qilin` CLI (`recomp/src/main.cpp`)
-`info` (JSON), `insns` (every word of the text sections: address, word, text), `disasm` (a raw file of big-endian words, for the sweep), `profile` (instruction mix of the text sections, with paired-single, floating-point and privileged counts), `cfg` (summary, `--json` for every function), `coverage` (exit status 3 while any word is unknown), `suspects` and `lift` (`--out <dir>`, `--range lo-hi`, `--only addr`; writes only files whose content changed). Exit status is non-zero on any error.
+`info` (JSON), `insns` (every word of the text sections: address, word, text), `disasm` (a raw file of big-endian words, for the sweep), `profile` (instruction mix of the text sections, with paired-single, floating-point and privileged counts), `cfg` (summary, `--json` for every function), `coverage` (exit status 3 while any word is unknown), `suspects`, `hwaccess` (constant-address loads and stores outside cached MEM1 per function, `--json`; see `code-analysis.md`) and `lift` (`--out <dir>`, `--range lo-hi`, `--only addr`; writes only files whose content changed). Exit status is non-zero on any error.
 
 ## Next
-1. The hardware-access profile: which lifted functions touch memory-mapped hardware or call replaced libraries, as the runtime's to-do list.
+1. The runtime, starting from its to-do list (`code-analysis.md`): the replaced functions lifted code calls, and the GX FIFO.
 2. Broadway's open FP questions, from hardware or a clean source: frC rounding in single-precision and paired-single multiplies, the `fres`/`frsqrte`/`ps_res`/`ps_rsqrte` tables, `fctiwz`'s high word for negative inputs, non-IEEE compares and `fsel`.
-3. The runtime.

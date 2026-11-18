@@ -11,6 +11,14 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-11-18
+The runtime's to-do list: what lifted code needs from the libraries and hardware the runtime replaces.
+
+### Added
+- **`qilin hwaccess`** (`recomp/src/hwaccess.*`): the loads and stores in each function whose address is a constant outside cached MEM1, found by constant propagation over the GPRs through the control flow, classified by region (hardware block, GX FIFO, uncached mirrors, MEM2, EFB, locked cache).
+- **`tools/analysis/runtime_todo.py`**: joins the call graph, `qilin hwaccess` and the library plan into the to-do list. Lifted code calls 309 replaced functions directly, and its only direct hardware access is the GX FIFO: 322 stores in 12 functions, from inlined GX calls in NW4R, the Home Button Menu, the Mii library and the game. 5 lift-side functions need the estimate tables. The report is derived from the game and stays out of git.
+- **Tests** for the address map and the constant propagation (GX FIFO and VI addresses found, cached MEM1 ignored, registers unknown after a call).
+
 ## [0.10.0] - 2026-11-18
 The differential test under UBSan, finding no undefined behaviour in lifted code or the runtime across all 64,824 trials. The difftest is now deterministic and isolates its trials.
 
