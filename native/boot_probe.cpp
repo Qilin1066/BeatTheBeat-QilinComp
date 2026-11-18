@@ -27,8 +27,16 @@ extern "C" void ppc_memory_fence() {
 namespace {
 
 constexpr auto dol_size = std::streamoff{3'302'048};
-constexpr std::uint32_t entry_point = 0x80004050;
-static_assert(DOLRECOMP_ENTRY_POINT == entry_point);
+static_assert(DOLRECOMP_ENTRY_POINT == 0x80004050);
+constexpr std::uint32_t sdk_init_registers = 0x80004210;
+constexpr std::uint32_t sdk_call_init_hardware = 0x80004058;
+constexpr std::uint32_t sdk_init_paired_singles = 0x800DBC90;
+constexpr std::uint32_t sdk_call_init_fprs = 0x80004374;
+constexpr std::uint32_t sdk_init_caches = 0x800DD390;
+constexpr std::uint32_t sdk_return_from_init_caches = 0x8000437C;
+constexpr std::uint32_t sdk_set_error_handler = 0x800DDF10;
+constexpr std::uint32_t sdk_dma_error_handler = 0x800DD240;
+constexpr std::uint32_t sdk_machine_check_error = 1;
 
 struct Stop {
     std::string_view reason;
@@ -92,10 +100,39 @@ void load_sections(const std::vector<std::uint8_t>& dol, std::vector<std::uint8_
     }
 }
 
-void run_probe(CPUState& cpu) {
+void start_from_loaded_image(CPUState& cpu) {
+    // The verified PAL DOL is loaded at its final addresses, with BSS already zeroed.
+    // Run the original register setup, then return to __start after its __init_data call.
+    cpu.pc = sdk_init_registers;
+    cpu.lr = sdk_call_init_hardware;
+    func_80004000(&cpu);
+    if (cpu.exception || cpu.pc != sdk_init_paired_singles || cpu.lr != sdk_call_init_fprs) {
+        throw Stop{"unexpected PAL startup after register setup", cpu.pc,
+                   cpu.exception ? cpu.exception : cpu.lr};
+    }
+
+    // Native equivalent of the cold-boot __OSPSInit call. The executable code is
+    // already linked, so the boot-time instruction cache flash has no work here.
+    cpu.hid2 |= PPC_HID2_LSQE | PPC_HID2_PSE;
+    ppc_memory_fence();
+    std::ranges::fill(cpu.gqr, 0u);
+    cpu.gpr[0] = cpu.lr;
+    cpu.gpr[3] = 0;
+    cpu.pc = cpu.lr;
+}
+
+[[noreturn]] void run_probe(CPUState& cpu) {
     // Each native dispatch is cycle-bounded by the emitter. Limit the overall startup probe too.
     constexpr std::size_t max_dispatches = 4'096;
     for (std::size_t count = 0; count < max_dispatches; ++count) {
+        if (cpu.pc == sdk_init_caches && cpu.lr == sdk_return_from_init_caches) {
+            // The host owns cache coherence. Keep the SDK's DMA error-handler registration
+            // by tail-calling the original OSSetErrorHandler with the same arguments.
+            ppc_memory_fence();
+            cpu.gpr[3] = sdk_machine_check_error;
+            cpu.gpr[4] = sdk_dma_error_handler;
+            cpu.pc = sdk_set_error_handler;
+        }
         const auto start_pc = cpu.pc;
         cpu.downcount = 0;
         const auto function = (start_pc & 3u) == 0 ? dolrecomp_find_original(start_pc) : nullptr;
@@ -132,7 +169,6 @@ int main(int argc, char** argv) {
         CPUState cpu{};
         cpu.ram = ram.data();
         cpu.ram_size = static_cast<u32>(ram.size());
-        cpu.pc = entry_point;
         cpu.msr = PPC_MSR_FP | PPC_MSR_RI | PPC_MSR_IR | PPC_MSR_DR;
         cpu.instruction_fallback = unsupported_instruction;
         cpu.external_read = unmapped_read;
@@ -140,7 +176,9 @@ int main(int argc, char** argv) {
         cpu.external_read32 = unmapped_external_read;
         cpu.external_write32 = unmapped_external_write;
 
-        std::cout << "Running locally compiled SOMP01 code at 0x" << std::hex << cpu.pc << '\n';
+        std::cout << "Running locally compiled SOMP01 register setup at 0x"
+                  << std::hex << sdk_init_registers << '\n';
+        start_from_loaded_image(cpu);
         run_probe(cpu);
     } catch (const Stop& stop) {
         std::cerr << "Native boot stopped at 0x" << std::hex << stop.pc << " (detail 0x"

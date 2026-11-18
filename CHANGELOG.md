@@ -5,6 +5,7 @@
 - Added a C++23 startup probe that runs locally compiled PAL `SOMP01` code and stops at the first unsupported operation.
 - Lowered `dcbf` and `dcbst` at compile time for the native probe's coherent RAM model.
 - Verified that Windows x64 passes the initial cache-flush loop and reaches the SDK's `mfhid0` instruction.
+- Replaced the cold-boot data and cache setup with native initialization while retaining the SDK DMA error-handler registration. Verified that the PAL WBFS build reaches the performance monitor setup in `OSInit` on Windows x64.
 
 ## 0.1.0-alpha.1 — 2026-11-18
 
