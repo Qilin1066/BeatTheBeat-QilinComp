@@ -11,9 +11,10 @@ Roadmap step 1, **analysis**, is in progress; the recompiler core (step 2) has i
 | Piece | State |
 |---|---|
 | DOL loader (sections, BSS, entry point, flat image; the PAL build recognised by SHA-256) | ✅ |
-| Broadway decoder (all 222 instructions of the 750CL with the paired singles; reserved bits and invalid forms rejected) | ✅ 0 unexplained disagreements with GNU binutils over ~38 million words; on every word of the game's code once `main.dol` is run through it |
+| Broadway decoder (all 222 instructions of the 750CL with the paired singles; reserved bits and invalid forms rejected) | ✅ 0 unexplained disagreements with GNU binutils over ~38 million swept words and all 512,944 words of the game's code |
+| Function discovery + CFG (tail calls, vtables and callbacks, CodeWarrior jump tables, register save/restore chains) | ✅ 8,301 functions, all 157 jump tables proven; every word of the code accounted for (`qilin coverage`: 98.83% code, the rest padding, dead code and 102 identified words of data and debugger stub, none of it lifted) |
 | CI: Linux x64 (GCC 14, Clang 19), Linux ARM64, macOS ARM64 and x64, Windows x64, warnings as errors, plus the decoder sweep | ✅ |
-| Analysis of the PAL `main.dol`: function discovery, library boundaries, names from the Rhythm Heaven Fever decomp | next (see `docs/dol-analysis.md`) |
+| Library boundaries and names from the Rhythm Heaven Fever decomp, ported to PAL | next (see `docs/dol-analysis.md`) |
 | Lifter → C++, differential test | later (see roadmap) |
 | Runtime: OS, DVD, NAND, GX on Vulkan, AX audio, input | later (see roadmap) |
 
@@ -51,6 +52,9 @@ build/qilin info    path/to/main.dol [--json info.json]   # SHA-256, supported b
 build/qilin profile path/to/main.dol                      # instruction profile of the code
 build/qilin insns   path/to/main.dol [-o listing.txt]     # every word of the code, decoded
 build/qilin disasm  words.bin [--base 0x80004000]         # a file of big-endian words, decoded
+build/qilin cfg     path/to/main.dol [--json cfg.json]    # function discovery + control flow, summary
+build/qilin coverage path/to/main.dol [--list]            # every word: code, padding, dead or unknown (exit 3 if any unknown)
+build/qilin suspects path/to/main.dol                     # functions with problems, for review
 ```
 
 ### Decoder check
@@ -66,8 +70,8 @@ This compares the decoder with GNU objdump (`-M broadway,raw`): mnemonic and eve
 
 | Path | What |
 |---|---|
-| `recomp/src/` | Recompiler core: `dol` loader, `sha256`, `decoder` (Broadway), `main` (CLI) |
-| `recomp/tests/` | Unit tests on a synthetic in-memory DOL and on the decoder, so they need no game files |
+| `recomp/src/` | Recompiler core: `dol` loader, `sha256`, `decoder` (Broadway), `cfg` (function discovery + control flow), `main` (CLI) |
+| `recomp/tests/` | Unit tests on a synthetic in-memory DOL, the decoder and a synthetic program, so they need no game files |
 | `tools/check/` | The decoder cross-check against GNU objdump |
 | `docs/` | Roadmap and design targets, prior art, analysis and status notes |
 

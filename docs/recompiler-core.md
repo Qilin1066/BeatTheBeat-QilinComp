@@ -1,6 +1,6 @@
 # Recompiler core: status (roadmap steps 1–2)
 
-Last updated 2026-11-18 (v0.2.0: DOL loader, Broadway decoder, the binutils cross-check, CI).
+Last updated 2026-11-18 (v0.3.0: function discovery and CFG, coverage accounting, everything run on the PAL `main.dol`; v0.2.0: DOL loader, Broadway decoder, the binutils cross-check, CI).
 
 ## Language and toolchain
 Everything is **C++23**: the recompiler, the runtime and the generated code. The C++23 features in use so far are `std::expected` (the DOL loader), `std::print`/`std::format` (the tools), `std::ranges` algorithms and `std::string::contains`.
@@ -41,7 +41,7 @@ Our own, table-driven. One row per base instruction (**222**: the 750CL's intege
 | Set | Words | Result |
 |---|---|---|
 | Sweep of the encoding space, 8 seeds | ~38 million | **0 unexplained disagreements**; 4.15 million valid words per seed identical |
-| Every word of the PAL `main.dol`'s text sections | — | to do (needs the user's copy) |
+| Every word of the PAL `main.dol`'s text sections | 512,944 | **0 unexplained disagreements**; 505,952 valid and identical |
 
 The sweep takes random words for every primary opcode and every extended-opcode value (each register field left zero half the time, so valid forms of instructions with reserved fields come up), then every single-bit neighbour of every word either side accepts, which tests the edge of each instruction's reserved bits. CI runs one seed (about 4.8 million words, 30 s).
 
@@ -52,13 +52,25 @@ The reviewed disagreements, all counted by class and none failing the check:
 - **binutils doesn't check some invalid forms:** paired-single updates with `rA=0`, `lswi` with `rA` among the registers loaded, `bcctr` that decrements CTR.
 - **Formatting only:** objdump's raw mode prints `mfcr`'s absent field as `-1`. Elsewhere our text follows objdump's (`addi r3,0,0`, `bclr 20,lt,0`, `lwarx r3,r4,r5,0`, `psq_l f1,8(r0),0,0` although `rA=0` means 0 there).
 
-**Unit tests** (`recomp/tests/tests.cpp`, no binutils or game files): 63 encodings pinned to objdump's exact text; 18 words that must not decode, each with its reason; for each of the 222 instructions, a canonical word that must decode to it and, for every bit it doesn't define, the same word with that bit set, which must not decode; field accessors (sign extension, branch targets, the paired-single fields) and mnemonic suffixes.
+**Unit tests** (`recomp/tests/tests.cpp`, no binutils or game files), for the decoder: 63 encodings pinned to objdump's exact text; 18 words that must not decode, each with its reason; for each of the 222 instructions, a canonical word that must decode to it and, for every bit it doesn't define, the same word with that bit set, which must not decode; field accessors (sign extension, branch targets, the paired-single fields) and mnemonic suffixes.
+
+### Function discovery + CFG (`recomp/src/cfg.*`)
+CodeWarrior makes this simpler than on x86: every instruction is one aligned word, switch tables and constants live in data sections, so text holds code and padding, and each function is one contiguous range. It runs in 1.2 s on the game.
+
+1. **Strong seeds:** the entry point and every `bl` target from a linear sweep of the text. A `bl` to the next instruction is the get-PC idiom (`bl $+4; mflr`), not a call.
+2. **Recursive descent**, each function bounded by the next known start. Calls continue; `blr`, `bctr`, `b`, `rfi` and an unconditional trap end a path; conditional returns and branches fork it. Execution that runs past the bound into the next function is recorded (`falls_into`): CodeWarrior's register save/restore routines are one routine with an entry point per register.
+3. **Tail calls:** a `b` (or `bc`) past the bound to a *clean boundary* (a valid word that starts its section or follows code that can't fall through, or padding) becomes a start. So does one into another function's span when the branching function is strongly seeded: that span was explored before the start was known, and CodeWarrior never branches between functions except to an entry. `lis`/`addi` (or `ori`) pairs in code that build an address at a clean boundary are starts too (callbacks, thread entries).
+4. **Jump tables**, CodeWarrior's pattern (`cmplwi`, `bgt`, `lis`, `slwi`, `addi`, `lwzx`, `mtctr`, `bctr`, in any order). The search walks back from the `bctr` on the straight line, follows the one branch into a block above an early return, and finds the table base in a data-pool register (`lis r18` early in the function, `addi r3, r18, n` at the switch: one writer, and for a volatile register no call after it; calls preserve r14–r31 under the EABI). **A table is proven** when a `cmplwi` on the index register, followed by `bgt` (or `bge`, or a conditional return) on that CR field, bounds it, and every entry lands inside the function on a valid instruction; otherwise it's read while entries are plausible and reported. Every table in the game is proven.
+5. **Weak seeds, in rounds until nothing changes:** pointers into text stored in data (vtables, `.ctors`, `extabindex`, callback tables), except words inside a jump table: every table a linear scan of the code can prove is excluded first, so a function reached only through a vtable doesn't have its case labels taken for functions. Then the first word of each run of unreached code that starts at a clean boundary and isn't inside a function's span (gaps). A weak seed must not fall inside another function's span.
+6. **Validation:** a weakly seeded function that reaches an invalid word or runs off its section is dropped and never re-seeded; a strongly seeded one is a suspect. Branches to targets that are neither inside the function nor a clean boundary are suspects too.
+
+**Coverage** (`qilin coverage`) accounts for every word of the text: **code** (reached), **padding** (zero or `nop`, not reached), **dead** (not reached, inside a function, after code that can't fall through, and no branch in reached code nor any pointer in data targets any word of it) or **unknown**. Results on the game are in `dol-analysis.md`: 98.83% of `.text` is code, and the 102 unknown words are identified data and debugger-stub code that isn't lifted.
+
+**Tests:** a synthetic program with a function found each way (entry, call, tail call, `lis`/`addi`, vtable, gap), a switch with its case after the default, a register-save chain, the get-PC idiom, an indirect tail call, padding and dead code, checked function by function and word by word; and a data pointer to code that runs into an invalid word, which validation must reject.
 
 ### `qilin` CLI (`recomp/src/main.cpp`)
-`info` (JSON), `insns` (every word of the text sections: address, word, text), `disasm` (a raw file of big-endian words, for the sweep) and `profile` (instruction mix of the text sections, with paired-single, floating-point and privileged counts). Exit status is non-zero on any error.
+`info` (JSON), `insns` (every word of the text sections: address, word, text), `disasm` (a raw file of big-endian words, for the sweep), `profile` (instruction mix of the text sections, with paired-single, floating-point and privileged counts), `cfg` (summary, `--json` for every function), `coverage` (exit status 3 while any word is unknown) and `suspects`. Exit status is non-zero on any error.
 
 ## Next
-1. Run `qilin info`, `profile` and the cross-check on the PAL `main.dol`; write the results into `dol-analysis.md`.
-2. Function discovery and CFG (recursive descent from the entry point, the exception tables and data references; CodeWarrior jump tables; validation that drops data decoded as code), and the coverage accounting Ghoulies has (`qilin coverage`).
-3. Port the decomp's US names and library splits to PAL addresses, and fix the lifted/replaced boundary per library.
-4. The lifter's first slice (integer, with CR/XER elimination) and the differential test's reference executor.
+1. Port the decomp's US names and library splits to PAL addresses (masked-hash function signatures), compare the function lists, and fix the lifted/replaced boundary per library; list the unknown words by library, so "done" means unknown == 0 in every lifted library.
+2. The lifter's first slice (integer, with CR/XER elimination), the generated function table for indirect calls, and the differential test's reference executor.

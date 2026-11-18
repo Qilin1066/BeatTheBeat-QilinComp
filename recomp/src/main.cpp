@@ -6,6 +6,9 @@
 //   qilin disasm  <words.bin> [--base addr] [-o out.txt]
 //                                                a file of big-endian words, decoded (encoding sweep)
 //   qilin profile <main.dol>                     instruction profile of the text sections
+//   qilin cfg     <main.dol> [--json out.json]   function discovery + control flow, summary
+//   qilin coverage <main.dol> [--list]           word accounting of the text: code / padding / unknown
+//   qilin suspects <main.dol>                    functions with problems, for review
 //
 // Listings are one line per word: address, word, text ("8000310c 4e800020 bclr 20,lt,0").
 // Exit status is non-zero on any error; nothing fails silently.
@@ -25,6 +28,7 @@
 #include <string_view>
 #include <vector>
 
+#include "cfg.hpp"
 #include "decoder.hpp"
 #include "dol.hpp"
 
@@ -48,6 +52,9 @@ int usage() {
                "  qilin insns   <main.dol> [-o out.txt]\n"
                "  qilin disasm  <words.bin> [--base addr] [-o out.txt]\n"
                "  qilin profile <main.dol>\n"
+               "  qilin cfg     <main.dol> [--json out.json]\n"
+               "  qilin coverage <main.dol> [--list]\n"
+               "  qilin suspects <main.dol>\n"
                "  qilin --version\n");
     return 2;
 }
@@ -56,6 +63,7 @@ struct Args {
     std::string command, input;
     std::optional<std::string> out, json;
     uint32_t base = 0;
+    bool list = false;
 };
 
 uint32_t parse_u32(std::string_view s) {
@@ -82,6 +90,7 @@ Args parse_args(std::span<char*> argv) {
         if (arg == "-o") a.out = value();
         else if (arg == "--json") a.json = value();
         else if (arg == "--base") a.base = parse_u32(value());
+        else if (arg == "--list") a.list = true;
         else if (arg.starts_with("-")) throw Failure{std::format("unknown option {}", arg)};
         else if (a.input.empty()) a.input = arg;
         else throw Failure{std::format("unexpected argument {}", arg)};
@@ -178,6 +187,44 @@ int cmd_profile(const Args& a) {
     return 0;
 }
 
+int cmd_cfg(const Args& a) {
+    const Dol dol = load_dol(a.input);
+    Cfg cfg(dol);
+    cfg.run();
+    std::print("{}", cfg.summary());
+    if (a.json) {
+        std::ofstream f(*a.json, std::ios::binary);
+        if (!(f << cfg.to_json())) throw Failure{std::format("cannot write {}", *a.json)};
+    }
+    return 0;
+}
+
+int cmd_coverage(const Args& a) {
+    const Dol dol = load_dol(a.input);
+    Cfg cfg(dol);
+    cfg.run();
+    uint64_t unknown = 0;
+    for (const Coverage& c : cfg.coverage()) {
+        const uint64_t words = c.code + c.padding + c.dead + c.unknown;
+        std::println("{} {:08X}-{:08X}: {} words: code {} ({}), padding {}, dead {}, unknown {} ({}) in {} spans", c.section,
+                     c.lo, c.hi, words, c.code, percent(c.code, words, 3), c.padding, c.dead, c.unknown,
+                     percent(c.unknown, words, 3), c.unknown_spans.size());
+        if (a.list)
+            for (const auto& [lo, hi] : c.unknown_spans) std::println("  {:08X}-{:08X} ({} words)", lo, hi, (hi - lo) / 4);
+        unknown += c.unknown;
+    }
+    return unknown ? 3 : 0;
+}
+
+int cmd_suspects(const Args& a) {
+    const Dol dol = load_dol(a.input);
+    Cfg cfg(dol);
+    cfg.run();
+    for (const Suspect& s : cfg.suspects()) std::println("{:08X} {}", s.start, s.why);
+    std::println("{} suspects; rejected starts: {}", cfg.suspects().size(), cfg.rejected().size());
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -192,6 +239,9 @@ int main(int argc, char** argv) {
         if (a.command == "insns") return cmd_insns(a);
         if (a.command == "disasm") return cmd_disasm(a);
         if (a.command == "profile") return cmd_profile(a);
+        if (a.command == "cfg") return cmd_cfg(a);
+        if (a.command == "coverage") return cmd_coverage(a);
+        if (a.command == "suspects") return cmd_suspects(a);
         return usage();
     } catch (const Failure& f) {
         std::println(stderr, "qilin: {}", f.message);

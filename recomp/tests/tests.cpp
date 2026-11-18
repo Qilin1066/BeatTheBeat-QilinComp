@@ -1,5 +1,5 @@
-// Self-contained tests: SHA-256, a synthetic DOL built in memory, and the
-// Broadway decoder. No game files required (runs in CI).
+// Self-contained tests: SHA-256, a synthetic DOL built in memory, the
+// Broadway decoder, and function discovery on a synthetic program. No game files required (runs in CI).
 #include <algorithm>
 #include <cstring>
 #include <print>
@@ -7,6 +7,7 @@
 #include <string_view>
 #include <vector>
 
+#include "cfg.hpp"
 #include "decoder.hpp"
 #include "dol.hpp"
 #include "sha256.hpp"
@@ -341,12 +342,169 @@ void test_decoder() {
     CHECK(ppc::disasm(ppc::decode(0), 0) == ".long 0x0");
 }
 
+// ---------------------------------------------------------------- CFG
+
+// A synthetic program with one function for each way a function is found,
+// a CodeWarrior switch, a register-save chain, the get-PC idiom, an indirect
+// tail call, padding and dead code. text0 0x80003100-0x80003300, data0 0x80005000.
+struct Program {
+    std::vector<uint8_t> bytes = std::vector<uint8_t>(0x400, 0);
+    static constexpr uint32_t kText = 0x80003100, kData = 0x80005000;
+
+    void word(uint32_t a, uint32_t w) {
+        put_be32(bytes, a >= kData ? 0x300 + (a - kData) : 0x100 + (a - kText), w);
+    }
+    static uint32_t b(uint32_t pc, uint32_t to, bool link = false) {
+        return 0x48000000u | ((to - pc) & 0x03FFFFFCu) | (link ? 1u : 0u);
+    }
+    static uint32_t bc(uint32_t pc, unsigned bo, unsigned bi, uint32_t to) {
+        return (16u << 26) | (bo << 21) | (bi << 16) | ((to - pc) & 0xFFFCu);
+    }
+    static uint32_t li(unsigned rd, int16_t v) { return (14u << 26) | (rd << 21) | static_cast<uint16_t>(v); }
+
+    Program() {
+        put_be32(bytes, 0x00, 0x100);  // text0
+        put_be32(bytes, 0x48, kText);
+        put_be32(bytes, 0x90, 0x200);
+        put_be32(bytes, 0x1C, 0x300);  // data0
+        put_be32(bytes, 0x64, kData);
+        put_be32(bytes, 0xAC, 0x100);
+        put_be32(bytes, 0xE0, kText);  // entry
+
+        // 80003100 entry: calls, a lis/addi pointer, then a tail call.
+        word(0x80003100, 0x9421FFF0);                     // stwu r1,-16(r1)
+        word(0x80003104, b(0x80003104, 0x80003140, true)); // bl switch
+        word(0x80003108, b(0x80003108, 0x80003180, true)); // bl save chain, first entry
+        word(0x8000310C, b(0x8000310C, 0x80003184, true)); // bl save chain, second entry
+        word(0x80003110, b(0x80003110, 0x800031A0, true)); // bl get-PC user
+        word(0x80003114, 0x3C608000);                     // lis r3,0x8000
+        word(0x80003118, 0x386331D0);                     // addi r3,r3,0x31D0: thread entry
+        word(0x8000311C, 0x38210010);                     // addi r1,r1,16
+        word(0x80003120, b(0x80003120, 0x800031C0));      // b: tail call
+        // 80003140 switch (r3) with cases 0, 1, 2 and a default.
+        word(0x80003140, 0x28030002);                     // cmplwi r3,2
+        word(0x80003144, bc(0x80003144, 12, 1, 0x80003170)); // bgt default
+        word(0x80003148, 0x3C808000);                     // lis r4,0x8000
+        word(0x8000314C, 0x5460103A);                     // slwi r0,r3,2
+        word(0x80003150, 0x38845000);                     // addi r4,r4,0x5000
+        word(0x80003154, 0x7C04002E);                     // lwzx r0,r4,r0
+        word(0x80003158, 0x7C0903A6);                     // mtctr r0
+        word(0x8000315C, 0x4E800420);                     // bctr
+        word(0x80003160, li(3, 0));
+        word(0x80003164, 0x4E800020);
+        word(0x80003168, li(3, 1));
+        word(0x8000316C, 0x4E800020);
+        word(0x80003170, li(3, -1));                      // default
+        word(0x80003174, 0x4E800020);
+        word(0x80003178, li(3, 2));                       // case 2, after the default
+        word(0x8000317C, 0x4E800020);
+        // 80003180 register-save chain: two entry points, the first falls into the second.
+        word(0x80003180, 0x91CBFFF8);                     // stw r14,-8(r11)
+        word(0x80003184, 0x91EBFFFC);                     // stw r15,-4(r11)
+        word(0x80003188, 0x4E800020);
+        // 800031A0 reads the PC: bl to the next instruction is not a call.
+        word(0x800031A0, b(0x800031A0, 0x800031A4, true));
+        word(0x800031A4, 0x7C6802A6);                     // mflr r3
+        word(0x800031A8, 0x4E800020);
+        word(0x800031C0, li(3, 5));                       // reached only by the tail call
+        word(0x800031C4, 0x4E800020);
+        word(0x800031D0, li(3, 6));                       // reached only through lis/addi
+        word(0x800031D4, 0x4E800020);
+        word(0x800031E0, li(3, 7));                       // reached only through a vtable in data
+        word(0x800031E4, b(0x800031E4, 0x800031EC));
+        word(0x800031E8, li(3, 9));                       // dead: nothing reaches it
+        word(0x800031EC, 0x4E800020);
+        word(0x80003200, li(3, 8));                       // referenced by nothing: a gap
+        word(0x80003204, 0x4E800020);
+        word(0x80003210, 0x81830000);                     // lwz r12,0(r3)
+        word(0x80003214, 0x7D8903A6);                     // mtctr r12
+        word(0x80003218, 0x4E800420);                     // bctr: an indirect tail call
+
+        word(0x80005000, 0x80003160);                     // the switch's table
+        word(0x80005004, 0x80003168);
+        word(0x80005008, 0x80003178);
+        word(0x8000500C, 0x800031E0);                     // a vtable
+        word(0x80005010, 0x80003210);
+    }
+};
+
+void test_cfg() {
+    const Program p;
+    auto dol = Dol::parse(p.bytes);
+    CHECK(dol.has_value());
+    if (!dol) return;
+    Cfg cfg(*dol);
+    cfg.run();
+    const auto& fs = cfg.functions();
+    const std::vector<std::pair<uint32_t, Origin>> expected = {
+        {0x80003100, Origin::Entry},   {0x80003140, Origin::Call},    {0x80003180, Origin::Call},
+        {0x80003184, Origin::Call},    {0x800031A0, Origin::Call},    {0x800031C0, Origin::TailCall},
+        {0x800031D0, Origin::ImmPtr},  {0x800031E0, Origin::DataPtr}, {0x80003200, Origin::Gap},
+        {0x80003210, Origin::DataPtr},
+    };
+    CHECK(fs.size() == expected.size());
+    for (const auto& [start, origin] : expected) {
+        auto it = fs.find(start);
+        if (it == fs.end() || it->second.origin != origin)
+            std::println(stderr, "  function {:08x}: {}", start, it == fs.end() ? "missing" : origin_name(it->second.origin));
+        CHECK(it != fs.end() && it->second.origin == origin);
+    }
+    if (fs.size() != expected.size()) return;
+
+    const Function& entry = fs.at(0x80003100);
+    CHECK(entry.calls == (std::set<uint32_t>{0x80003140, 0x80003180, 0x80003184, 0x800031A0}));
+    CHECK(entry.tails == (std::set<uint32_t>{0x800031C0}));
+    CHECK(entry.insns.size() == 9);
+    const Function& sw = fs.at(0x80003140);
+    CHECK(sw.jtabs.size() == 1);
+    if (sw.jtabs.size() == 1) {
+        CHECK(sw.jtabs[0].proven);
+        CHECK(sw.jtabs[0].table == 0x80005000);
+        CHECK(sw.jtabs[0].entries == (std::vector<uint32_t>{0x80003160, 0x80003168, 0x80003178}));
+    }
+    CHECK(sw.insns.size() == 16);
+    CHECK(sw.leaders.contains(0x80003178) && sw.leaders.contains(0x80003170));
+    CHECK(fs.at(0x80003180).falls_into == 0x80003184 && fs.at(0x80003180).insns.size() == 1);
+    CHECK(fs.at(0x800031A0).calls.empty() && fs.at(0x800031A0).insns.size() == 3);
+    CHECK(fs.at(0x800031E0).insns.size() == 3);
+    CHECK(fs.at(0x80003210).itails == (std::vector<uint32_t>{0x80003218}));
+    CHECK(cfg.suspects().empty());
+    CHECK(cfg.rejected().empty());
+
+    const auto cov = cfg.coverage();
+    CHECK(cov.size() == 1);
+    if (cov.size() == 1) {
+        CHECK(cov[0].code == 43);
+        CHECK(cov[0].dead == 1);  // 800031E8
+        CHECK(cov[0].unknown == 0);
+        CHECK(cov[0].padding == 128 - 44);
+    }
+    CHECK(cfg.to_json().contains("\"falls_into\": \"0x80003184\""));
+    CHECK(percent(1, 3, 2) == "33.33%" && percent(2, 3, 0) == "67%" && percent(0, 0, 1) == "n/a");
+
+    // Weak evidence that reaches an invalid word is rejected: a data pointer
+    // to a clean boundary whose code runs into a reserved encoding.
+    Program q;
+    q.word(0x80003230, Program::li(3, 1));
+    q.word(0x80003234, 0x7C83202F);  // lwzx with the record bit: invalid
+    q.word(0x80005014, 0x80003230);
+    auto dol2 = Dol::parse(q.bytes);
+    CHECK(dol2.has_value());
+    if (!dol2) return;
+    Cfg cfg2(*dol2);
+    cfg2.run();
+    CHECK(!cfg2.functions().contains(0x80003230));
+    CHECK(cfg2.rejected() == (std::vector<uint32_t>{0x80003230}));
+    CHECK(cfg2.coverage()[0].unknown == 2);
+}
+
 }  // namespace
 
 int main() {
     test_sha256();
     test_dol();
     test_decoder();
+    test_cfg();
     if (failures) {
         std::println(stderr, "{} check(s) failed", failures);
         return 1;
