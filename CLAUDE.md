@@ -47,6 +47,10 @@ Before a milestone commit, all of these must hold: tests pass, warnings are clea
 - The DOL SHA-256 is `2e0368359106a2eef773c70ef083e89aafe1e49603eefc7f16b9ed414cd098fe`. Entry point, sections and real start-up register values (r1 0x803E7488, r2 0x8032A680, r13 0x80328500) are in `docs/dol-analysis.md`.
 - Broadway divide by zero or overflow: `divw` gives 0xFFFFFFFF for a negative dividend, else 0; `divwu` gives 0. (Unicorn differs; this is a known difference.)
 - Generated code under MSVC: `[[maybe_unused]]` covers only a declaration's first declarator (so one declaration per local), and C4702 is disabled for generated code (optimiser-dependent).
+- FPSCR is only touched by replaced or dropped code (base, OS, MetroTRK), so lifted code doesn't model it. `OSInit` calls `PPCSetFpNonIEEEMode`: the game runs with NI = 1 (denormal operands and results become signed zero, per the IBM 750GX/GL manual).
+- Where Broadway's FP result has no source (fmuls-family frC that isn't a single, compares of denormals, `fres`/`frsqrte` tables), lifted code stops (`rt::fp_unknown`) or the function isn't lifted. Don't guess these, and don't take them from Dolphin's code (it's GPL).
+- Unicorn's FP: it ignores NI (the harness counts flushes, so these are known differences), and `fctiwz` gives a 0 high word and `0x80000000` on positive overflow (corrected by hooks).
+- The harness treats a top-level return to anywhere but the caller as a bad return, as lifted callers do.
 - The difftest's entry stub at 0x80002F00 must be in the starting state on both sides (a function scanning memory reads it).
 - Unicorn quirks:
   - its XER API doesn't set the flags, so the harness uses a stub
@@ -55,19 +59,18 @@ Before a milestone commit, all of these must hold: tests pass, warnings are clea
   - it reports the `dcbz` fault address differently
 - Library split (`docs/code-analysis.md`): lift game/NW4R/MSL/runtime/etc. (74%); replace OS, DVD, GX, AX, pad, WPAD, NAND… (25%); drop MetroTRK/NdevExi2A (1%).
 
-## Status (v0.6.0)
+## Status (v0.7.0)
 
 - 8,171 functions, all 157 jump tables proven, 98.80% of `.text` reached as code (the rest is identified as padding, dead code or data).
-- 6,374 functions lifted (slice 1: integer, loads and stores, branches, jump tables).
-- Difftest: 50,992 trials (8 per function), 0 unexplained mismatches; 136 s on 16 workers.
+- 7,549 functions lifted (slice 1: integer, loads and stores, branches, jump tables; slice 3: floating point). Left: 560 paired single, 56 privileged, 5 FPSCR, 1 `frsqrte`.
+- Difftest: 60,392 trials (8 per function), 0 unexplained mismatches; 163 s on 16 workers.
 - `qilin lift` output is in fixed 256-function chunks and only changed files are rewritten, so rebuilds are incremental.
 
 ## Next steps, in order
 
-1. **Lifter slice 3, floating point:** native double/float; `std::fma` for fused ops (keep `-ffp-contract=off` elsewhere); FPSCR; Broadway's `fres`/`frsqrte` estimate tables.
-2. **Lifter slice 4, paired singles and GQR quantisation:** Unicorn lacks them, so write a reference model.
-3. Register liveness, to cut `out()`/`in()` syncing around calls; difftest under UBSan.
-4. Hardware-access profile, exception tables, timing model; then the runtime (OS, DVD, NAND, GX on Vulkan, AX, input).
+1. **Lifter slice 4, paired singles and GQR quantisation:** Unicorn lacks them, so write a reference model. Also ps1 for `lfs` and single-precision arithmetic in paired-single mode. 534 of the 560 functions stop at `psq_st` (FPR saves in prologues).
+2. Register liveness, to cut `out()`/`in()` syncing around calls; difftest under UBSan.
+3. Hardware-access profile, exception tables, timing model; then the runtime (OS, DVD, NAND, GX on Vulkan, AX, input).
 
 ## Conventions
 

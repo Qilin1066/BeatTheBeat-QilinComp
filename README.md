@@ -6,7 +6,7 @@ A static recompilation of **Beat the Beat: Rhythm Paradise** (Nintendo, Wii; *Rh
 
 ## Status
 
-Roadmap step 1, **analysis**, is nearly done; step 2, the **recompiler core**, is in progress: the lifter's first slice runs, checked against the original code.
+Roadmap step 1, **analysis**, is nearly done; step 2, the **recompiler core**, is in progress: the lifter's integer and floating-point slices run, checked against the original code.
 
 | Piece | State |
 |---|---|
@@ -17,8 +17,9 @@ Roadmap step 1, **analysis**, is nearly done; step 2, the **recompiler core**, i
 | Names from the Rhythm Heaven Fever decomp ported to PAL; library boundaries; what's lifted, replaced or dropped | ✅ 8,043 of the decomp's 8,103 functions match exactly; 74% of the code lifted (`docs/code-analysis.md`) |
 | Hardware-access profile, exception tables, timing model | next (see `docs/dol-analysis.md`) |
 | Lifter → C++, slice 1: integer, loads and stores, branches, calls, jump tables, the function table | ✅ 6,374 of 8,171 functions (the rest need floating point, or are privileged code that's replaced); generated code warning-free under GCC 14 and Clang 19 |
-| Differential test against the original code under Unicorn (PowerPC 750CL) | ✅ every lifted function, 50,992 trials, 0 unexplained mismatches; found and fixed one lifter bug; parallel, about 2 minutes on 16 cores |
-| Lifter slices 3–4: floating point, paired singles | next |
+| Differential test against the original code under Unicorn (PowerPC 750CL) | ✅ every lifted function, 60,392 trials, 0 unexplained mismatches; found and fixed one lifter bug; parallel, under 3 minutes on 16 cores |
+| Lifter slice 3: floating point (non-IEEE mode as the game sets it, PowerPC NaNs, bit-exact `lfs`/`stfs`; FPSCR is only in replaced code) | ✅ 7,549 of 8,171 functions lift; 60,392 difftest trials, 0 unexplained mismatches |
+| Lifter slice 4: paired singles | next (560 functions) |
 | Runtime: OS, DVD, NAND, GX on Vulkan, AX audio, input | later (see roadmap) |
 
 The repository's first version (0.1.0-alpha.1, a Dolphin-based preview, and a native boot probe on top of DolRecomp) was written with ChatGPT and has been retired. `docs/prior-art.md` §1 says what it did and what carried over.

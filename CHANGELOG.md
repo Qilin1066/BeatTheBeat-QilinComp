@@ -11,6 +11,18 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-11-18
+Lifter slice 3, floating point: 7,549 of the game's 8,171 functions lift (1,175 more), in the non-IEEE mode the game sets, and every one runs against the original code: 60,392 trials, 0 unexplained mismatches.
+
+### Added
+- **Lifter, slice 3:** FP loads and stores, single- and double-precision add, subtract, multiply and divide, fused multiply-adds (`std::fma`), `frsp`, `fctiwz`, moves, sign operations and compares. Through runtime helpers: non-IEEE mode (FPSCR[NI], which `OSInit` sets), with denormal operands and results flushed to zero of their sign; PowerPC's NaN rules (operand order, the positive default QNaN); the architecture's bit conversions for `lfs` and `stfs`; `fctiwz` saturation and the 750 family's high word.
+- **Fail loudly on unsourced Broadway behaviour:** a single-precision multiply whose frC isn't a single, and a compare of a denormal, stop (`rt::fp_unknown`). FPSCR access (only in replaced code), FP record forms and `fres`/`frsqrte` aren't lifted, and the reason is reported.
+- **Differential test with FP state:** random FPRs (singles, specials, NaN payloads, denormals) compared bit for bit; MSR[FP] set in Unicorn; hooks correct Unicorn's `fctiwz` (high word, positive overflow); the harness counts non-IEEE flushes, a known difference since Unicorn ignores NI.
+- **Tests** for the FP helpers (non-IEEE flushing, NaN selection, fused rounding, `fctiwz`, `lfs`/`stfs` round trips) and the lifter's FP output.
+
+### Changed
+- The harness checks a top-level function's return as a lifted caller does: a return anywhere but the caller (a stack smashed by random input) is a bad return, a known difference where Unicorn jumps there.
+
 ## [0.6.0] - 2026-11-18
 A faster loop: the differential test runs in parallel on Linux, macOS and Windows, a full run at 8 trials per function takes about 2 minutes on 16 cores (v0.5.0 took about 45 minutes at 4 trials on two cores), and `qilin lift` rewrites only what changed, so rebuilds are incremental. 50,992 trials, 0 unexplained mismatches.
 

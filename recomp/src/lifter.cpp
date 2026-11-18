@@ -46,12 +46,17 @@ private:
     std::string tail_direct(uint32_t target);
     std::string ret();
     void record(const Insn& in, const std::string& rd);
+    void floating(uint32_t pc, const Insn& in);
     void use(unsigned r) { gprs_.insert(r); }
+    std::string F(unsigned n) {
+        fprs_.insert(n);
+        return std::format("f{}", n);
+    }
 
     const Cfg& cfg_;
     const Function& f_;
     std::string body_;
-    std::set<unsigned> gprs_;
+    std::set<unsigned> gprs_, fprs_;
     std::set<uint32_t> targets_;  // labels that something jumps to
     bool out_ = false, in_ = false;
 };
@@ -115,7 +120,7 @@ void Emitter::instruction(uint32_t pc, const Insn& in) {
     const ppc::Spec& s = ppc::spec(in.op);
     if (s.flags & ppc::kPrivileged) throw Unsupported{std::format("privileged: {}", s.name)};
     if (s.flags & ppc::kPaired) throw Unsupported{std::format("paired single (slice 4): {}", s.name)};
-    if (s.flags & ppc::kFloat) throw Unsupported{std::format("floating point (slice 3): {}", s.name)};
+    if (s.flags & ppc::kFloat) return floating(pc, in);
 
     const unsigned rd = in.rd(), ra = in.ra(), rb = in.rb();
     const std::string D = R(rd), A = R(ra), B = R(rb), S = R(rd);
@@ -486,6 +491,100 @@ void Emitter::instruction(uint32_t pc, const Insn& in) {
     }
 }
 
+// Slice 3: floating point, through the helpers in guest.hpp (FPSCR, non-IEEE
+// mode, NaNs and Broadway's results are described there). Only what the
+// game's lifted code uses, and what is pinned down by a source, is lifted.
+void Emitter::floating(uint32_t pc, const Insn& in) {
+    const ppc::Spec& s = ppc::spec(in.op);
+    if ((s.flags & ppc::kRc) && in.rc())
+        throw Unsupported{std::format("floating-point record form (CR1 from FPSCR, not modelled): {}.", s.name)};
+    const unsigned d = in.rd(), a = in.ra(), b = in.rb(), cc = in.rc_reg();
+
+    auto load = [&](const std::string& ea, bool update, bool single) {
+        if (a) use(a);
+        line(std::format("{{ const uint32_t ea = {}; QILIN_PC({}); {} = {};{} }}", ea, hex(pc), F(d),
+                         single ? "rt::lfs(rt::ld32(ea))" : "rt::dbl(rt::ld64(ea))",
+                         update ? std::format(" {} = ea;", R(a)) : ""));
+    };
+    auto store = [&](const std::string& ea, bool update, const char* how) {
+        if (a) use(a);
+        const std::string v = F(d);
+        const std::string st = std::string(how) == "s"   ? std::format("rt::st32(ea, rt::stfs({}))", v)
+                               : std::string(how) == "d" ? std::format("rt::st64(ea, rt::bits({}))", v)
+                                                         : std::format("rt::st32(ea, static_cast<uint32_t>(rt::bits({})))", v);
+        line(std::format("{{ const uint32_t ea = {}; QILIN_PC({}); {};{} }}", ea, hex(pc), st,
+                         update ? std::format(" {} = ea;", R(a)) : ""));
+    };
+    auto set = [&](const std::string& expr) { line(std::format("{} = {};", F(d), expr)); };
+    // A single-precision multiply: Broadway rounds frC first, by a rule no
+    // source here pins down, so lifted code only goes on when that's a no-op.
+    auto single_frc = [&] { line(std::format("if (!rt::single_significand({})) rt::fp_unknown({});", F(cc), hex(pc))); };
+    auto x = [&](unsigned n) { return F(n); };
+
+    switch (in.op) {
+    case Op::lfs: load(ea_d(in), false, true); break;
+    case Op::lfsu: load(ea_d(in), true, true); break;
+    case Op::lfsx: use(b); load(ea_x(in), false, true); break;
+    case Op::lfsux: use(b); load(ea_x(in), true, true); break;
+    case Op::lfd: load(ea_d(in), false, false); break;
+    case Op::lfdu: load(ea_d(in), true, false); break;
+    case Op::lfdx: use(b); load(ea_x(in), false, false); break;
+    case Op::lfdux: use(b); load(ea_x(in), true, false); break;
+    case Op::stfs: store(ea_d(in), false, "s"); break;
+    case Op::stfsu: store(ea_d(in), true, "s"); break;
+    case Op::stfsx: use(b); store(ea_x(in), false, "s"); break;
+    case Op::stfsux: use(b); store(ea_x(in), true, "s"); break;
+    case Op::stfd: store(ea_d(in), false, "d"); break;
+    case Op::stfdu: store(ea_d(in), true, "d"); break;
+    case Op::stfdx: use(b); store(ea_x(in), false, "d"); break;
+    case Op::stfdux: use(b); store(ea_x(in), true, "d"); break;
+    case Op::stfiwx: use(b); store(ea_x(in), false, "w"); break;
+
+    case Op::fadd: set(std::format("rt::fadd({}, {})", x(a), x(b))); break;
+    case Op::fsub: set(std::format("rt::fsub({}, {})", x(a), x(b))); break;
+    case Op::fmul: set(std::format("rt::fmul({}, {})", x(a), x(cc))); break;
+    case Op::fdiv: set(std::format("rt::fdiv({}, {})", x(a), x(b))); break;
+    case Op::fadds: set(std::format("rt::fadds({}, {})", x(a), x(b))); break;
+    case Op::fsubs: set(std::format("rt::fsubs({}, {})", x(a), x(b))); break;
+    case Op::fmuls: single_frc(); set(std::format("rt::fmuls({}, {})", x(a), x(cc))); break;
+    case Op::fdivs: set(std::format("rt::fdivs({}, {})", x(a), x(b))); break;
+    case Op::fmadd: set(std::format("rt::fma_({}, {}, {}, false, false)", x(a), x(cc), x(b))); break;
+    case Op::fmsub: set(std::format("rt::fma_({}, {}, {}, true, false)", x(a), x(cc), x(b))); break;
+    case Op::fnmadd: set(std::format("rt::fma_({}, {}, {}, false, true)", x(a), x(cc), x(b))); break;
+    case Op::fnmsub: set(std::format("rt::fma_({}, {}, {}, true, true)", x(a), x(cc), x(b))); break;
+    case Op::fmadds: single_frc(); set(std::format("rt::fmas({}, {}, {}, false, false)", x(a), x(cc), x(b))); break;
+    case Op::fmsubs: single_frc(); set(std::format("rt::fmas({}, {}, {}, true, false)", x(a), x(cc), x(b))); break;
+    case Op::fnmadds: single_frc(); set(std::format("rt::fmas({}, {}, {}, false, true)", x(a), x(cc), x(b))); break;
+    case Op::fnmsubs: single_frc(); set(std::format("rt::fmas({}, {}, {}, true, true)", x(a), x(cc), x(b))); break;
+    case Op::frsp: set(std::format("rt::frsp({})", x(b))); break;
+    case Op::fctiwz: set(std::format("rt::fctiwz({})", x(b))); break;
+    case Op::fmr: set(x(b)); break;
+    case Op::fneg: set(std::format("rt::fneg({})", x(b))); break;
+    case Op::fabs: set(std::format("rt::fabs_({})", x(b))); break;
+    case Op::fnabs: set(std::format("rt::fneg(rt::fabs_({}))", x(b))); break;
+    case Op::fcmpu:
+    case Op::fcmpo:
+        // Non-IEEE mode zeroes denormal operands of arithmetic; for compares
+        // no source says, so a denormal operand stops.
+        line(std::format("if (rt::denormal_d({0}) || rt::denormal_d({1})) rt::fp_unknown({2}); "
+                         "cr = rt::set_crf(cr, {3}, rt::fcmp({0}, {1}));",
+                         x(a), x(b), hex(pc), in.crfd()));
+        break;
+    case Op::fres:
+    case Op::frsqrte:
+        throw Unsupported{std::format("floating-point estimate (Broadway's table not known): {}", s.name)};
+    case Op::mffs:
+    case Op::mtfsf:
+    case Op::mtfsfi:
+    case Op::mtfsb0:
+    case Op::mtfsb1:
+    case Op::mcrfs:
+        throw Unsupported{std::format("FPSCR access (only in replaced code; FPSCR not modelled): {}", s.name)};
+    default:
+        throw Unsupported{std::format("floating point not used by the game's lifted code: {}", s.name)};
+    }
+}
+
 LiftResult Emitter::run() {
     LiftResult r;
     uint32_t prev = 0;
@@ -530,11 +629,17 @@ LiftResult Emitter::run() {
         for (unsigned g : gprs_) code += std::format(" [[maybe_unused]] uint32_t r{0} = c.r[{0}];", g);
         code += "\n";
     }
+    if (!fprs_.empty()) {
+        code += "   ";
+        for (unsigned g : fprs_) code += std::format(" [[maybe_unused]] double f{0} = c.f[{0}];", g);
+        code += "\n";
+    }
     code += "    [[maybe_unused]] uint32_t lr = c.lr; [[maybe_unused]] uint32_t ctr = c.ctr;"
             " [[maybe_unused]] uint32_t cr = c.cr; [[maybe_unused]] uint32_t xer = c.xer;\n";
     auto sync = [&](bool to_context) {
         std::string s;
         for (unsigned g : gprs_) s += to_context ? std::format(" c.r[{0}] = r{0};", g) : std::format(" r{0} = c.r[{0}];", g);
+        for (unsigned g : fprs_) s += to_context ? std::format(" c.f[{0}] = f{0};", g) : std::format(" f{0} = c.f[{0}];", g);
         s += to_context ? " c.lr = lr; c.ctr = ctr; c.cr = cr; c.xer = xer;" : " lr = c.lr; ctr = c.ctr; cr = c.cr; xer = c.xer;";
         return s;
     };

@@ -7,9 +7,11 @@
 // Guest memory is MEM1 (24 MB at 0x80000000) holding the DOL image, as in
 // the Unicorn run; anything else stops with a memory fault (checked memory).
 // All integers are little-endian u32.
-//   case:   fn, r0..r31, lr, ctr, cr, xer, n, then n x (addr, len, bytes) written over the image
+//   case:   fn, r0..r31, lr, ctr, cr, xer, f0..f31 (u64 bits), n, then n x (addr, len, bytes)
+//           written over the image
 //   result: status (0 = returned, else 1 + rt::Stop::Kind), stop pc, stop value,
-//           r0..r31, lr, ctr, cr, xer, ret, then the changed 32-byte blocks of MEM1:
+//           r0..r31, lr, ctr, cr, xer, ret, f0..f31 (u64 bits), how many values non-IEEE
+//           mode flushed to zero, then the changed 32-byte blocks of MEM1:
 //           count, count x (addr, 32 bytes)
 #include <cstdio>
 #include <cstring>
@@ -51,6 +53,16 @@ uint8_t* reserve_guest_space() {
 
 bool read_u32(uint32_t& v) { return std::fread(&v, 4, 1, stdin) == 1; }
 void write_u32(uint32_t v) { std::fwrite(&v, 4, 1, stdout); }
+bool read_f64(double& d) {
+    uint64_t v;
+    if (std::fread(&v, 8, 1, stdin) != 1) return false;
+    d = rt::dbl(v);
+    return true;
+}
+void write_f64(double d) {
+    const uint64_t v = rt::bits(d);
+    std::fwrite(&v, 8, 1, stdout);
+}
 
 }  // namespace
 
@@ -99,6 +111,7 @@ int main(int argc, char** argv) {
         rt::Context c;
         for (uint32_t& r : c.r) read_u32(r);
         read_u32(c.lr), read_u32(c.ctr), read_u32(c.cr), read_u32(c.xer);
+        for (double& f : c.f) read_f64(f);
         uint32_t writes = 0;
         read_u32(writes);
         written.clear();
@@ -115,8 +128,13 @@ int main(int argc, char** argv) {
         }
 
         uint32_t status = 0, pc = 0, value = 0;
+        rt::g_ni_flushes = 0;
+        const uint32_t caller = c.lr;
         try {
             rt::call(c, fn, 0);
+            // The check every lifted caller makes after a call: a function
+            // that returns somewhere else (a smashed stack) stops.
+            if (c.ret != caller) rt::bad_return(fn, c.ret);
         } catch (const rt::Stop& s) {
             status = 1 + s.kind;
             pc = s.pc;
@@ -125,6 +143,8 @@ int main(int argc, char** argv) {
         write_u32(status), write_u32(pc), write_u32(value);
         for (uint32_t r : c.r) write_u32(r);
         write_u32(c.lr), write_u32(c.ctr), write_u32(c.cr), write_u32(c.xer), write_u32(c.ret);
+        for (double f : c.f) write_f64(f);
+        write_u32(rt::g_ni_flushes);
         changed.clear();
         for (uint32_t page = 0; page < kMem1Size; page += kPage) {
             if (std::memcmp(mem1 + page, initial.data() + page, kPage) == 0) continue;

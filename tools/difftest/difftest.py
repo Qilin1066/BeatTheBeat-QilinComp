@@ -121,10 +121,16 @@ class Original:
         self.mu.hook_add(UC_HOOK_MEM_UNMAPPED, self._unmapped)
         self.mu.hook_add(UC_HOOK_BLOCK, self._block)
         # Every divw/divwu: did a trial divide by zero (or 0x80000000 by -1)?
+        # Every fctiwz, and the instruction after it: see _fctiwz.
+        self.fctiwz = {}
         for lo, hi in text:
             for i, (w,) in enumerate(struct.iter_unpack(">I", image[lo - MEM1:hi - MEM1])):
                 if w >> 26 == 31 and (w >> 1) & 0x1FF in (459, 491) and (w >> 1) & 0x3FF != 0x3FF:
                     self.mu.hook_add(UC_HOOK_CODE, self._divide, w, lo + 4 * i, lo + 4 * i)
+                if w >> 26 == 63 and (w >> 1) & 0x3FF == 15:
+                    self.fctiwz[lo + 4 * i] = ((w >> 21) & 31, (w >> 11) & 31)
+        for at in sorted(set(self.fctiwz) | {a + 4 for a in self.fctiwz}):
+            self.mu.hook_add(UC_HOOK_CODE, self._fctiwz, None, at, at)
 
     def _unmapped(self, mu, access, address, size, value, data):
         self.stop = (1, mu.reg_read(P.UC_PPC_REG_PC), address)
@@ -136,12 +142,27 @@ class Original:
         if b == 0 or ((word >> 1) & 0x1FF == 491 and a == 0x80000000 and b == 0xFFFFFFFF):
             self.divided_by_zero = True
 
+    def _fctiwz(self, mu, address, size, data):
+        # QEMU 5 (Unicorn 2.1) leaves fctiwz's high word 0, which the
+        # architecture leaves undefined and the 750 family sets to 0xFFF80000,
+        # and gives 0x80000000 for a positive overflow, where the architecture
+        # says 0x7FFFFFFF. The hook on the next instruction puts both right.
+        if self.pending is not None:
+            frd, overflow = self.pending
+            low = 0x7FFFFFFF if overflow else mu.reg_read(P.UC_PPC_REG_FPR0 + frd) & 0xFFFFFFFF
+            mu.reg_write(P.UC_PPC_REG_FPR0 + frd, 0xFFF8000000000000 | low)
+            self.pending = None
+        if address in self.fctiwz:
+            frd, frb = self.fctiwz[address]
+            b = struct.unpack("<d", struct.pack("<Q", mu.reg_read(P.UC_PPC_REG_FPR0 + frb)))[0]
+            self.pending = (frd, b == b and b >= 2147483648.0)
+
     def _block(self, mu, address, size, data):
         if address in self.not_lifted and address != self.entry:
             self.stop = (5, address, 0)
             mu.emu_stop()
 
-    def run(self, fn, regs, writes):
+    def run(self, fn, regs, fprs, writes):
         # Unicorn 2.1's write hook misses dcbz, stmw and stswi, so changes are
         # found by comparing all of MEM1 with the trial's starting state.
         mu = self.mu
@@ -154,6 +175,10 @@ class Original:
         mu.reg_write(P.UC_PPC_REG_LR, regs[32])
         mu.reg_write(P.UC_PPC_REG_CTR, regs[33])
         mu.reg_write(P.UC_PPC_REG_CR, regs[34])
+        mu.reg_write(P.UC_PPC_REG_MSR, mu.reg_read(P.UC_PPC_REG_MSR) | 0x2000)  # MSR[FP]: the FPU is available
+        for i in range(32):
+            mu.reg_write(P.UC_PPC_REG_FPR0 + i, fprs[i])
+        self.pending = None
         # Unicorn 2.1's register API stores XER without setting the SO, OV
         # and CA flags the instructions use, so XER goes in through mtxer:
         # r0 carries it to the stub, which then restores r0.
@@ -205,7 +230,7 @@ class Original:
             initial[addr - MEM1:addr - MEM1 + len(blob)] = original
         if timeout:
             return None
-        return status, out, changed
+        return status, out, changed, [mu.reg_read(P.UC_PPC_REG_FPR0 + i) for i in range(32)], 0
 
 
 class Lifted:
@@ -232,18 +257,20 @@ class Lifted:
             while True:
                 status = struct.unpack("<3I", rd(12))
                 out = list(struct.unpack("<37I", rd(37 * 4)))
+                fprs = list(struct.unpack("<32Q", rd(32 * 8)))
+                flushes = struct.unpack("<I", rd(4))[0]
                 n = struct.unpack("<I", rd(4))[0]
                 changed = {}
                 for _ in range(n):
                     addr = struct.unpack("<I", rd(4))[0]
                     changed[addr] = rd(32)
-                results.put((status, out, changed))
+                results.put((status, out, changed, fprs, flushes))
         except (EOFError, OSError, ValueError):
             results.put(None)  # the harness exited (or was killed)
 
-    def run(self, fn, regs, writes, timeout=20):
+    def run(self, fn, regs, fprs, writes, timeout=20):
         """The result, or None if the lifted code didn't finish in time (the harness is restarted)."""
-        msg = struct.pack("<37I", fn, *regs) + struct.pack("<I", len(writes))
+        msg = struct.pack("<37I", fn, *regs) + struct.pack("<32Q", *fprs) + struct.pack("<I", len(writes))
         for addr, blob in writes:
             msg += struct.pack("<II", addr, len(blob)) + blob
         self.p.stdin.write(msg)
@@ -285,7 +312,25 @@ def random_state(rng):
         heap[i] = HEAP + ((offset[i] * (HEAP_SIZE - 0x100)) >> 16 & ~3)
     heap.byteswap()  # guest words are big-endian
     stack = rng.randbytes(STACK_FILL)
-    return regs, [(HEAP, heap.tobytes()), (STACK_TOP - STACK_FILL, stack)]
+    return regs, [fpr_value(rng) for _ in range(32)], [(HEAP, heap.tobytes()), (STACK_TOP - STACK_FILL, stack)]
+
+
+def fpr_value(rng):
+    """An FPR's bits: mostly singles, as game code holds, and some of everything else."""
+    def bits(x):
+        return struct.unpack("<Q", struct.pack("<d", x))[0]
+    k = rng.random()
+    if k < 0.45:  # a single, as lfs and single-precision arithmetic leave
+        return bits(struct.unpack("<f", struct.pack("<f", rng.uniform(-1000.0, 1000.0) * 2.0 ** rng.randrange(-20, 20)))[0])
+    if k < 0.6:
+        return bits(rng.choice([0.0, -0.0, 1.0, -1.0, 0.5, 2.0, 3.0, -2.5, 100.0, 2147483648.0, -2147483649.0]))
+    if k < 0.75:  # a double that isn't a single
+        return bits(rng.uniform(-1e6, 1e6))
+    if k < 0.85:  # infinities, NaNs (quiet, signalling, with payloads), denormals
+        return rng.choice([0x7FF0000000000000, 0xFFF0000000000000, 0x7FF8000000000000, 0xFFF8000000001234,
+                           0x7FF4000000000000, 0x7FF0000000000001, 0x0000000000000001, 0x8008000000000000,
+                           bits(1e-40), bits(-3e-39)])
+    return rng.getrandbits(64)
 
 
 # Known differences, by design. Each returns a reason or None.
@@ -293,7 +338,9 @@ CACHE_OPS = {(31, 86), (31, 54), (31, 278), (31, 246), (31, 982)}  # dcbf dcbst 
 
 
 def known_difference(a, b, image, divided_by_zero, reads_time):
-    (sa, _, _), (sb, _, _) = a, b
+    sa, sb = a[0], b[0]
+    if b[4]:
+        return "non-IEEE mode flushed a denormal to zero (OSInit sets FPSCR[NI]); Unicorn ignores NI"
     if divided_by_zero:
         return ("divide by zero: undefined in the architecture; lifted code gives Broadway's result, "
                 "Unicorn leaves the dividend")
@@ -309,12 +356,15 @@ def known_difference(a, b, image, divided_by_zero, reads_time):
             return "dcbz fault: same instruction and block; Unicorn reports where its zeroing loop faulted"
     if sb[0] == 2:
         return "indirect jump to an address that isn't a function: lifted code stops, Unicorn runs whatever is there"
+    if sb[0] == 3:
+        return ("return to an address other than the caller's (a stack smashed by random input): "
+                "lifted code stops, Unicorn jumps there")
     return None
 
 
 def compare(a, b):
     """'' if equal, else what differs."""
-    (sa, oa, ma), (sb, ob, mb) = a, b
+    (sa, oa, ma, fa, _), (sb, ob, mb, fb, _) = a, b
     if sa[0] != sb[0]:
         return f"stopped differently: original {STATUS[sa[0]] if isinstance(sa[0], int) else sa}, lifted {STATUS[sb[0]]} ({sb[1]:08X} {sb[2]:08X})"
     if sa[0] in (1, 5) and (sa[1], sa[2]) != (sb[1], sb[2]):
@@ -329,6 +379,9 @@ def compare(a, b):
             x, y = x & XER_MASK, y & XER_MASK
         if x != y:
             diffs.append(f"{n} {x:08X}/{y:08X}")
+    for i in range(32):
+        if fa[i] != fb[i]:
+            diffs.append(f"f{i} {fa[i]:016X}/{fb[i]:016X}")
     if ma != mb:
         addrs = sorted(set(ma) ^ set(mb) | {k for k in ma if k in mb and ma[k] != mb[k]})
         diffs.append(f"memory at {', '.join(f'{x:08X}' for x in addrs[:4])}")
@@ -351,17 +404,17 @@ def test_function(fn):
     rng = random.Random(w["seed"] << 32 | fn)  # this function's trials, whatever else runs
     counts, stops, bad = collections.Counter(), collections.Counter(), None
     for _ in range(w["trials"]):
-        regs, writes = random_state(rng)
+        regs, fprs, writes = random_state(rng)
         # Unicorn enters through the stub (see Original.run). It is part of the
         # starting state on both sides, like the heap and stack: a function
         # that reads memory down to it must see the same bytes either way.
         writes.append((STUB, struct.pack(">4I", 0x7C0103A6, 0x3C000000 | regs[0] >> 16, 0x60000000 | regs[0] & 0xFFFF,
                                          0x48000000 | (fn - (STUB + 12)) & 0x03FFFFFC)))
-        a = w["original"].run(fn, regs, writes)
+        a = w["original"].run(fn, regs, fprs, writes)
         if a is None:
             counts["skipped: runs too long under Unicorn"] += 1
             continue
-        b = w["lifted"].run(fn, regs, writes)
+        b = w["lifted"].run(fn, regs, fprs, writes)
         if b is None:
             counts["MISMATCH"] += 1
             bad = bad or "lifted code didn't finish; the original did"
@@ -370,7 +423,8 @@ def test_function(fn):
             counts["skipped: Unicorn stopped (" + a[0][2].split('(')[0].strip() + ")"] += 1
             continue
         if b[0][0] == 6:
-            counts["skipped: unsupported special register or system call"] += 1
+            counts["skipped: " + ("a floating-point case Broadway's result isn't pinned down for"
+                                  if b[0][2] == 0xFFFFFFFF else "unsupported special register or system call")] += 1
             continue
         why = compare(a, b)
         known = known_difference(a, b, w["image"], w["original"].divided_by_zero, fn in w["time"]) if why else None

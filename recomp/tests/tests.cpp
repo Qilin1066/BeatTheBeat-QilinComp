@@ -578,21 +578,90 @@ void test_lifter() {
         }
     }
 
-    // Floating point waits for slice 3, and says so.
-    Program q;
-    q.word(0x80003260, 0xC0230000);  // lfs f1,0(r3)
-    q.word(0x80003264, 0x4E800020);
-    q.word(0x80005020, 0x80003260);
-    auto dol2 = Dol::parse(q.bytes);
-    CHECK(dol2.has_value());
-    if (!dol2) return;
-    Cfg cfg2(*dol2);
-    cfg2.run();
-    const LiftResult r = Lifter(cfg2).lift(cfg2.functions().at(0x80003260));
-    CHECK(!r.ok && r.fail_at == 0x80003260 && r.why == "floating point (slice 3): lfs");
+    // Slice 3: floating point through the runtime's helpers; FPSCR access
+    // (only in replaced code) is refused with the reason.
+    auto lift_one = [](std::initializer_list<uint32_t> words) {
+        Program q;
+        uint32_t at = 0x80003260;
+        for (uint32_t w : words) q.word(at, w), at += 4;
+        q.word(0x80005020, 0x80003260);
+        auto d = Dol::parse(q.bytes);
+        CHECK(d.has_value());
+        if (!d) return LiftResult{};
+        Cfg c(*d);
+        c.run();
+        return Lifter(c).lift(c.functions().at(0x80003260));
+    };
+    LiftResult r = lift_one({0xC0230000,    // lfs f1,0(r3)
+                             0xC8430008,    // lfd f2,8(r3)
+                             0xEC6100B2,    // fmuls f3,f1,f2
+                             0xFC011040,    // fcmpo cr0,f1,f2
+                             0xD0630010,    // stfs f3,16(r3)
+                             0x4E800020});  // blr
+    CHECK(r.ok);
+    CHECK(r.code.contains("f1 = rt::lfs(rt::ld32(ea));"));
+    CHECK(r.code.contains("f2 = rt::dbl(rt::ld64(ea));"));
+    CHECK(r.code.contains("if (!rt::single_significand(f2)) rt::fp_unknown(0x80003268u); f3 = rt::fmuls(f1, f2);") ||
+          (r.code.contains("if (!rt::single_significand(f2)) rt::fp_unknown(0x80003268u);") &&
+           r.code.contains("f3 = rt::fmuls(f1, f2);")));
+    CHECK(r.code.contains("if (rt::denormal_d(f1) || rt::denormal_d(f2)) rt::fp_unknown(0x8000326Cu); "
+                          "cr = rt::set_crf(cr, 0, rt::fcmp(f1, f2));"));
+    CHECK(r.code.contains("rt::st32(ea, rt::stfs(f3));"));
+    CHECK(r.code.contains("[[maybe_unused]] double f1 = c.f[1];") && r.code.contains("c.f[3] = f3;"));
+    r = lift_one({0xFC00048E, 0x4E800020});  // mffs f0
+    CHECK(!r.ok && r.fail_at == 0x80003260 &&
+          r.why == "FPSCR access (only in replaced code; FPSCR not modelled): mffs");
+    r = lift_one({0xEC22182B, 0x4E800020});  // fadds. f1,f2,f3
+    CHECK(!r.ok && r.why.starts_with("floating-point record form"));
 }
 
 // ---------------------------------------------------------------- runtime helpers
+
+void test_float() {
+    using rt::bits;
+    using rt::dbl;
+    // Non-IEEE mode: denormal operands and results are zero of their sign.
+    CHECK(bits(rt::fmul(0x1p-1000, 0x1p-30)) == 0);                       // denormal result
+    CHECK(bits(rt::fmul(-0x1p-1000, 0x1p-30)) == 0x8000000000000000ull);   // keeps the sign
+    CHECK(rt::fadd(0x1p-1060, 1.0) == 1.0 && rt::fadd(0x1p-1060, 0x1p-1060) == 0.0);  // denormal operands
+    CHECK(rt::fadds(1e-40, 0.0) == 0.0);                       // single precision: by the single format
+    CHECK(rt::fadds(0x1p-120, 0x1p-120) == 0x1p-119);          // a normal single stays
+    CHECK(rt::fadd(1e-300, 0.0) == 1e-300);                    // a normal double stays in double precision
+    // NaNs: the first NaN operand (frA, frB, frC), quieted; else the positive default QNaN.
+    const double inf = dbl(0x7FF0000000000000ull);
+    CHECK(bits(rt::fsub(inf, inf)) == 0x7FF8000000000000ull);
+    CHECK(bits(rt::fmul(0.0, inf)) == 0x7FF8000000000000ull);
+    CHECK(bits(rt::fadd(dbl(0x7FF0000000000001ull), dbl(0xFFF8000000000002ull))) == 0x7FF8000000000001ull);
+    CHECK(bits(rt::fadd(1.0, dbl(0xFFF8000000000002ull))) == 0xFFF8000000000002ull);
+    CHECK(bits(rt::fma_(1.0, 2.0, dbl(0x7FF4000000000000ull), false, true)) == 0x7FFC000000000000ull);  // no negation
+    CHECK(bits(rt::fadds(dbl(0x7FF800000FFFFFFFull), 1.0)) == 0x7FF8000000000000ull);  // single keeps 23 bits
+    // Fused multiply-add rounds once: (1 + 2^-30)^2 - 1 keeps the 2^-60 term.
+    CHECK(rt::fma_(1.0 + 0x1p-30, 1.0 + 0x1p-30, 1.0, true, false) == 0x1p-29 + 0x1p-60);
+    CHECK(rt::fma_(2.0, 3.0, 1.0, false, true) == -7.0 && rt::fma_(2.0, 3.0, 1.0, true, true) == -5.0);
+    // Single precision rounds the double result.
+    CHECK(rt::fadds(1.0, 0x1p-24 + 0x1p-40) == 1.0 + 0x1p-23);
+    CHECK(rt::frsp(1.0 + 0x1p-25) == 1.0);
+    // fctiwz: truncation, saturation, NaN, and the 750 family's high word.
+    CHECK(bits(rt::fctiwz(3.7)) == 0xFFF8000000000003ull && bits(rt::fctiwz(-3.7)) == 0xFFF80000FFFFFFFDull);
+    CHECK(bits(rt::fctiwz(1e10)) == 0xFFF800007FFFFFFFull && bits(rt::fctiwz(-1e10)) == 0xFFF8000080000000ull);
+    CHECK(bits(rt::fctiwz(dbl(0x7FF8000000000000ull))) == 0xFFF8000080000000ull);
+    CHECK(bits(rt::fctiwz(-2147483648.9)) == 0xFFF8000080000000ull);
+    // Compares: FL FG FE FU.
+    CHECK(rt::fcmp(1.0, 2.0) == rt::kLt && rt::fcmp(2.0, 1.0) == rt::kGt && rt::fcmp(-0.0, 0.0) == rt::kEq);
+    CHECK(rt::fcmp(dbl(0x7FF8000000000000ull), 1.0) == 1);
+    // lfs: exact, NaN payloads kept (a signalling NaN stays signalling).
+    CHECK(rt::lfs(0x3F800000u) == 1.0 && rt::lfs(0x00000001u) == 0x1p-149);
+    CHECK(bits(rt::lfs(0x7F800001u)) == 0x7FF0000020000000ull && bits(rt::lfs(0xFF800000u)) == 0xFFF0000000000000ull);
+    // stfs: the architecture's bit copy (no rounding) and denormalisation.
+    CHECK(rt::stfs(1.0 + 0x1p-24 + 0x1p-40) == 0x3F800000u);  // truncated, where a conversion rounds up
+    CHECK(rt::stfs(0x1p-149) == 0x00000001u && rt::stfs(0x1p-127) == 0x00400000u && rt::stfs(-0x1p-126) == 0x80800000u);
+    CHECK(rt::stfs(0x1p-200) == 0 && rt::stfs(-0.0) == 0x80000000u);
+    CHECK(rt::stfs(dbl(0x7FF4000000000000ull)) == 0x7FA00000u);  // a signalling NaN stays signalling
+    for (const uint32_t w : {0x3F800000u, 0xC2F6E979u, 0x00000001u, 0x807FFFFFu, 0x7F7FFFFFu, 0x7FC00001u, 0xFF800000u})
+        CHECK(rt::stfs(rt::lfs(w)) == w);  // lfs then stfs is the identity
+    // fmuls's frC check.
+    CHECK(rt::single_significand(1.5) && rt::single_significand(rt::lfs(0x3DCCCCCDu)) && !rt::single_significand(0.1));
+}
 
 void test_runtime() {
     // add3: carry out and signed overflow.
@@ -658,6 +727,7 @@ int main() {
     test_cfg();
     test_lifter();
     test_runtime();
+    test_float();
     if (failures) {
         std::println(stderr, "{} check(s) failed", failures);
         return 1;
