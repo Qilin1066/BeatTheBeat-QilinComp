@@ -35,7 +35,9 @@ struct Context {
 // a return somewhere unexpected, a trap, something not lifted. Thrown, so the
 // runtime can name it and its caller, and the differential test can compare it.
 struct Stop {
-    enum Kind : uint32_t { Memory, BadJump, BadReturn, Trap, NotLifted, Unsupported } kind;
+    // Unregistered: a replaced function the runtime has no native code for
+    // yet (pc: the function, value: where it was called from).
+    enum Kind : uint32_t { Memory, BadJump, BadReturn, Trap, NotLifted, Unsupported, Unregistered } kind;
     uint32_t pc;     // guest address of the instruction (or function)
     uint32_t value;  // the address involved
 };
@@ -446,6 +448,11 @@ uint32_t mfspr(Context& c, unsigned spr, uint32_t pc);
 void mtspr(Context& c, unsigned spr, uint32_t v, uint32_t pc);
 uint32_t mftb(Context& c, unsigned tbr);
 void syscall(Context& c, uint32_t pc);
+// `qilin lift --runtime` only: a function of a replaced library, by its index
+// in the generated g_natives table. Runs the native code registered for it
+// (native.hpp) and returns to the caller as a blr would; stops with
+// Unregistered if there is none.
+void native(Context& c, uint32_t index);
 
 [[noreturn]] inline void trap(uint32_t pc) { throw Stop{Stop::Trap, pc, 0}; }
 [[noreturn]] inline void bad_jump(uint32_t pc, uint32_t target) { throw Stop{Stop::BadJump, pc, target}; }

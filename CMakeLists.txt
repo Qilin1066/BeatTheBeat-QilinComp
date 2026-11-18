@@ -7,7 +7,7 @@ if(APPLE AND NOT CMAKE_OSX_DEPLOYMENT_TARGET)
     set(CMAKE_OSX_DEPLOYMENT_TARGET 10.15 CACHE STRING "oldest macOS the runtime runs on")
 endif()
 # The single source of the version number (see CHANGELOG.md for the scheme).
-project(BeatTheBeatQilinComp VERSION 0.11.0 LANGUAGES C CXX)
+project(BeatTheBeatQilinComp VERSION 0.12.0 LANGUAGES C CXX)
 
 # ---- Language: C++23 everywhere (recompiler, runtime, generated code) ----
 set(CMAKE_CXX_STANDARD 23)
@@ -72,6 +72,7 @@ add_library(qilin_core STATIC
     recomp/src/cfg.cpp
     recomp/src/lifter.cpp
     recomp/src/hwaccess.cpp
+    recomp/src/libraries.cpp
 )
 target_include_directories(qilin_core PUBLIC recomp/src)
 target_link_libraries(qilin_core PUBLIC qilin_dol PRIVATE qilin_warnings)
@@ -128,9 +129,37 @@ if(QILIN_GEN_DIR)
     endif()
 endif()
 
+# The game: qilin_run, from `qilin lift --runtime` output (a second directory:
+# the difftest's lifts every library, this one calls native code for the
+# replaced ones).
+#   qilin lift main.dol --out gen-rt --runtime --symbols pal_symbols.txt
+#   cmake -B build-rt -DQILIN_RUNTIME_GEN_DIR=$PWD/gen-rt
+# Checked memory for now (bring-up): an access outside the memory lifted code
+# may use stops with the address and the instruction.
+set(QILIN_RUNTIME_GEN_DIR "" CACHE PATH "qilin lift --runtime output directory")
+if(QILIN_RUNTIME_GEN_DIR)
+    file(GLOB QILIN_RUNTIME_GEN_SOURCES CONFIGURE_DEPENDS "${QILIN_RUNTIME_GEN_DIR}/*.cpp")
+    add_library(qilin_gen_runtime STATIC ${QILIN_RUNTIME_GEN_SOURCES} recomp/runtime/dispatch.cpp)
+    target_include_directories(qilin_gen_runtime PUBLIC "${QILIN_RUNTIME_GEN_DIR}")
+    target_compile_definitions(qilin_gen_runtime PUBLIC QILIN_CHECKED_MEMORY)
+    target_link_libraries(qilin_gen_runtime PUBLIC qilin_runtime PRIVATE qilin_warnings)
+    if(MSVC)
+        target_compile_options(qilin_gen_runtime PRIVATE /wd4702)  # as for qilin_gen_checked
+    endif()
+    # The native functions register themselves from static initialisers, so
+    # they are the executable's own sources: a static library would drop them.
+    add_executable(qilin_run
+        recomp/runtime/run.cpp
+        recomp/runtime/machine.cpp
+        recomp/runtime/native.cpp
+        recomp/runtime/os.cpp
+    )
+    target_link_libraries(qilin_run PRIVATE qilin_gen_runtime qilin_dol qilin_warnings)
+endif()
+
 # ---- Tests (no game files needed) ----
 enable_testing()
-add_executable(qilin_tests recomp/tests/tests.cpp)
+add_executable(qilin_tests recomp/tests/tests.cpp recomp/runtime/native.cpp)
 target_link_libraries(qilin_tests PRIVATE qilin_core qilin_runtime qilin_warnings)
 qilin_tool(qilin_tests)
 add_test(NAME qilin_tests COMMAND qilin_tests)

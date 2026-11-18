@@ -24,6 +24,7 @@
 /analysis-out/
 /generated/
 /gen/
+/gen-rt/
 *.insns.txt
 cfg.json
 cfg.json.gz

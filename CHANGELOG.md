@@ -11,6 +11,18 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-11-18
+The runtime skeleton: `qilin_run` starts the game. It runs `OSInit` natively and the static constructors as lifted code, and stops at the first replaced function it has no native code for, naming it and its caller.
+
+### Added
+- **`qilin lift --runtime --symbols <list>`**: the runtime's own lift. Functions of replaced and dropped libraries become calls to native code (`rt::native`), listed in a generated `natives.cpp`; `symbols.cpp` names every function for reports. The differential test's lift is unchanged and still lifts every library.
+- **The library plan in code** (`recomp/src/libraries.*`): the lifted, replaced and dropped ranges of `docs/code-analysis.md`, and the functions lifted out of replaced libraries by name: `__init_user`, `__init_cpp`, `exit`, and GX's light-object functions, which only fill in a structure.
+- **The registry of native functions** (`recomp/runtime/native.*`): native code registers by the function's name with `QILIN_NATIVE(name)`, so the repository holds no list of PAL addresses. Start-up refuses a registration that matches no replaced function, several, or is repeated. A replaced function without native code stops the game when called (`Stop::Unregistered`).
+- **`qilin_run`** (`recomp/runtime/run.cpp`, `machine.*`; CMake `QILIN_RUNTIME_GEN_DIR`): maps MEM1 and MEM2 in a reserved 4 GB guest space, loads the DOL, sets up what `__start` sets up, then calls `OSInit`, `__init_user`, `main` and `exit`. Every stop is reported with function names. Bring-up runs with checked memory: low memory, the uncached mirrors and hardware registers stop lifted code.
+- **The first native OS functions** (`recomp/runtime/os.cpp`, 22): `OSInit`, the interrupt enable, the arenas, the cache range functions, `OSRegisterVersion`, `PPCHalt`.
+- **`docs/runtime.md`**: how the runtime is built and reached, the boot values still to confirm in Dolphin, and a proposal for the next step: lift the OS's thread, mutex and alarm bookkeeping and replace only the context switch, interrupts and timers under it.
+- **Tests** for the library plan, the symbol list reader and the registry.
+
 ## [0.11.0] - 2026-11-18
 The runtime's to-do list: what lifted code needs from the libraries and hardware the runtime replaces.
 

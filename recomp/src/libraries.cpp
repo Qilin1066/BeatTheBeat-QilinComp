@@ -1,0 +1,119 @@
+#include "libraries.hpp"
+
+#include <algorithm>
+#include <array>
+#include <charconv>
+#include <format>
+#include <fstream>
+#include <stdexcept>
+
+namespace qilin {
+
+namespace {
+
+using enum Plan;
+
+// docs/code-analysis.md, "Libraries in the PAL build", in address order.
+constexpr Library kLibraries[] = {
+    {0x80004000, 0x800043C4, "init/start", Replace},  // the runtime starts the game
+    {0x800043C4, 0x80004744, "init/runtime", Lift},   // memcpy, __fill_mem, memset
+    {0x80004744, 0x80006720, "init/trk", Drop},       // debugger vectors, __init_data's tables
+    {0x80006F00, 0x800DA6A4, "game", Lift},
+    {0x800DA6A4, 0x800DA8E0, "base", Replace},
+    {0x800DA8E0, 0x800E81FC, "os", Replace},
+    {0x800E8200, 0x800E8CD8, "mtx", Lift},
+    {0x800E8CE0, 0x800F1A28, "dvd", Replace},
+    {0x800F1A30, 0x800F646C, "vi", Replace},
+    {0x800F6470, 0x800F7CDC, "pad", Replace},
+    {0x800F7CE0, 0x800F828C, "ai", Replace},
+    {0x800F8290, 0x800FB5D0, "ax", Replace},
+    {0x800FB5D0, 0x800FC714, "axfx", Lift},
+    {0x800FC720, 0x800FD268, "dsp", Replace},
+    {0x800FD270, 0x80104EF0, "gx", Replace},
+    {0x80104EF0, 0x80107694, "runtime", Lift},
+    {0x80107694, 0x80112124, "msl", Lift},
+    {0x80112130, 0x80113EF8, "exi", Replace},
+    {0x80113F00, 0x801155D8, "si", Replace},
+    {0x801155D8, 0x8011A6A0, "trk", Drop},
+    {0x8011A6A0, 0x8011B160, "ndevexi2a", Drop},
+    {0x8011B160, 0x8011C6D0, "mem", Lift},
+    {0x8011C6D0, 0x8011CA50, "euart", Replace},
+    {0x8011CA50, 0x8011E1F0, "fs", Replace},
+    {0x8011E1F0, 0x8012067C, "ipc", Replace},
+    {0x80120680, 0x801244A8, "nand", Replace},
+    {0x801244B0, 0x801265D4, "sc", Replace},
+    {0x801265D4, 0x801268AC, "wenc", Lift},
+    {0x801268B0, 0x80127288, "arc", Lift},
+    {0x80127290, 0x80127890, "cx", Lift},
+    {0x80127890, 0x8013EBE8, "wpad", Replace},
+    {0x8013EBF0, 0x8016C3C4, "bte", Replace},
+    {0x8016C3D0, 0x8016D91C, "usb", Replace},
+    {0x8016D920, 0x80175494, "kpad", Lift},
+    {0x801754A0, 0x801757D8, "tpl", Lift},
+    {0x801757E0, 0x80175E00, "esp", Replace},
+    {0x80175E00, 0x801995B8, "hbm", Lift},
+    {0x801995C0, 0x8019B628, "nw4r/db", Lift},
+    {0x8019B630, 0x8019CFEC, "nw4r/g3d", Lift},
+    {0x8019CFF0, 0x801A9140, "nw4r/lyt", Lift},
+    {0x801A9140, 0x801A9684, "nw4r/math", Lift},
+    {0x801A9690, 0x801C966C, "nw4r/snd", Lift},
+    {0x801C9670, 0x801D4CE4, "nw4r/ut", Lift},
+    {0x801D4CE4, 0x801EFBF0, "gameutil", Lift},
+    {0x801EFBF0, 0x801F968C, "rfl", Lift},
+};
+
+// Start-up after OSInit, from the end of the OS library (__ppc_eabi_init):
+// __init_user runs the static constructors through __init_cpp, and exit runs
+// the destructors before halting. The runtime calls them as __start does.
+//
+// GX's light objects: these functions only fill in or read back the
+// GXLightObj the caller passes (colour, position, direction, the attenuation
+// maths). Nothing reaches the GPU until GXLoadLightObjImm, which is native.
+constexpr std::string_view kLiftAnyway[] = {
+    "__init_user",
+    "__init_cpp",
+    "exit",
+    "GXInitLightAttn",
+    "GXInitLightSpot",
+    "GXInitLightDistAttn",
+    "GXInitLightPos",
+    "GXGetLightPos",
+    "GXInitLightDir",
+    "GXGetLightDir",
+    "GXInitLightColor",
+};
+
+}  // namespace
+
+std::span<const Library> libraries() { return kLibraries; }
+
+const Library* library_at(uint32_t addr) {
+    const auto it = std::ranges::upper_bound(kLibraries, addr, {}, &Library::lo);
+    if (it == std::begin(kLibraries)) return nullptr;
+    const Library& l = *(it - 1);
+    return addr < l.hi ? &l : nullptr;
+}
+
+std::span<const std::string_view> lift_anyway_names() { return kLiftAnyway; }
+
+bool lift_anyway(std::string_view name) { return std::ranges::find(kLiftAnyway, name) != std::end(kLiftAnyway); }
+
+std::map<uint32_t, std::string> load_symbols(const std::string& path) {
+    std::ifstream f(path);
+    if (!f) throw std::runtime_error(std::format("cannot open {}", path));
+    std::map<uint32_t, std::string> names;
+    for (std::string line; std::getline(f, line);) {
+        // name = .section:0xADDRESS; ...
+        const size_t eq = line.find(" = ."), colon = line.find(":0x", eq == std::string::npos ? 0 : eq);
+        if (eq == std::string::npos || eq == 0 || colon == std::string::npos || colon + 11 > line.size()) continue;
+        uint32_t addr = 0;
+        const char* first = line.data() + colon + 3;
+        const auto [end, ec] = std::from_chars(first, first + 8, addr, 16);
+        if (ec != std::errc{} || end != first + 8) continue;
+        names.emplace(addr, line.substr(0, eq));
+    }
+    if (names.empty()) throw std::runtime_error(std::format("{}: no symbols (expected \"name = .text:0x80001234; ...\")", path));
+    return names;
+}
+
+}  // namespace qilin

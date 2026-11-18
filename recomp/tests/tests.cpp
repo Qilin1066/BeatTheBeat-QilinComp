@@ -4,7 +4,10 @@
 #include <algorithm>
 #include <map>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <print>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -14,7 +17,9 @@
 #include "dol.hpp"
 #include "guest.hpp"
 #include "hwaccess.hpp"
+#include "libraries.hpp"
 #include "lifter.hpp"
+#include "native.hpp"
 #include "sha256.hpp"
 
 using namespace qilin;
@@ -830,9 +835,95 @@ void test_runtime() {
     rt::g_mem = saved;
 }
 
+// ---------------------------------------------------------------- library plan
+
+void test_libraries() {
+    // In address order, without overlaps: library_at searches by that.
+    const auto libs = libraries();
+    CHECK(!libs.empty());
+    for (size_t i = 0; i < libs.size(); ++i) {
+        CHECK(libs[i].lo < libs[i].hi);
+        if (i) CHECK(libs[i - 1].hi <= libs[i].lo);
+    }
+    const Library* game = library_at(0x80038314u);
+    CHECK(game && game->name == "game" && game->plan == Plan::Lift);
+    const Library* os = library_at(0x800DB3A0u);
+    CHECK(os && os->name == "os" && os->plan == Plan::Replace);
+    CHECK(library_at(0x800DA8E0u) == os && library_at(0x800E81F8u) == os);  // first and last word
+    CHECK(library_at(0x800DA8DCu)->name == "base");
+    const Library* trk = library_at(0x80115FCCu);
+    CHECK(trk && trk->plan == Plan::Drop);
+    CHECK(library_at(0x80006800u) == nullptr);  // extab, between .init and .text
+    CHECK(library_at(0x7FFFFFFFu) == nullptr && library_at(0x801F968Cu) == nullptr);
+    CHECK(lift_anyway("exit") && lift_anyway("__init_cpp") && !lift_anyway("OSInit") && !lift_anyway(""));
+    for (std::string_view n : lift_anyway_names()) CHECK(lift_anyway(n));
+
+    // The PAL symbol list, as port_symbols.py writes it.
+    const auto path = std::filesystem::temp_directory_path() / "qilin_test_symbols.txt";
+    {
+        std::ofstream f(path);
+        f << "main = .text:0x80038314; // size:0x14C us:0x80038204 match:anchored unit:Game/main.cpp\n"
+             "__start = .init:0x80004050; // size:0x168\n"
+             "a line that is not a symbol\n"
+             "__save_gpr.part2 = .text:0x80105000; // size:0x4\n";
+    }
+    const auto names = load_symbols(path.string());
+    CHECK(names.size() == 3 && names.at(0x80038314u) == "main" && names.at(0x80004050u) == "__start");
+    CHECK(names.at(0x80105000u) == "__save_gpr.part2");
+    std::filesystem::remove(path);
+    bool threw = false;
+    try {
+        load_symbols(path.string());
+    } catch (const std::runtime_error&) {
+        threw = true;
+    }
+    CHECK(threw);
+}
+
+// ---------------------------------------------------------------- native registry
+
+QILIN_NATIVE(TestDouble) { c.r[3] *= 2; }
+
+void test_natives() {
+    CHECK(rt::bind_natives() && rt::natives_bound() == 1);
+    rt::Context c;
+    c.r[3] = 21;
+    c.lr = 0x80001234u;
+    rt::native(c, 0);
+    CHECK(c.r[3] == 42 && c.ret == 0x80001234u);  // returns to the caller, as a blr
+    // A replaced function without native code stops, naming itself and the caller.
+    bool stopped = false;
+    try {
+        rt::native(c, 1);
+    } catch (const rt::Stop& s) {
+        stopped = s.kind == rt::Stop::Unregistered && s.pc == 0x80002000u && s.value == 0x80001234u;
+    }
+    CHECK(stopped);
+    CHECK(rt::symbol_at(0x80001000u) && std::string_view(rt::symbol_at(0x80001000u)->name) == "TestDouble");
+    CHECK(rt::symbol_at(0x80001004u) == nullptr);
+    CHECK(rt::symbol_containing(0x80001004u) == rt::symbol_at(0x80001000u));
+    CHECK(rt::symbol_containing(0x80000050u) == nullptr);
+    CHECK(rt::symbol_address("alpha") == 0x80000100u);
+    CHECK(rt::symbol_address("twice") == 0 && rt::symbol_address("absent") == 0);  // ambiguous, missing
+}
+
 }  // namespace
 
+// What `qilin lift --runtime` generates, for test_natives.
+namespace qilin::rt {
+extern const NativeEntry g_natives[] = {{0x80001000u, "TestDouble", "os"}, {0x80002000u, "TestMissing", "gx"}};
+extern const size_t g_native_count = 2;
+extern const Symbol g_symbols[] = {{0x80000100u, "alpha"},
+                                   {0x80001000u, "TestDouble"},
+                                   {0x80002000u, "TestMissing"},
+                                   {0x80003000u, "twice"},
+                                   {0x80003100u, "twice"}};
+extern const size_t g_symbol_count = 5;
+}  // namespace qilin::rt
+
 int main() {
+    test_libraries();
+    test_natives();
     test_sha256();
     test_dol();
     test_decoder();

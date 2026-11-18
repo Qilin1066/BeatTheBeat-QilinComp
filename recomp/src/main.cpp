@@ -9,8 +9,10 @@
 //   qilin cfg     <main.dol> [--json out.json]   function discovery + control flow, summary
 //   qilin coverage <main.dol> [--list]           word accounting of the text: code / padding / unknown
 //   qilin suspects <main.dol>                    functions with problems, for review
-//   qilin lift    <main.dol> --out <dir> [--range lo-hi] [--only addr]
-//                                                lift to C++ (generated code: never commit it)
+//   qilin lift    <main.dol> --out <dir> [--range lo-hi] [--only addr] [--runtime --symbols <list>]
+//                                                lift to C++ (generated code: never commit it);
+//                                                --runtime: for qilin_run, where replaced libraries
+//                                                call native code (the difftest lifts everything)
 //   qilin hwaccess <main.dol> [--json out.json]  loads and stores at constant addresses outside
 //                                                cached MEM1 (hardware, GX FIFO, MEM2...), per function
 //
@@ -39,6 +41,7 @@
 #include "decoder.hpp"
 #include "dol.hpp"
 #include "hwaccess.hpp"
+#include "libraries.hpp"
 #include "lifter.hpp"
 
 #ifndef QILIN_VERSION
@@ -64,7 +67,7 @@ int usage() {
                "  qilin cfg     <main.dol> [--json out.json]\n"
                "  qilin coverage <main.dol> [--list]\n"
                "  qilin suspects <main.dol>\n"
-               "  qilin lift    <main.dol> --out <dir> [--range lo-hi] [--only addr]\n"
+               "  qilin lift    <main.dol> --out <dir> [--range lo-hi] [--only addr] [--runtime --symbols <list>]\n"
                "  qilin hwaccess <main.dol> [--json out.json]\n"
                "  qilin --version\n");
     return 2;
@@ -72,10 +75,10 @@ int usage() {
 
 struct Args {
     std::string command, input;
-    std::optional<std::string> out, json, out_dir;
+    std::optional<std::string> out, json, out_dir, symbols;
     std::optional<std::pair<uint32_t, uint32_t>> range;
     uint32_t base = 0;
-    bool list = false;
+    bool list = false, runtime = false;
 };
 
 uint32_t parse_u32(std::string_view s) {
@@ -104,6 +107,8 @@ Args parse_args(std::span<char*> argv) {
         else if (arg == "--base") a.base = parse_u32(value());
         else if (arg == "--list") a.list = true;
         else if (arg == "--out") a.out_dir = value();
+        else if (arg == "--symbols") a.symbols = value();
+        else if (arg == "--runtime") a.runtime = true;
         else if (arg == "--only") {
             const uint32_t v = parse_u32(value());
             a.range = std::pair{v, v + 1};
@@ -287,13 +292,52 @@ int cmd_lift(const Args& a) {
     std::string header = banner + "#pragma once\n#include \"guest.hpp\"\n\nnamespace qilin::gen {\n";
     std::string table = banner + "#include \"functions.hpp\"\n\nnamespace qilin::rt {\nextern const FnEntry g_functions[] = {\n";
     std::string stubs = banner + "#include \"functions.hpp\"\n\nnamespace qilin::gen {\n";
+    // --runtime: functions of replaced and dropped libraries call the
+    // runtime's native code through rt::native, by index in g_natives.
+    std::map<uint32_t, std::string> names;
+    if (a.runtime && !a.symbols)
+        throw Failure{"lift --runtime needs --symbols <the list tools/analysis/port_symbols.py --symbols-out writes>"};
+    if (a.symbols) {
+        try {
+            names = load_symbols(*a.symbols);
+        } catch (const std::runtime_error& e) {
+            throw Failure{e.what()};
+        }
+    }
+    std::string natives = banner + "#include \"functions.hpp\"\n#include \"native.hpp\"\n\nnamespace qilin::gen {\n";
+    std::string native_table = "}  // namespace qilin::gen\n\nnamespace qilin::rt {\nextern const NativeEntry g_natives[] = {\n";
+    std::string symbols = banner + "#include \"native.hpp\"\n\nnamespace qilin::rt {\nextern const Symbol g_symbols[] = {\n";
+    auto quoted = [](std::string_view s) {
+        std::string q = "\"";
+        for (char ch : s) {
+            if (ch == '"' || ch == '\\') q += '\\';
+            q += ch;
+        }
+        return q + "\"";
+    };
+    std::set<std::string_view> lifted_anyway;
     std::vector<std::string> chunks;
-    size_t index = 0, lifted = 0, failed = 0, skipped = 0;
+    size_t index = 0, lifted = 0, failed = 0, skipped = 0, native = 0;
     std::map<std::string, std::vector<uint32_t>> failures;  // reason -> functions
     for (const auto& [start, f] : cfg.functions()) {
         if (index++ % kChunkFunctions == 0) chunks.emplace_back();
         header += std::format("void {}(rt::Context& c);\n", fn_name(start));
         table += std::format("    {{0x{:08X}u, gen::{}}},\n", start, fn_name(start));
+        if (a.runtime) {
+            const Library* lib = library_at(start);
+            if (!lib) throw Failure{std::format("function {:08X} is in no library of the plan (libraries.cpp)", start)};
+            const auto named = names.find(start);
+            const std::string name = named != names.end() ? named->second : fn_name(start);
+            symbols += std::format("    {{0x{:08X}u, {}}},\n", start, quoted(name));
+            if (lib->plan != Plan::Lift && !lift_anyway(name)) {
+                natives += std::format("void {}(rt::Context& c) {{ rt::native(c, {}); }}\n", fn_name(start), native++);
+                native_table += std::format("    {{0x{:08X}u, {}, {}}},\n", start, quoted(name), quoted(lib->name));
+                continue;
+            }
+            if (lib->plan != Plan::Lift)
+                for (std::string_view n : lift_anyway_names())
+                    if (n == name) lifted_anyway.insert(n);
+        }
         const bool wanted = !a.range || (start >= a.range->first && start < a.range->second);
         LiftResult r;
         if (wanted) r = lifter.lift(f);
@@ -318,23 +362,43 @@ int cmd_lift(const Args& a) {
     written += update_file(dir / "functions.hpp", header);
     written += update_file(dir / "table.cpp", table);
     written += update_file(dir / "stubs.cpp", stubs);
-    std::set<std::string> names;
+    size_t extra = 0;
+    if (a.runtime) {
+        for (std::string_view n : lift_anyway_names())
+            if (!lifted_anyway.contains(n))
+                throw Failure{std::format("libraries.cpp lifts {} out of a replaced library, but {} names no such function", n,
+                                          *a.symbols)};
+        native_table += "};\nextern const size_t g_native_count = sizeof(g_natives) / sizeof(g_natives[0]);\n"
+                        "}  // namespace qilin::rt\n";
+        symbols += "};\nextern const size_t g_symbol_count = sizeof(g_symbols) / sizeof(g_symbols[0]);\n"
+                   "}  // namespace qilin::rt\n";
+        written += update_file(dir / "natives.cpp", natives + native_table);
+        written += update_file(dir / "symbols.cpp", symbols);
+        extra = 2;
+    } else {
+        // Left by a --runtime run into the same directory: they would define
+        // functions twice.
+        std::filesystem::remove(dir / "natives.cpp");
+        std::filesystem::remove(dir / "symbols.cpp");
+    }
+    std::set<std::string> chunk_names;
     for (size_t i = 0; i < chunks.size(); ++i) {
         const std::string name = std::format("lifted_{:03}.cpp", i);
-        names.insert(name);
+        chunk_names.insert(name);
         written += update_file(dir / name, banner + "#include <bit>\n#include \"functions.hpp\"\n\nnamespace qilin::gen {\n\n" +
                                                chunks[i] + "}  // namespace qilin::gen\n");
     }
     size_t removed = 0;  // chunks left by an earlier run over more functions
     for (const auto& e : std::filesystem::directory_iterator(dir)) {
         const std::string name = e.path().filename().string();
-        if (name.starts_with("lifted_") && e.path().extension() == ".cpp" && !names.contains(name)) {
+        if (name.starts_with("lifted_") && e.path().extension() == ".cpp" && !chunk_names.contains(name)) {
             std::filesystem::remove(e.path());
             ++removed;
         }
     }
 
     std::string report = std::format("{} functions lifted, {} not lifted, {} outside the range\n", lifted, failed, skipped);
+    if (a.runtime) report += std::format("{:6} replaced or dropped: native code, through the runtime's registry\n", native);
     for (const auto& [why, fns] : failures) {
         if (why.starts_with("  ")) continue;
         report += std::format("{:6} {}\n", fns.size(), why);
@@ -347,8 +411,8 @@ int cmd_lift(const Args& a) {
     for (const auto& [n, why] : detail) report += std::format("{:6} {}\n", n, why.substr(2));
     write_file(dir / "lift_report.txt", report);
     std::print("{}", report.substr(0, report.find("\nby instruction")));
-    std::println("{} files in {}: {} written, {} unchanged, {} removed", chunks.size() + 3, dir.string(), written,
-                 chunks.size() + 3 - written, removed);
+    const size_t files = chunks.size() + 3 + extra;
+    std::println("{} files in {}: {} written, {} unchanged, {} removed", files, dir.string(), written, files - written, removed);
     return 0;
 }
 

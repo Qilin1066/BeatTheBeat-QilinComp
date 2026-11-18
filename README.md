@@ -23,6 +23,7 @@ Roadmap step 1, **analysis**, is nearly done; step 2, the **recompiler core**, i
 | Runtime to-do list: replaced functions lifted code calls, its direct hardware accesses (`qilin hwaccess`, `tools/analysis/runtime_todo.py`) | ✅ 309 replaced functions called; the GX FIFO is the only hardware lifted code touches |
 | Differential test under UBSan (`-DQILIN_UBSAN=ON`, or `tools/difftest/build_ubsan.py` on any host) | ✅ no undefined behaviour in 64,824 trials |
 | Lifter slice 4: paired singles and GQR quantisation (from IBM's 750CL manual; a reference model in the difftest, since Unicorn has none) | ✅ 8,103 of 8,171 functions lift; the rest are replaced libraries and 5 estimate-instruction users |
+| Runtime skeleton: `qilin_run`, the registry of native functions, the runtime's own lift (`qilin lift --runtime`) | 🔨 starts the game, runs `OSInit` natively and the static constructors lifted; stops, naming it, at the first replaced function without native code (`docs/runtime.md`) |
 | Runtime: OS, DVD, NAND, GX on Vulkan, AX audio, input | later (see roadmap) |
 
 The repository's first version (0.1.0-alpha.1, a Dolphin-based preview, and a native boot probe on top of DolRecomp) was written with ChatGPT and has been retired. `docs/prior-art.md` §1 says what it did and what carried over.
@@ -75,6 +76,17 @@ python3 tools/difftest/difftest.py ... --only 801E9140         # replays exactly
 
 Runs every lifted function from random states, as lifted C++ and as the original code under Unicorn's PowerPC 750CL model (`pip install unicorn`), and compares registers, memory and how each stopped. It uses one worker per CPU (`--jobs`) and runs on Linux, macOS and Windows. Details in `docs/recompiler-core.md`.
 
+### Running the game (bring-up)
+
+```sh
+python3 tools/analysis/port_symbols.py --qilin build/qilin --dol path/to/main.dol --symbols-out pal_symbols.txt
+build/qilin lift path/to/main.dol --out gen-rt --runtime --symbols pal_symbols.txt
+cmake -S . -B build-rt -DQILIN_RUNTIME_GEN_DIR=$PWD/gen-rt && cmake --build build-rt --target qilin_run
+build-rt/qilin_run path/to/main.dol
+```
+
+It doesn't get far yet: it stops at the first SDK function the runtime has no native code for, and says which and who called it. `docs/runtime.md` has the details. Keep `pal_symbols.txt` outside the repository.
+
 ### Decoder check
 
 ```sh
@@ -96,8 +108,8 @@ This compares the decoder with GNU objdump (`-M broadway,raw`): mnemonic and eve
 
 | Path | What |
 |---|---|
-| `recomp/src/` | Recompiler core: `dol` loader, `sha256`, `decoder` (Broadway), `cfg` (function discovery + control flow), `lifter` (Broadway → C++), `main` (CLI) |
-| `recomp/runtime/` | What lifted code needs at run time: `guest.hpp` (context, big-endian memory, arithmetic and flag helpers), `dispatch.cpp` (the function table) |
+| `recomp/src/` | Recompiler core: `dol` loader, `sha256`, `decoder` (Broadway), `cfg` (function discovery + control flow), `lifter` (Broadway → C++), `libraries` (what's lifted, replaced or dropped), `main` (CLI) |
+| `recomp/runtime/` | What lifted code needs at run time: `guest.hpp` (context, big-endian memory, arithmetic and flag helpers), `dispatch.cpp` (the function table). The game itself: `run.cpp` (`qilin_run`), `machine` (guest memory), `native` (the registry of native functions), `os.cpp` (the OS, natively) |
 | `recomp/tests/` | Unit tests on a synthetic in-memory DOL, the decoder and a synthetic program, so they need no game files |
 | `tools/check/` | The decoder cross-check against GNU objdump |
 | `tools/difftest/` | The differential test: `harness.cpp` runs lifted code, `difftest.py` the original under Unicorn |

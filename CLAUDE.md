@@ -16,14 +16,15 @@ Static recompilation of **Beat the Beat: Rhythm Paradise** (Wii, PAL `SOMP01` re
 ## Layout
 
 - `recomp/src/`: `dol` (loader, known-build SHA), `decoder` (table-driven, 222 ops, X-macro `QILIN_PPC_OPS`), `cfg` (function discovery, jump tables, coverage), `lifter` (one C++ function per guest function), `main.cpp` (the `qilin` CLI).
-- `recomp/runtime/`: `guest.hpp` (Context, memory, flag and arithmetic helpers, `Stop`), `dispatch.cpp` (`rt::call`, SPRs, time base).
+- `recomp/src/libraries.*`: the library plan in code (lift, replace or drop, by PAL range) and `lift_anyway` (functions lifted out of replaced libraries, by name). Keep it in step with the table in `docs/code-analysis.md`.
+- `recomp/runtime/`: `guest.hpp` (Context, memory, flag and arithmetic helpers, `Stop`), `dispatch.cpp` (`rt::call`, SPRs, time base). The game: `run.cpp` (`qilin_run`: start-up as `__start`, stop reports), `machine.*` (guest memory), `native.*` (registry: `QILIN_NATIVE(name)`, by the decomp's name, never by address), `os.cpp` (native OS functions).
 - `recomp/tests/tests.cpp`: unit tests (`ctest`).
 - `tools/check/verify_decoder.py`: compares the decoder with binutils objdump.
 - `tools/difftest/`: runs lifted code and the original under Unicorn and compares the results, one worker per CPU. Runs on Linux, macOS and Windows. Trials are seeded per function, so `--only`/`--range` replay a full run's trials exactly.
 - `tools/analysis/port_symbols.py`: ports US decomp names to PAL.
 - `recomp/src/hwaccess.*` (`qilin hwaccess`) and `tools/analysis/runtime_todo.py`: the runtime's to-do list (replaced functions lifted code calls, its direct hardware accesses). Their output is game-derived: never commit it.
 - `tools/difftest/build_ubsan.py`: the UBSan harness through zig's Clang, on any host.
-- `docs/`: design and results. Keep them current. `recompiler-core.md` covers the decoder, CFG, lifter and difftest; `roadmap-and-design-targets.md` is the roadmap.
+- `docs/`: design and results. Keep them current. `recompiler-core.md` covers the decoder, CFG, lifter and difftest; `runtime.md` the runtime; `roadmap-and-design-targets.md` is the roadmap.
 
 ## Build and check
 
@@ -40,6 +41,15 @@ Differential test (`pip install unicorn`; on Windows with the Visual Studio gene
 ```sh
 cmake -S . -B build-gen -DQILIN_GEN_DIR=$PWD/gen && cmake --build build-gen --target qilin_difftest --parallel
 python3 tools/difftest/difftest.py --harness build-gen/qilin_difftest --dol path/to/main.dol --gen gen [--only A,B] [--range LO-HI] [--jobs N]
+```
+
+The runtime (its own lift: replaced libraries call native code; `pal_symbols.txt` and `gen-rt/` are game-derived, never commit them):
+
+```sh
+python3 tools/analysis/port_symbols.py --qilin build/qilin --dol path/to/main.dol --symbols-out pal_symbols.txt
+build/qilin lift path/to/main.dol --out gen-rt --runtime --symbols pal_symbols.txt
+cmake -S . -B build-rt -DQILIN_RUNTIME_GEN_DIR=$PWD/gen-rt && cmake --build build-rt --target qilin_run --parallel
+build-rt/qilin_run path/to/main.dol       # stops, naming it, at the first replaced function without native code
 ```
 
 Before a milestone commit, all of these must hold: tests pass, warnings are clean (`QILIN_WERROR`), generated code is warning-free under GCC, Clang and MSVC, and the difftest has **0 unexplained mismatches**. Any new Unicorn quirk goes in `known_difference` with a comment explaining why.
@@ -68,9 +78,15 @@ Before a milestone commit, all of these must hold: tests pass, warnings are clea
   - stale translation cache: call `ctl_remove_cache`
   - its write hook misses `dcbz`/`stmw`/`stswi`, so the harness compares all of MEM1
   - it reports the `dcbz` fault address differently
+- Bring-up loop: run `qilin_run`, read the stop (`no native code yet for X [lib], called from Y`), add `QILIN_NATIVE(X)` or, if X only works on guest structures, add its name to `lift_anyway` and lift again. Check what X does in the listing (`qilin insns`) before writing it.
+- The native functions register from static initialisers, so their sources are `qilin_run`'s own (a static library would drop them).
+- `OSInit`'s arenas come from low memory that IOS and the apploader fill in. The runtime's values are from `OSInit`'s own defaults and are still to be confirmed with a Dolphin memory dump at the entry point (`docs/runtime.md`).
+- `OSLockMutex` and the thread, message and alarm code are bookkeeping on guest structures over `OSDisableInterrupts`, the context switch (`SelectThread`) and the time base. `OSGetCurrentThread` and the SDK's inlined clock macros read low memory.
 - Library split (`docs/code-analysis.md`): lift game/NW4R/MSL/runtime/etc. (74%); replace OS, DVD, GX, AX, pad, WPAD, NAND… (25%); drop MetroTRK/NdevExi2A (1%).
 
-## Status (v0.11.0)
+## Status (v0.12.0)
+
+- Runtime skeleton: `qilin_run` starts the game, runs `OSInit` natively and the static constructors lifted, and stops at `OSInitMutex` (the first replaced function without native code). 22 of 2,135 replaced or dropped functions have native code; 6,031 functions are lifted for the runtime.
 
 - 8,171 functions, all 157 jump tables proven, 98.80% of `.text` reached as code (the rest is identified as padding, dead code or data).
 - 8,103 functions lifted (slices 1, 3 and 4: integer, floating point, paired singles). Left: 56 privileged and 7 FPSCR (replaced libraries), 5 `fres`/`frsqrte`.
@@ -83,7 +99,8 @@ Before a milestone commit, all of these must hold: tests pass, warnings are clea
 
 ## Next steps, in order
 
-1. The runtime, from its to-do list: OS first (threads, time, memory, interrupts as the lifted code calls them), then GX on Vulkan (including the FIFO stores), AX, DVD, NAND, input. Exception tables and a timing model as the runtime needs them.
+1. Get the owner's answer on the proposal in `docs/runtime.md`: lift the OS's thread, mutex, message and alarm units; replace only the interrupt enable, the context switch (`SelectThread` native, one host thread per guest thread under a run lock) and the timers. And the boot information confirmed in Dolphin.
+2. The rest of the runtime, from its to-do list: OS (threads, time, memory, interrupts as the lifted code calls them), then GX on Vulkan (including the FIFO stores), AX, DVD, NAND, input. Exception tables and a timing model as the runtime needs them.
 
 ## Conventions
 
