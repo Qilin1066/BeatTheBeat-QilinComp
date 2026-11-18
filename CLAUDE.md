@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-Static recompilation of **Beat the Beat: Rhythm Paradise** (Wii, PAL `SOMP01` rev 0) to native code. Same requirements and scope as the sister project Tecboy1066/GBTGhoulies-Qilincomp.
+Static recompilation of **Beat the Beat: Rhythm Paradise** (Wii, PAL `SOMP01` rev 0) to native code. Same requirements and scope as the sister project Qilin1066/GBTGhoulies-Qilincomp.
 
 ## Requirements (non-negotiable)
 
