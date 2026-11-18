@@ -7,6 +7,8 @@ param(
 
     [string]$BuildDirectory = (Join-Path (Split-Path -Parent $PSScriptRoot) 'build'),
 
+    [switch]$NativeBootProbe,
+
     [ValidateRange(1, 128)]
     [int]$Jobs = [Math]::Min(10, [Environment]::ProcessorCount)
 )
@@ -31,7 +33,7 @@ function Invoke-Tool([string]$Program, [string[]]$Arguments) {
     }
 }
 
-function Initialize-Source([string]$Directory, [string]$Url, [string]$Commit) {
+function Initialize-Source([string]$Directory, [string]$Url, [string]$Commit, [switch]$OnlyTopLevel) {
     if (-not (Test-Path -LiteralPath (Join-Path $Directory '.git') -PathType Container)) {
         if (Test-Path -LiteralPath $Directory) {
             throw "Refusing to initialize an existing directory at $Directory. Choose a fresh build directory."
@@ -46,6 +48,8 @@ function Initialize-Source([string]$Directory, [string]$Url, [string]$Commit) {
     } elseif ($head -ne $Commit) {
         throw "$Directory must be at $Commit. Choose a fresh build directory."
     }
+
+    if ($OnlyTopLevel) { return }
 
     # The public submodule wrapper invokes sh.exe. The native helper works with MinGit too.
     Invoke-Tool $git @('-C', $Directory, '-c', 'core.longpaths=true', '-c',
@@ -138,7 +142,6 @@ try {
     $ninja = Resolve-Tool 'ninja'
     $clang = Resolve-Tool 'clang'
     $clangXX = Resolve-Tool 'clang++'
-    $python = Resolve-Tool 'python'
     $compilerTarget = & $clang -dumpmachine
     if ($LASTEXITCODE -ne 0 -or $compilerTarget -notmatch '^x86_64-.*-(windows-gnu|mingw32)$') {
         throw 'Place the x86-64 UCRT LLVM-MinGW clang and clang++ on PATH first.'
@@ -148,16 +151,16 @@ try {
     $mg = Join-Path $root 'mg'
     $dr = Join-Path $root 'dr'
     $vendor = Join-Path $mg 'vendor\dolphin'
-    Initialize-Source $mg 'https://github.com/ExpansionPak/ModernGekko.git' $modernGekkoCommit
+    Initialize-Source $mg 'https://github.com/ExpansionPak/ModernGekko.git' $modernGekkoCommit -OnlyTopLevel:$NativeBootProbe
+    if ($NativeBootProbe) {
+        Invoke-Tool $git @('-C', $mg, '-c', 'core.longpaths=true',
+            'submodule--helper', 'update', '--init', '--depth', '1', '--', 'vendor/dolphin')
+    }
     Initialize-Source $dr 'https://github.com/ExpansionPak/DolRecomp.git' $dolRecompCommit
     $actualRecompCoreCommit = & $git -C $vendor rev-parse HEAD
     if ($LASTEXITCODE -ne 0 -or $actualRecompCoreCommit -ne $recompCoreCommit) {
         throw "RecompCore did not resolve to $recompCoreCommit."
     }
-
-    $patches = Join-Path $project 'patches'
-    Set-SourcePatch $mg (Join-Path $patches 'ModernGekko.patch')
-    Set-SourcePatch $vendor (Join-Path $patches 'RecompCore.patch')
 
     $config = @('-G', 'Ninja', '-DCMAKE_BUILD_TYPE=Release', '-DCMAKE_POLICY_VERSION_MINIMUM=3.5',
         "-DCMAKE_MAKE_PROGRAM=$ninja", "-DCMAKE_C_COMPILER=$clang", '-DCMAKE_OBJECT_PATH_MAX=240')
@@ -186,6 +189,22 @@ try {
     }
 
     $env:CMAKE_NINJA_FORCE_RESPONSE_FILE = '1'
+    if ($NativeBootProbe) {
+        $nativeBuild = Join-Path $root 'native-boot-build'
+        Invoke-Tool $cmake @('-S', (Join-Path $project 'native'), '-B', $nativeBuild, '-G', 'Ninja',
+            '-DCMAKE_BUILD_TYPE=Release', '-DCMAKE_CXX_FLAGS_RELEASE=-O1 -DNDEBUG',
+            "-DCMAKE_MAKE_PROGRAM=$ninja", "-DCMAKE_CXX_COMPILER=$clangXX",
+            "-DQILIN_PREPARED_BUILD=$root", '-DCMAKE_OBJECT_PATH_MAX=240')
+        Invoke-Tool $cmake @('--build', $nativeBuild, '--parallel', "$Jobs")
+        Copy-Item -LiteralPath (Join-Path $compilerBin 'libc++.dll'), (Join-Path $compilerBin 'libunwind.dll') -Destination $nativeBuild
+        Write-Host "Run `"$(Join-Path $nativeBuild 'qilin-native-boot.exe')`" `"$(Join-Path $gameRoot 'sys\main.dol')`""
+        return
+    }
+
+    $python = Resolve-Tool 'python'
+    $patches = Join-Path $project 'patches'
+    Set-SourcePatch $mg (Join-Path $patches 'ModernGekko.patch')
+    Set-SourcePatch $vendor (Join-Path $patches 'RecompCore.patch')
     $moduleBuild = Join-Path $root 'mod'
     Invoke-Tool $cmake ($config + @('-S', (Join-Path $vendor 'module-template'), '-B', $moduleBuild,
         "-DPython3_EXECUTABLE=$python", "-DGAME_ID=$discId", "-DGENERATED_DIR=$generated",

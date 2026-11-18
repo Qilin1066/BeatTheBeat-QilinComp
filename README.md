@@ -4,6 +4,8 @@ Experimental ahead-of-time recompilation of the Europe/Australia release of *Bea
 
 Version `0.1.0-alpha.1` reached save-slot selection on Windows x64 after a scripted Wii Remote A+B press. Linux x64, Linux ARM64 and Apple Silicon are target platforms. The source includes the MoltenVK integration for macOS. See [validation and next milestone](docs/VALIDATION.md) for the measured results and remaining coverage.
 
+The [native port](docs/NATIVE-PORT.md) has a separate C++23 startup probe and a target matrix for Windows, Linux, Raspberry Pi 4, Intel and Apple Silicon Macs, and iPadOS.
+
 ## Build and run
 
 Use a local PAL WBFS image or its extracted data partition. The build validates the disc ID, revision and executable hash before translating it. Follow the [Windows build guide](docs/BUILD.md). The launcher maps **X** to Wii Remote A and **Z** to B. Press **X + Z** at the title screen.
