@@ -55,6 +55,7 @@ STACK_FILL = 0x4000
 XER_MASK = 0xE000007F
 LIMIT = 400_000             # instructions per trial under Unicorn
 PAGE = 4096
+TIME_START, TIME_STEP = 0x0000000100000000, 0x1000  # as kTimeStart, kTimeStep in guest.hpp
 STATUS = ["returned", "memory fault", "bad jump", "bad return", "trap", "not lifted", "unsupported"]
 
 memcmp = ctypes.cdll.msvcrt.memcmp if sys.platform == "win32" else ctypes.CDLL(None).memcmp
@@ -97,6 +98,8 @@ class Original:
         self.mem = (ctypes.c_ubyte * MEM1_SIZE).from_buffer_copy(image)
         self.mu.mem_map_ptr(MEM1, MEM1_SIZE, UC_PROT_ALL, ctypes.addressof(self.mem))
         self.image = image
+        self.image_buf = ctypes.create_string_buffer(image, MEM1_SIZE)  # the image, for memcmp
+        self.image_at = ctypes.addressof(self.image_buf)
         self.initial = bytearray(image)  # a trial's starting state; the image again between trials
         self.initial_at = ctypes.addressof((ctypes.c_ubyte * MEM1_SIZE).from_buffer(self.initial))
         self.not_lifted = not_lifted
@@ -123,22 +126,33 @@ class Original:
         # One code hook per text section, filtered here: Unicorn scans its
         # list of code hooks linearly, and one hook per address (thousands)
         # made trials 30 times slower than this.
-        # Instructions whose results differ from Unicorn's by design: the time
-        # base, and special registers the runtime models (other than LR, CTR,
-        # XER and the GQRs, which the model above keeps). A trial that runs
-        # one is flagged, whatever path got it there.
-        self.time = set()
+        # The time base is deterministic on both sides (QILIN_DETERMINISTIC_TIME
+        # in the harness): the k-th mftb of a trial reads TIME_START + k *
+        # TIME_STEP, so trials that read it are compared and replay exactly.
+        # Special registers the runtime models differently (anything but LR,
+        # CTR, XER and the GQRs, which the model above keeps) still differ by
+        # design: a trial that reads one is flagged, whatever path got it there.
+        self.time, self.mftb = set(), {}
         for lo, hi in text:
             for i, (w,) in enumerate(struct.iter_unpack(">I", image[lo - MEM1:hi - MEM1])):
-                if w >> 26 == 31 and (w >> 1) & 0x3FF == 371:  # mftb
-                    self.time.add(lo + 4 * i)
+                if w >> 26 == 31 and (w >> 1) & 0x3FF == 371:  # mftb rD, tbr
+                    self.mftb[lo + 4 * i] = ((w >> 21) & 31, ((w >> 16) & 31) | ((w >> 11) & 31) << 5)
                 elif w >> 26 == 31 and (w >> 1) & 0x3FF == 339:  # mfspr
                     spr = ((w >> 16) & 31) | ((w >> 11) & 31) << 5
                     if spr not in (1, 8, 9) and not 912 <= spr <= 919:
                         self.time.add(lo + 4 * i)
-        self.hooked = set(self.fctiwz) | set(self.kind) | after | set(self.divides) | self.time
+        self.hooked = set(self.fctiwz) | set(self.kind) | after | set(self.divides) | self.time | set(self.mftb)
         for lo, hi in text:
             self.mu.hook_add(UC_HOOK_CODE, self._code, None, lo, hi - 4)
+        # The whole CPU state, restored before every trial. A trial that jumps
+        # somewhere that isn't a function (a known difference) runs whatever is
+        # there under Unicorn, and that can include mtmsr, mtfsf or mtspr: left
+        # alone, those changes reached later trials in the same worker, and a
+        # result depended on which functions the worker had run before.
+        self.mu.reg_write(P.UC_PPC_REG_MSR, self.mu.reg_read(P.UC_PPC_REG_MSR) | 0x2000)  # MSR[FP]
+        self.clean = self.mu.context_save()
+        self.last_fn = 0
+        self.trials_run = 0
 
     def _unmapped(self, mu, access, address, size, value, data):
         self.stop = (1, mu.reg_read(P.UC_PPC_REG_PC), address)
@@ -172,6 +186,13 @@ class Original:
             self.model.ps1[self.dup] = mu.reg_read(P.UC_PPC_REG_FPR0 + self.dup)
             self.dup = None
         self._fctiwz(mu, address)
+        if address in self.mftb:  # the deterministic time base, as the harness gives it
+            rd, tbr = self.mftb[address]
+            t = TIME_START + self.time_reads * TIME_STEP
+            self.time_reads += 1
+            mu.reg_write(P.UC_PPC_REG_0 + rd, t >> 32 if tbr == 269 else t & 0xFFFFFFFF)
+            mu.reg_write(P.UC_PPC_REG_PC, address + 4)
+            return
         k = self.kind.get(address)
         if k is None:
             return
@@ -213,6 +234,22 @@ class Original:
         # Unicorn 2.1's write hook misses dcbz, stmw and stswi, so changes are
         # found by comparing all of MEM1 with the trial's starting state.
         mu = self.mu
+        mu.context_restore(self.clean)
+        # Between trials MEM1 is the image again. If not, an earlier trial's
+        # memory survived (or the host's RAM flipped a bit: v0.10.0 found a
+        # machine whose overclocked memory did), and this trial's result would
+        # depend on what the worker ran before: stop, with where. Checked every
+        # 16th trial: a whole-MEM1 compare on every trial doubled the run time
+        # with 16 workers, and a changed page stays changed until rewritten.
+        self.trials_run += 1
+        if self.trials_run % 16 == 0 and memcmp(ctypes.addressof(self.mem), self.image_at, MEM1_SIZE):
+            first = next(i for i in range(0, MEM1_SIZE, 32)
+                         if memcmp(ctypes.addressof(self.mem) + i, self.image_at + i, 32))
+            now = ctypes.string_at(ctypes.addressof(self.mem) + first, 32).hex()
+            raise RuntimeError(f"Unicorn's MEM1 isn't the image at the start of a trial ({fn:08X}, after a trial of "
+                               f"{self.last_fn:08X}): {MEM1 + first:08X} is {now}, "
+                               f"the image has {self.image[first:first + 32].hex()}")
+        self.last_fn = fn
         initial = self.initial
         for addr, blob in writes:
             initial[addr - MEM1:addr - MEM1 + len(blob)] = blob
@@ -237,6 +274,7 @@ class Original:
         self.stop = None
         self.divided_by_zero = False
         self.read_time = False
+        self.time_reads = 0
         self.entry = fn
         timeout = False
         try:
@@ -416,7 +454,7 @@ def known_difference(a, b, image, divided_by_zero, reads_time):
         return ("divide by zero: undefined in the architecture; lifted code gives Broadway's result, "
                 "Unicorn leaves the dividend")
     if reads_time:
-        return "the trial read the time base or a special register, which differ from Unicorn's by design"
+        return "the trial read a special register the runtime models differently from Unicorn"
     if sa[0] == 1 and MEM1 <= sa[1] < MEM1 + MEM1_SIZE:
         word = struct.unpack(">I", image[sa[1] - MEM1:sa[1] - MEM1 + 4])[0]
         if (word >> 26, (word >> 1) & 0x3FF) in CACHE_OPS:
@@ -458,6 +496,9 @@ def compare(a, b):
     if ma != mb:
         addrs = sorted(set(ma) ^ set(mb) | {k for k in ma if k in mb and ma[k] != mb[k]})
         diffs.append(f"memory at {', '.join(f'{x:08X}' for x in addrs[:4])}")
+        first = addrs[0]  # which side changed the first differing block, and to what
+        diffs.append(f"[{first:08X} original {ma[first].hex() if first in ma else 'unchanged'}, "
+                     f"lifted {mb[first].hex() if first in mb else 'unchanged'}]")
     return "; ".join(diffs)
 
 
@@ -472,7 +513,19 @@ def init_worker(harness, dol, not_lifted, trials, seed):
 
 
 def test_function(fn):
-    """All of one function's trials: (fn, outcome counts, how agreeing trials ended, first mismatch or None)."""
+    """All of one function's trials: (fn, outcome counts, how agreeing trials ended, first mismatch or None).
+    If anything fails, the error lists the functions this worker ran before, in order: replaying them with
+    --only (and --jobs 1) reproduces state that leaked from one trial to another."""
+    history = _worker.setdefault("history", [])
+    history.append(fn)
+    del history[:-64]
+    try:
+        return _test_function(fn)
+    except Exception as e:
+        raise RuntimeError(f"{e}\n  this worker ran, in order: --only {','.join(f'{x:08X}' for x in history)}") from e
+
+
+def _test_function(fn):
     w = _worker
     rng = random.Random(w["seed"] << 32 | fn)  # this function's trials, whatever else runs
     counts, stops, bad = collections.Counter(), collections.Counter(), None

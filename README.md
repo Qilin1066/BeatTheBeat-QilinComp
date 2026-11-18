@@ -20,6 +20,7 @@ Roadmap step 1, **analysis**, is nearly done; step 2, the **recompiler core**, i
 | Differential test against the original code under Unicorn (PowerPC 750CL) | ✅ every lifted function, 64,824 trials, 0 unexplained mismatches; found and fixed one lifter bug; parallel, under 3 minutes on 16 cores |
 | Lifter slice 3: floating point (non-IEEE mode as the game sets it, PowerPC NaNs, bit-exact `lfs`/`stfs`; FPSCR is only in replaced code) | ✅ 7,549 of 8,171 functions lift; 60,392 difftest trials, 0 unexplained mismatches |
 | Register dataflow: around each call, store only what changed and reload only what's read | ✅ lifted objects 10.6% smaller, difftest unchanged |
+| Differential test under UBSan (`-DQILIN_UBSAN=ON`, or `tools/difftest/build_ubsan.py` on any host) | ✅ no undefined behaviour in 64,824 trials |
 | Lifter slice 4: paired singles and GQR quantisation (from IBM's 750CL manual; a reference model in the difftest, since Unicorn has none) | ✅ 8,103 of 8,171 functions lift; the rest are replaced libraries and 5 estimate-instruction users |
 | Runtime: OS, DVD, NAND, GX on Vulkan, AX audio, input | later (see roadmap) |
 

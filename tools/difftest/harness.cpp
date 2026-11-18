@@ -107,6 +107,7 @@ int main(int argc, char** argv) {
     };
     std::vector<Range> written;
     std::vector<uint32_t> changed;
+    uint64_t cases = 0;
 
     for (uint32_t fn; read_u32(fn);) {
         rt::Context c;
@@ -115,6 +116,20 @@ int main(int argc, char** argv) {
         for (double& f : c.f) read_f64(f);
         for (double& f : c.ps1) read_f64(f);
         for (unsigned i = 0; i < 8; ++i) read_u32(c.spr[912 + i]);
+        // Between cases MEM1 is the image again; if not, an earlier case's
+        // memory survived (or the host's RAM flipped a bit) and results would
+        // depend on what ran before: stop. Every 16th case, as difftest.py
+        // does: comparing all of MEM1 every time doubled the run time.
+        if (++cases % 16 == 0 && (std::memcmp(mem1, baseline.data(), kMem1Size) != 0 ||
+                                  std::memcmp(initial.data(), baseline.data(), kMem1Size) != 0)) {
+            uint32_t off = 0;
+            while (off < kMem1Size && std::memcmp(mem1 + off, baseline.data() + off, 32) == 0 &&
+                   std::memcmp(initial.data() + off, baseline.data() + off, 32) == 0)
+                off += 32;
+            std::println(stderr, "qilin_difftest: MEM1 isn't the image at the start of a case ({:08X}): block {:08X}", fn,
+                         kMem1 + off);
+            return 2;
+        }
         uint32_t writes = 0;
         read_u32(writes);
         written.clear();
@@ -132,6 +147,7 @@ int main(int argc, char** argv) {
 
         uint32_t status = 0, pc = 0, value = 0;
         rt::g_ni_flushes = 0;
+        rt::g_time_reads = 0;
         const uint32_t caller = c.lr;
         try {
             rt::call(c, fn, 0);

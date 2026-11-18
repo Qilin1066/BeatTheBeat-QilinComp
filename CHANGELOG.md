@@ -11,6 +11,19 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-11-18
+The differential test under UBSan, finding no undefined behaviour in lifted code or the runtime across all 64,824 trials. The difftest is now deterministic and isolates its trials.
+
+### Added
+- **`QILIN_UBSAN`** (CMake): builds lifted code and `qilin_difftest` with `-fsanitize=undefined -fno-sanitize-recover=all`, for GCC and Clang. CMake refuses it under MSVC, which has no UBSan.
+- **`tools/difftest/build_ubsan.py`**: builds the UBSan harness with zig's Clang (`pip install ziglang`) on any host, Windows included, with the project's warnings as errors.
+- **A deterministic time base in the difftest** (`QILIN_DETERMINISTIC_TIME`): the k-th time-base read of a trial gives the same value on both sides, so trials that read it are compared (they were known differences) and every trial replays exactly.
+- **Trial isolation checks:** Unicorn's whole CPU state is restored before each trial; every 16th trial checks on both sides that MEM1 is the image again; a failure lists the functions the worker ran, for `--only` to replay; a memory mismatch shows which side changed the block, and to what.
+
+### Changed
+- **Found:** the rare non-reproducible stops these checks caught were bit flips in the development machine's overclocked non-ECC RAM, not the code. A stress test without any project code reproduced them.
+- The roadmap drops "CR bits only where read". `cr` is a local, so the host compiler already removes CR updates nothing reads: Clang folds a record-form update followed by a compare to the compare alone. CR that reaches a call or return is observable, so it has to be computed anyway.
+
 ## [0.9.0] - 2026-11-18
 Register dataflow around calls: lifted code stores only the registers it changed since the last sync, and reloads only those it reads before overwriting. The game's lifted objects are 10.6% smaller, and the differential test results are unchanged (64,824 trials, 0 unexplained mismatches).
 

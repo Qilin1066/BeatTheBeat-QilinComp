@@ -7,7 +7,7 @@ if(APPLE AND NOT CMAKE_OSX_DEPLOYMENT_TARGET)
     set(CMAKE_OSX_DEPLOYMENT_TARGET 10.15 CACHE STRING "oldest macOS the runtime runs on")
 endif()
 # The single source of the version number (see CHANGELOG.md for the scheme).
-project(BeatTheBeatQilinComp VERSION 0.9.0 LANGUAGES C CXX)
+project(BeatTheBeatQilinComp VERSION 0.10.0 LANGUAGES C CXX)
 
 # ---- Language: C++23 everywhere (recompiler, runtime, generated code) ----
 set(CMAKE_CXX_STANDARD 23)
@@ -96,11 +96,19 @@ endif()
 # qilin_difftest runs it against the original code (tools/difftest), with
 # checked memory: an access outside the mapped guest memory stops.
 set(QILIN_GEN_DIR "" CACHE PATH "qilin lift output directory")
+# The differential test under UBSan: any undefined behaviour in lifted code
+# or the runtime stops the harness (and so the test) with the report.
+# MSVC has no UBSan; on Windows, tools/difftest/build_ubsan.py builds the
+# harness with zig's Clang instead.
+option(QILIN_UBSAN "Build lifted code and qilin_difftest with UBSan (GCC or Clang)" OFF)
+if(QILIN_UBSAN AND MSVC)
+    message(FATAL_ERROR "QILIN_UBSAN needs GCC or Clang; on Windows use tools/difftest/build_ubsan.py")
+endif()
 if(QILIN_GEN_DIR)
     file(GLOB QILIN_GEN_SOURCES CONFIGURE_DEPENDS "${QILIN_GEN_DIR}/*.cpp")
     add_library(qilin_gen_checked STATIC ${QILIN_GEN_SOURCES} recomp/runtime/dispatch.cpp)
     target_include_directories(qilin_gen_checked PUBLIC "${QILIN_GEN_DIR}")
-    target_compile_definitions(qilin_gen_checked PUBLIC QILIN_CHECKED_MEMORY)
+    target_compile_definitions(qilin_gen_checked PUBLIC QILIN_CHECKED_MEMORY QILIN_DETERMINISTIC_TIME)
     target_link_libraries(qilin_gen_checked PUBLIC qilin_runtime PRIVATE qilin_warnings)
     if(MSVC)
         # C4702 (unreachable code) comes from MSVC's optimiser after inlining,
@@ -111,6 +119,12 @@ if(QILIN_GEN_DIR)
     add_executable(qilin_difftest tools/difftest/harness.cpp)
     target_link_libraries(qilin_difftest PRIVATE qilin_gen_checked qilin_dol qilin_warnings)
     qilin_tool(qilin_difftest)
+    if(QILIN_UBSAN)
+        foreach(t qilin_gen_checked qilin_difftest qilin_dol)
+            target_compile_options(${t} PRIVATE -fsanitize=undefined -fno-sanitize-recover=all)
+        endforeach()
+        target_link_options(qilin_difftest PRIVATE -fsanitize=undefined)
+    endif()
 endif()
 
 # ---- Tests (no game files needed) ----

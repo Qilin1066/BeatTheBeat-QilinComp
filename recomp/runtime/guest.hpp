@@ -430,6 +430,14 @@ inline void psq_st(double p0, double p1, uint32_t ea, bool w, uint32_t gqr, uint
     if (!w) quantize(ea + quant_size(t), p1, t, s);
 }
 
+#ifdef QILIN_DETERMINISTIC_TIME
+// The differential test only: the k-th time-base read since the counter was
+// reset gives kTimeStart + k * kTimeStep, as the test's Unicorn side does, so
+// trials that read the time base are compared and replay exactly.
+inline uint64_t g_time_reads = 0;
+inline constexpr uint64_t kTimeStart = 0x0000000100000000ull, kTimeStep = 0x1000;
+#endif
+
 // ---- provided by the runtime (dispatch.cpp and the host) ----
 // Call the lifted function at a guest address (bctrl, bctr, blrl). Unknown
 // targets stop with BadJump.
