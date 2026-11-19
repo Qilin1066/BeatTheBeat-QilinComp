@@ -15,6 +15,8 @@
 // played with buttons. Functions are added as bring-up reaches them, each
 // checked against how its callers use the result. Runtime code: no
 // std::format.
+#include <cstdio>
+
 #include "console.hpp"
 #include "input.hpp"
 #include "interrupts.hpp"
@@ -53,7 +55,15 @@ void call_back(Context& c, uint32_t fn, uint32_t r3, uint32_t r4) {
 // The remote's reports, as WPAD's interrupt delivers them: the sampling
 // callback, which reads the status with WPADRead.
 void report(Context& c) {
-    if (wpad.connected[0] && wpad.sampling_cb[0]) call_back(c, wpad.sampling_cb[0], 0, 0);
+    if (wpad.connected[0] && wpad.sampling_cb[0]) {
+        ++stats().remote_reports;
+        call_back(c, wpad.sampling_cb[0], 0, 0);
+    }
+}
+
+const char* name_of(uint32_t fn) {
+    const Symbol* s = fn ? symbol_at(fn) : nullptr;
+    return s ? s->name : "none";
 }
 
 // Connecting channel 0: the connect callback with WPAD_ERR_NONE, then
@@ -61,7 +71,10 @@ void report(Context& c) {
 void connect(Context& c) {
     wpad.connected[0] = true;
     ++stats().remotes_connected;
-    if (wpad.connect_cb[0]) call_back(c, wpad.connect_cb[0], 0, 0);
+    const uint32_t cb = wpad.connect_cb[0];
+    if (cb) call_back(c, cb, 0, 0);
+    std::fprintf(stderr, "qilin_run: Wii Remote connected (connect callback %s, sampling callback %s)\n", name_of(cb),
+                 name_of(wpad.sampling_cb[0]));
     add_periodic(kReportPeriod, report);
 }
 

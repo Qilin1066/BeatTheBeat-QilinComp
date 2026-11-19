@@ -15,6 +15,10 @@ layout(set = 0, binding = 0, std140) uniform Draw {
     uvec4 swaps[4];    // swap tables: the source channel of r, g, b, a
     uvec4 misc;        // x stages; y alpha compare (comp0 | comp1 << 3 | op << 6); z refs (ref0 | ref1 << 8); w flags
     uvec4 stages[48];  // per stage: colour, alpha, order (pack_draw)
+    uvec4 fog;         // x GXFogType (0 none), y colour (r | g << 8 | b << 16)
+    vec4 fog_abc;      // A, B, C as pack_draw computes them from GXSetFog's parameters
+    vec4 depth_range;  // the viewport's near and far
+    uvec4 tcscale[8];  // per texture coordinate: x manual scaling on, y s scale, z t scale
 };
 layout(set = 0, binding = 1) uniform sampler2D u_tex[8];
 
@@ -28,6 +32,19 @@ vec4 sample_map(uint map, vec2 uv) {
     case 5u: return texture(u_tex[5], uv);
     case 6u: return texture(u_tex[6], uv);
     default: return texture(u_tex[7], uv);
+    }
+}
+
+vec2 map_size(uint map) {
+    switch (map) {
+    case 0u: return vec2(textureSize(u_tex[0], 0));
+    case 1u: return vec2(textureSize(u_tex[1], 0));
+    case 2u: return vec2(textureSize(u_tex[2], 0));
+    case 3u: return vec2(textureSize(u_tex[3], 0));
+    case 4u: return vec2(textureSize(u_tex[4], 0));
+    case 5u: return vec2(textureSize(u_tex[5], 0));
+    case 6u: return vec2(textureSize(u_tex[6], 0));
+    default: return vec2(textureSize(u_tex[7], 0));
     }
 }
 
@@ -120,6 +137,10 @@ void main() {
         if (od.x != 255u) {
             vec3 tc = v_tex[od.y];
             vec2 uv = tc.z != 0.0 ? tc.xy / tc.z : tc.xy;
+            // GX scales coordinates by the texture's size, or by the
+            // game's own scale (GXSetTexCoordScaleManually).
+            uvec4 ts = tcscale[od.y];
+            if (ts.x != 0u) uv = uv * vec2(ts.yz) / map_size(od.x);
             tex = swizzle(ivec4(round(sample_map(od.x, uv) * 255.0)), (cs.w >> 2) & 3u);
         }
         vec4 rc = od.z == 4u ? v_col0 : od.z == 5u ? v_col1 : vec4(0.0);
@@ -175,6 +196,24 @@ void main() {
     bool pass = aop == 0u ? (t0 && t1) : aop == 1u ? (t0 || t1) : aop == 2u ? (t0 != t1) : (t0 == t1);
     if (!pass) discard;
 
-    if ((misc.w & 1u) != 0u) res.a = int((misc.w >> 8) & 255u);  // destination alpha
-    o_color = vec4(res) / 255.0;
+    vec4 outc = vec4(res) / 255.0;
+    // Fog: the depth as GX's fog sees it (0 at the viewport's near, 1 at
+    // its far), its distance into the fog (0 at the start, 1 at the end),
+    // then the curve. APPROX: GX's fixed-point steps.
+    if (fog.x != 0u) {
+        float zs = (gl_FragCoord.z - depth_range.x) / max(depth_range.y - depth_range.x, 1e-6);
+        float ze = (fog.x & 8u) != 0u ? fog_abc.x * zs - fog_abc.z : fog_abc.x / (fog_abc.y - zs) - fog_abc.z;
+        float f = clamp(ze, 0.0, 1.0);
+        switch (fog.x & 7u) {
+        case 4u: f = 1.0 - exp2(-8.0 * f); break;
+        case 5u: f = 1.0 - exp2(-8.0 * f * f); break;
+        case 6u: f = exp2(-8.0 * (1.0 - f)); break;
+        case 7u: f = exp2(-8.0 * (1.0 - f) * (1.0 - f)); break;
+        default: break;  // 2: linear
+        }
+        vec3 fc = vec3(fog.y & 255u, (fog.y >> 8) & 255u, (fog.y >> 16) & 255u) / 255.0;
+        outc.rgb = mix(outc.rgb, fc, f);
+    }
+    if ((misc.w & 1u) != 0u) outc.a = float((misc.w >> 8) & 255u) / 255.0;  // destination alpha
+    o_color = outc;
 }

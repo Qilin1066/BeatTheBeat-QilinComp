@@ -173,11 +173,14 @@ if(QILIN_RUNTIME_GEN_DIR)
 
     # The host side: a window, Vulkan, audio and the keyboard. Third-party
     # code is fetched at configure time, pinned by hash, and never committed:
-    # SDL3 (zlib licence; a system SDL3 is used if there is one), Khronos'
+    # SDL3 (zlib licence; a system SDL3 is used if there is one) and Khronos'
     # Vulkan headers (Apache-2.0; the loader comes through SDL, so no Vulkan
-    # SDK is needed) and glslang (BSD-3/Apache-2.0), built here to compile
-    # the runtime's GLSL shaders to SPIR-V. QILIN_HEADLESS_ONLY builds without
-    # any of it (QILIN_HEADLESS=1 also runs a full build without a window).
+    # SDK is needed). The shaders' SPIR-V is committed beside their GLSL
+    # (recomp/runtime/shaders/spirv, our own code compiled); a stamp of the
+    # GLSL's hashes stops the configure if they drift apart, and
+    # QILIN_BUILD_SHADERS=ON fetches glslang (BSD-3/Apache-2.0) to regenerate
+    # them. QILIN_HEADLESS_ONLY builds without any of it (QILIN_HEADLESS=1
+    # also runs a full build without a window).
     option(QILIN_HEADLESS_ONLY "Build qilin_run without a window, Vulkan or audio" OFF)
     if(QILIN_HEADLESS_ONLY)
         target_compile_definitions(qilin_run PRIVATE QILIN_HEADLESS_ONLY)
@@ -198,35 +201,56 @@ if(QILIN_RUNTIME_GEN_DIR)
             URL https://github.com/KhronosGroup/Vulkan-Headers/archive/refs/tags/v1.3.299.tar.gz
             URL_HASH SHA256=95bb8fe731469b9e1be532b9d3b4d7d33e28ddbd99a926da7f0eca82a134b92f)
         FetchContent_MakeAvailable(VulkanHeaders)
-        set(ENABLE_OPT OFF CACHE BOOL "" FORCE)
-        set(ENABLE_HLSL OFF CACHE BOOL "" FORCE)
-        set(GLSLANG_TESTS OFF CACHE BOOL "" FORCE)
-        set(GLSLANG_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
-        set(ENABLE_GLSLANG_BINARIES ON CACHE BOOL "" FORCE)
-        set(BUILD_EXTERNAL OFF CACHE BOOL "" FORCE)
-        FetchContent_Declare(glslang
-            URL https://github.com/KhronosGroup/glslang/archive/refs/tags/16.6.0.tar.gz
-            URL_HASH SHA256=9c09b901149c729df745057dafa815278aaa101b84d2b6e14f16a42de52f97f2)
-        FetchContent_MakeAvailable(glslang)
-
-        # The shaders, compiled to SPIR-V headers (uint32_t arrays) at build time.
-        set(QILIN_SHADER_DIR "${CMAKE_CURRENT_BINARY_DIR}/shaders")
-        set(QILIN_SHADER_HEADERS "")
-        foreach(shader gx.vert gx.frag)
-            string(REPLACE "." "_" name "${shader}")
-            set(out "${QILIN_SHADER_DIR}/${name}.h")
-            add_custom_command(OUTPUT "${out}"
-                COMMAND "${CMAKE_COMMAND}" -E make_directory "${QILIN_SHADER_DIR}"
-                COMMAND glslang-standalone -V --target-env vulkan1.3 --vn "k_${name}" -o "${out}"
-                        "${CMAKE_CURRENT_SOURCE_DIR}/recomp/runtime/shaders/${shader}"
-                DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/recomp/runtime/shaders/${shader}" glslang-standalone
-                VERBATIM)
-            list(APPEND QILIN_SHADER_HEADERS "${out}")
+        # The shaders: GLSL in recomp/runtime/shaders, SPIR-V headers
+        # (uint32_t arrays) in its spirv folder, and the GLSL's SHA-256
+        # (line endings normalised) in spirv/sources.sha256.
+        set(QILIN_SHADERS gx.vert gx.frag copy.vert copy.frag)
+        set(QILIN_SHADER_SRC "${CMAKE_CURRENT_SOURCE_DIR}/recomp/runtime/shaders")
+        set(QILIN_SHADER_DIR "${QILIN_SHADER_SRC}/spirv")
+        set(stamp "")
+        foreach(shader ${QILIN_SHADERS})
+            file(READ "${QILIN_SHADER_SRC}/${shader}" text)
+            string(REPLACE "\r" "" text "${text}")
+            string(SHA256 hash "${text}")
+            string(APPEND stamp "${hash}  ${shader}\n")
+            # an edited shader re-runs the configure, so the check (or the stamp) follows it
+            set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${QILIN_SHADER_SRC}/${shader}")
         endforeach()
-        add_custom_target(qilin_shaders DEPENDS ${QILIN_SHADER_HEADERS})
+        option(QILIN_BUILD_SHADERS "Fetch glslang and regenerate the committed SPIR-V from the GLSL" OFF)
+        if(QILIN_BUILD_SHADERS)
+            set(ENABLE_OPT OFF CACHE BOOL "" FORCE)
+            set(ENABLE_HLSL OFF CACHE BOOL "" FORCE)
+            set(GLSLANG_TESTS OFF CACHE BOOL "" FORCE)
+            set(GLSLANG_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
+            set(ENABLE_GLSLANG_BINARIES ON CACHE BOOL "" FORCE)
+            set(BUILD_EXTERNAL OFF CACHE BOOL "" FORCE)
+            FetchContent_Declare(glslang
+                URL https://github.com/KhronosGroup/glslang/archive/refs/tags/16.6.0.tar.gz
+                URL_HASH SHA256=9c09b901149c729df745057dafa815278aaa101b84d2b6e14f16a42de52f97f2)
+            FetchContent_MakeAvailable(glslang)
+            set(QILIN_SHADER_HEADERS "")
+            foreach(shader ${QILIN_SHADERS})
+                string(REPLACE "." "_" name "${shader}")
+                set(out "${QILIN_SHADER_DIR}/${name}.h")
+                add_custom_command(OUTPUT "${out}"
+                    COMMAND glslang-standalone -V --target-env vulkan1.3 --vn "k_${name}" -o "${out}" "${QILIN_SHADER_SRC}/${shader}"
+                    DEPENDS "${QILIN_SHADER_SRC}/${shader}" glslang-standalone
+                    VERBATIM)
+                list(APPEND QILIN_SHADER_HEADERS "${out}")
+            endforeach()
+            file(WRITE "${QILIN_SHADER_DIR}/sources.sha256" "${stamp}")
+            add_custom_target(qilin_shaders DEPENDS ${QILIN_SHADER_HEADERS})
+            add_dependencies(qilin_run qilin_shaders)
+        else()
+            file(READ "${QILIN_SHADER_DIR}/sources.sha256" committed)
+            string(REPLACE "\r" "" committed "${committed}")
+            if(NOT committed STREQUAL stamp)
+                message(FATAL_ERROR "The shaders' GLSL changed since their SPIR-V was generated: "
+                                    "configure once with -DQILIN_BUILD_SHADERS=ON and commit recomp/runtime/shaders/spirv")
+            endif()
+        endif()
 
         target_sources(qilin_run PRIVATE recomp/runtime/host.cpp recomp/runtime/gx_vulkan.cpp recomp/runtime/gx_texture.cpp)
-        add_dependencies(qilin_run qilin_shaders)
         target_include_directories(qilin_run PRIVATE "${QILIN_SHADER_DIR}")
         target_link_libraries(qilin_run PRIVATE SDL3::SDL3 Vulkan::Headers)
     endif()

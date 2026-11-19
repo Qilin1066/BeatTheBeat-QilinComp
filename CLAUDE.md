@@ -10,7 +10,7 @@ Static recompilation of **Beat the Beat: Rhythm Paradise** (Wii, PAL `SOMP01` re
 - **Static recompilation only.** No interpreter, JIT or emulator at runtime, not even as a fallback.
 - Targets: 64-bit **Windows, Linux, macOS** on **x86-64 and ARM64**. The low-end reference is ARM boards like the **Raspberry Pi 4**. No iPadOS, no 32-bit.
 - Compiler minimums: GCC 14, Clang 19, Apple Clang (Xcode 16), MSVC 2022 17.10.
-- No GPL code. The only third-party data is the CC0 decomp symbol list in `third_party/rhf/`. Third-party libraries (SDL3, Khronos' Vulkan headers, glslang: all permissive) are fetched by CMake at configure time, pinned by SHA-256, and never committed.
+- No GPL code. The only third-party data is the CC0 decomp symbol list in `third_party/rhf/`. Third-party libraries (SDL3, Khronos' Vulkan headers; glslang only with `-DQILIN_BUILD_SHADERS=ON`: all permissive) are fetched by CMake at configure time, pinned by SHA-256, and never committed. Keep dependencies to the fewest possible (the owner's standing preference). The shaders' SPIR-V is committed with a stamp of their GLSL's hash; after editing a shader, configure once with `-DQILIN_BUILD_SHADERS=ON` and commit `recomp/runtime/shaders/spirv`.
 - Never commit game data or anything derived from it: `main.dol`, `gen/`, `cfg.json`, ported symbol lists. These are gitignored.
 
 ## Layout

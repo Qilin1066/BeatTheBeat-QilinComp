@@ -36,6 +36,8 @@
 #include "gx.hpp"
 #include "native.hpp"
 
+#include "copy_frag.h"
+#include "copy_vert.h"
 #include "gx_frag.h"
 #include "gx_vert.h"
 
@@ -64,7 +66,7 @@ namespace {
     X(vkCmdBeginRendering) X(vkCmdEndRendering) X(vkCmdBindPipeline) X(vkCmdBindDescriptorSets)                     \
     X(vkCmdBindVertexBuffers) X(vkCmdDraw) X(vkCmdSetViewport) X(vkCmdSetScissor) X(vkCmdSetCullMode)               \
     X(vkCmdSetFrontFace) X(vkCmdSetDepthTestEnable) X(vkCmdSetDepthWriteEnable) X(vkCmdSetDepthCompareOp)           \
-    X(vkCmdBlitImage) X(vkCmdCopyBufferToImage) X(vkCmdClearAttachments) X(vkCmdClearColorImage)
+    X(vkCmdBlitImage) X(vkCmdCopyBufferToImage) X(vkCmdClearAttachments) X(vkCmdClearColorImage) X(vkCmdPushConstants)
 
 PFN_vkGetInstanceProcAddr vkGetInstanceProcAddr = nullptr;
 #define QILIN_VK_DECLARE(f) PFN_##f f = nullptr;
@@ -111,6 +113,15 @@ struct DrawBlock {
     uint32_t swaps[4][4];
     uint32_t misc[4];
     uint32_t stages[48][4];
+    uint32_t fog[4];
+    float fog_abc[4];
+    float depth_range[4];
+    uint32_t tcscale[8][4];
+};
+// The copy shader's push constants (shaders/copy.*).
+struct CopyBlock {
+    float src[4];
+    uint32_t mode[4];
 };
 
 struct Buffer {
@@ -122,7 +133,7 @@ struct Image {
     VkImage img = VK_NULL_HANDLE;
     VkDeviceMemory mem = VK_NULL_HANDLE;
     VkImageView view = VK_NULL_HANDLE;
-    uint32_t w = 0, h = 0;
+    uint32_t w = 0, h = 0, levels = 1;
     VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
 };
 struct Frame {
@@ -167,8 +178,14 @@ struct Vk {
     VkPipelineLayout layout = VK_NULL_HANDLE;
     VkShaderModule vert = VK_NULL_HANDLE, frag = VK_NULL_HANDLE;
     std::unordered_map<uint32_t, VkPipeline> pipelines;
-    std::unordered_map<uint32_t, VkSampler> samplers;
+    std::unordered_map<uint64_t, VkSampler> samplers;
     std::unordered_map<uint64_t, Texture> textures;
+    // copies from the EFB to textures (shaders/copy.*)
+    VkDescriptorSetLayout copy_set_layout = VK_NULL_HANDLE;
+    VkPipelineLayout copy_layout = VK_NULL_HANDLE;
+    VkShaderModule copy_vert = VK_NULL_HANDLE, copy_frag = VK_NULL_HANDLE;
+    VkPipeline copy_pipeline = VK_NULL_HANDLE;
+    VkSampler efb_sampler = VK_NULL_HANDLE;
     Image blank;  // what unused texture maps sample
     std::vector<std::pair<uint64_t, Image>> garbage;  // images to free once their frame is done
 } g;
@@ -202,12 +219,13 @@ Buffer make_buffer(VkDeviceSize size, VkBufferUsageFlags usage) {
     b.map = static_cast<uint8_t*>(p);
     return b;
 }
-Image make_image(uint32_t w, uint32_t h, VkFormat format, VkImageUsageFlags usage, VkImageAspectFlags aspect) {
+Image make_image(uint32_t w, uint32_t h, VkFormat format, VkImageUsageFlags usage, VkImageAspectFlags aspect,
+                 uint32_t levels = 1) {
     Image im;
-    im.w = w, im.h = h;
+    im.w = w, im.h = h, im.levels = levels;
     VkImageCreateInfo ii = vk_struct<VkImageCreateInfo>(VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO);
     ii.imageType = VK_IMAGE_TYPE_2D, ii.format = format, ii.extent = {w, h, 1};
-    ii.mipLevels = 1, ii.arrayLayers = 1, ii.samples = VK_SAMPLE_COUNT_1_BIT, ii.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ii.mipLevels = levels, ii.arrayLayers = 1, ii.samples = VK_SAMPLE_COUNT_1_BIT, ii.tiling = VK_IMAGE_TILING_OPTIMAL;
     ii.usage = usage, ii.sharingMode = VK_SHARING_MODE_EXCLUSIVE, ii.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     vk_check(vkCreateImage(g.device, &ii, nullptr, &im.img), "vkCreateImage");
     VkMemoryRequirements req;
@@ -216,7 +234,7 @@ Image make_image(uint32_t w, uint32_t h, VkFormat format, VkImageUsageFlags usag
     vk_check(vkBindImageMemory(g.device, im.img, im.mem, 0), "vkBindImageMemory");
     VkImageViewCreateInfo vi = vk_struct<VkImageViewCreateInfo>(VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO);
     vi.image = im.img, vi.viewType = VK_IMAGE_VIEW_TYPE_2D, vi.format = format;
-    vi.subresourceRange = {aspect, 0, 1, 0, 1};
+    vi.subresourceRange = {aspect, 0, levels, 0, 1};
     vk_check(vkCreateImageView(g.device, &vi, nullptr, &im.view), "vkCreateImageView");
     return im;
 }
@@ -229,21 +247,22 @@ void free_image(Image& im) {
 
 // A layout change, ordered after everything earlier on the queue (simple and
 // safe; the renderer isn't barrier-bound).
-void transition(VkCommandBuffer cb, VkImage img, VkImageLayout from, VkImageLayout to, VkImageAspectFlags aspect) {
+void transition(VkCommandBuffer cb, VkImage img, VkImageLayout from, VkImageLayout to, VkImageAspectFlags aspect,
+                uint32_t levels = 1) {
     VkImageMemoryBarrier2 b = vk_struct<VkImageMemoryBarrier2>(VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2);
     b.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, b.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
     b.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
     b.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
     b.oldLayout = from, b.newLayout = to;
     b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    b.image = img, b.subresourceRange = {aspect, 0, 1, 0, 1};
+    b.image = img, b.subresourceRange = {aspect, 0, levels, 0, 1};
     VkDependencyInfo d = vk_struct<VkDependencyInfo>(VK_STRUCTURE_TYPE_DEPENDENCY_INFO);
     d.imageMemoryBarrierCount = 1, d.pImageMemoryBarriers = &b;
     vkCmdPipelineBarrier2(cb, &d);
 }
 void transition(VkCommandBuffer cb, Image& im, VkImageLayout to, VkImageAspectFlags aspect) {
     if (im.layout == to) return;
-    transition(cb, im.img, im.layout, to, aspect);
+    transition(cb, im.img, im.layout, to, aspect, im.levels);
     im.layout = to;
 }
 
@@ -406,11 +425,15 @@ VkPipeline pipeline(uint32_t key) {
     return p;
 }
 
-// A texture map's sampler: wrap modes from GX's mode word (bits 0-3), the
-// magnification filter (bit 4) and the minification filter's linear bit
-// (bit 7: hardware codes 4-6 are linear). APPROX: level 0 only.
-VkSampler sampler(uint32_t mode0) {
-    const uint32_t key = mode0 & 0x9F;
+// A texture map's sampler, from the texture object's mode words as the
+// SDK's GXInitTexObjLOD packs them: mode0 has the wraps (bits 0-3), the
+// magnification filter (bit 4), the minification filter's hardware code
+// (bits 5-7: bit 2 linear, bits 0-1 mipmapped, bit 1 linear between levels;
+// the SDK's table maps GX_NEAR..GX_LIN_MIP_LIN to 0, 4, 1, 5, 2, 6) and the
+// LOD bias times 32 (bits 9-16, signed); mode1 the minimum and maximum LOD
+// times 16. APPROX: edge LOD, anisotropy and the bias clamp aren't modelled.
+VkSampler sampler(uint32_t mode0, uint32_t mode1 = 0, uint32_t levels = 1) {
+    const uint64_t key = (mode0 & 0x1FEFFu) | uint64_t(mode1 & 0xFFFFu) << 32 | uint64_t(levels) << 48;
     if (auto it = g.samplers.find(key); it != g.samplers.end()) return it->second;
     auto wrap = [](uint32_t w) {
         if (w > 2) unsupported("a texture wrap mode", w);
@@ -419,16 +442,98 @@ VkSampler sampler(uint32_t mode0) {
                         : VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT;
     };
     VkSamplerCreateInfo si = vk_struct<VkSamplerCreateInfo>(VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO);
-    si.magFilter = (key >> 4) & 1 ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
-    si.minFilter = (key >> 7) & 1 ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
-    si.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
-    si.addressModeU = wrap(key & 3), si.addressModeV = wrap((key >> 2) & 3);
+    const uint32_t min_code = (mode0 >> 5) & 7;
+    si.magFilter = (mode0 >> 4) & 1 ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
+    si.minFilter = min_code & 4 ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
+    si.mipmapMode = min_code & 2 ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    si.addressModeU = wrap(mode0 & 3), si.addressModeV = wrap((mode0 >> 2) & 3);
     si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    si.maxLod = 0.0f;
+    if ((min_code & 3) && levels > 1) {
+        si.minLod = float(mode1 & 0xFF) / 16.0f;
+        si.maxLod = std::min(float((mode1 >> 8) & 0xFF) / 16.0f, float(levels - 1));
+        si.mipLodBias = float(static_cast<int8_t>((mode0 >> 9) & 0xFF)) / 32.0f;
+    }
     VkSampler s;
     vk_check(vkCreateSampler(g.device, &si, nullptr, &s), "vkCreateSampler");
     g.samplers.emplace(key, s);
     return s;
+}
+
+// The copy pass: one triangle into an RGBA8 target, the EFB read with
+// texelFetch, the rectangle and conversion as push constants.
+void create_copy_pipeline() {
+    VkDescriptorSetLayoutBinding b{};
+    b.binding = 0, b.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, b.descriptorCount = 1;
+    b.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    VkDescriptorSetLayoutCreateInfo li = vk_struct<VkDescriptorSetLayoutCreateInfo>(VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO);
+    li.bindingCount = 1, li.pBindings = &b;
+    vk_check(vkCreateDescriptorSetLayout(g.device, &li, nullptr, &g.copy_set_layout), "vkCreateDescriptorSetLayout");
+    const VkPushConstantRange push{VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(CopyBlock)};
+    VkPipelineLayoutCreateInfo pl = vk_struct<VkPipelineLayoutCreateInfo>(VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO);
+    pl.setLayoutCount = 1, pl.pSetLayouts = &g.copy_set_layout, pl.pushConstantRangeCount = 1, pl.pPushConstantRanges = &push;
+    vk_check(vkCreatePipelineLayout(g.device, &pl, nullptr, &g.copy_layout), "vkCreatePipelineLayout");
+    g.copy_vert = shader(k_copy_vert, sizeof k_copy_vert);
+    g.copy_frag = shader(k_copy_frag, sizeof k_copy_frag);
+
+    VkPipelineShaderStageCreateInfo stages[2]{};
+    stages[0].sType = stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT, stages[0].module = g.copy_vert, stages[0].pName = "main";
+    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT, stages[1].module = g.copy_frag, stages[1].pName = "main";
+    VkPipelineVertexInputStateCreateInfo vin = vk_struct<VkPipelineVertexInputStateCreateInfo>(VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO);
+    VkPipelineInputAssemblyStateCreateInfo ia = vk_struct<VkPipelineInputAssemblyStateCreateInfo>(VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO);
+    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    VkPipelineViewportStateCreateInfo vp = vk_struct<VkPipelineViewportStateCreateInfo>(VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO);
+    vp.viewportCount = 1, vp.scissorCount = 1;
+    VkPipelineRasterizationStateCreateInfo rs = vk_struct<VkPipelineRasterizationStateCreateInfo>(VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO);
+    rs.polygonMode = VK_POLYGON_MODE_FILL, rs.cullMode = VK_CULL_MODE_NONE, rs.lineWidth = 1.0f;
+    VkPipelineMultisampleStateCreateInfo ms = vk_struct<VkPipelineMultisampleStateCreateInfo>(VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO);
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    VkPipelineColorBlendAttachmentState att{};
+    att.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    VkPipelineColorBlendStateCreateInfo cb = vk_struct<VkPipelineColorBlendStateCreateInfo>(VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO);
+    cb.attachmentCount = 1, cb.pAttachments = &att;
+    const VkDynamicState dyn[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dy = vk_struct<VkPipelineDynamicStateCreateInfo>(VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO);
+    dy.dynamicStateCount = 2, dy.pDynamicStates = dyn;
+    VkPipelineRenderingCreateInfo ri = vk_struct<VkPipelineRenderingCreateInfo>(VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO);
+    const VkFormat target = VK_FORMAT_R8G8B8A8_UNORM;
+    ri.colorAttachmentCount = 1, ri.pColorAttachmentFormats = &target;
+    VkGraphicsPipelineCreateInfo pi = vk_struct<VkGraphicsPipelineCreateInfo>(VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO);
+    pi.pNext = &ri, pi.stageCount = 2, pi.pStages = stages, pi.pVertexInputState = &vin, pi.pInputAssemblyState = &ia;
+    pi.pViewportState = &vp, pi.pRasterizationState = &rs, pi.pMultisampleState = &ms, pi.pColorBlendState = &cb;
+    pi.pDynamicState = &dy, pi.layout = g.copy_layout;
+    vk_check(vkCreateGraphicsPipelines(g.device, VK_NULL_HANDLE, 1, &pi, nullptr, &g.copy_pipeline), "vkCreateGraphicsPipelines");
+    VkSamplerCreateInfo si = vk_struct<VkSamplerCreateInfo>(VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO);
+    si.magFilter = si.minFilter = VK_FILTER_NEAREST;
+    si.addressModeU = si.addressModeV = si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    vk_check(vkCreateSampler(g.device, &si, nullptr, &g.efb_sampler), "vkCreateSampler");
+}
+
+// GX's copy formats: how the copy shader converts (shaders/copy.frag), and
+// the texture format of the same size in memory (for the guest-bytes hash).
+struct CopyFormat {
+    uint32_t mode, mem_format;
+};
+CopyFormat copy_format(uint32_t f) {
+    switch (f) {
+    case kTexRgba8: return {0, kTexRgba8};
+    case kTexRgb5A3: return {0, kTexRgb5A3};
+    case kTexRgb565: return {1, kTexRgb565};
+    case kTexI4: return {2, kTexI4};
+    case kTexI8: return {2, kTexI8};
+    case kTexIA4: return {3, kTexIA4};
+    case kTexIA8: return {3, kTexIA8};
+    case 0x20: return {4, kTexI4};    // GX_CTF_R4
+    case 0x28: return {4, kTexI8};    // GX_CTF_R8
+    case 0x22: return {5, kTexIA4};   // GX_CTF_RA4
+    case 0x23: return {5, kTexIA8};   // GX_CTF_RA8
+    case 0x29: return {6, kTexI8};    // GX_CTF_G8
+    case 0x2A: return {7, kTexI8};    // GX_CTF_B8
+    case 0x27: return {8, kTexI8};    // GX_CTF_A8
+    case 0x2B: return {9, kTexIA8};   // GX_CTF_RG8
+    case 0x2C: return {10, kTexIA8};  // GX_CTF_GB8
+    default: unsupported("a copy to a texture in this format (depth or YUV)", f);
+    }
 }
 
 // ---- frames ----
@@ -500,46 +605,81 @@ uint64_t hash_bytes(const uint8_t* p, size_t n, uint64_t h) {
     return h;
 }
 
+// How many levels a texture map's object has: one without mipmaps, else up
+// to its maximum LOD (mode1 bits 8-15, times 16), at most down to 1x1.
+uint32_t texture_levels(const TexMap& t) {
+    if (!t.mipmap) return 1;
+    const uint32_t max_lod = ((t.mode1 >> 8) & 0xFF) / 16;
+    const uint32_t full = std::bit_width(std::max<uint32_t>(t.width, t.height));
+    return std::min(max_lod + 1, full);
+}
+
+// Guest addresses as one key, whichever mirror the game used.
+uint32_t norm_addr(uint32_t a) { return (a & 0x1FFFFFFFu) | 0x80000000u; }
+
+// A copy from the EFB to a texture (GXCopyTex): the image, the texture it
+// stands for, and a hash of the guest bytes there when it was made (the
+// copy itself lives on the GPU; if the CPU writes those bytes, the texture
+// is theirs again).
+struct EfbCopy {
+    Image image;
+    uint32_t width = 0, height = 0, format = 0;
+    uint64_t guest_hash = 0;
+};
+std::unordered_map<uint32_t, EfbCopy> g_copies;
+
 // The texture a map holds, decoded and uploaded when it's new or its bytes
-// (or its TLUT's) changed since it was last seen.
-VkImageView texture(const State& s, const TexMap& t) {
+// (or its TLUT's) changed since it was last seen; or an EFB copy there.
+const Image& texture(const State& s, const TexMap& t) {
+    const uint32_t levels = texture_levels(t);
+    uint32_t bytes = 0;
+    for (uint32_t l = 0; l < levels; ++l) bytes += texture_bytes(t.format, std::max(1u, uint32_t(t.width) >> l), std::max(1u, uint32_t(t.height) >> l));
+    if (!bytes) unsupported("texture format", t.format);
+    if (auto it = g_copies.find(norm_addr(t.image)); it != g_copies.end()) {
+        EfbCopy& c = it->second;
+        if (c.width == t.width && c.height == t.height && hash_bytes(g_mem + t.image, bytes, 0) == c.guest_hash) return c.image;
+        g.garbage.emplace_back(g.frame_number, c.image);  // the CPU rewrote it, or it's read as something else
+        g_copies.erase(it);
+    }
     const bool indexed = t.format == kTexC4 || t.format == kTexC8 || t.format == kTexC14X2;
     const Tlut* tlut = nullptr;
     if (indexed) {
         if (t.tlut >= s.tlut.size()) unsupported("a TLUT name", t.tlut);
         tlut = &s.tlut[t.tlut];
     }
-    const uint32_t bytes = texture_bytes(t.format, t.width, t.height);
-    if (!bytes) unsupported("texture format", t.format);
     uint64_t key = hash_bytes(nullptr, 0, 0x51C0FFEEull);
-    const uint32_t id[6] = {t.image, t.format, t.width, t.height, tlut ? tlut->data : 0u, tlut ? tlut->format : 0u};
+    const uint32_t id[7] = {t.image, t.format, t.width, t.height, tlut ? tlut->data : 0u, tlut ? tlut->format : 0u, levels};
     key = hash_bytes(reinterpret_cast<const uint8_t*>(id), sizeof id, key);
     Texture& tex = g.textures[key];
-    if (tex.frame_checked == g.frame_number && tex.image.img) return tex.image.view;
+    if (tex.frame_checked == g.frame_number && tex.image.img) return tex.image;
     tex.frame_checked = g.frame_number;
     uint64_t h = hash_bytes(g_mem + t.image, bytes, 0);
     if (tlut) h = hash_bytes(g_mem + tlut->data, 2u * tlut->entries, h);
-    if (tex.image.img && tex.hash == h) return tex.image.view;
+    if (tex.image.img && tex.hash == h) return tex.image;
     tex.hash = h;
 
-    std::vector<uint8_t> rgba(size_t(t.width) * t.height * 4);
-    decode_texture(t.format, t.image, t.width, t.height, tlut, rgba.data());
     if (!tex.image.img)
         tex.image = make_image(t.width, t.height, VK_FORMAT_R8G8B8A8_UNORM,
-                               VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_COLOR_BIT);
+                               VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_COLOR_BIT, levels);
     Frame& f = cur();
-    const VkDeviceSize at = take(f, f.upload_used, kUploadBytes, rgba.size(), 16, "texture uploads in one frame (bytes)");
-    std::memcpy(f.upload.map + at, rgba.data(), rgba.size());
     end_rendering();
     transition(f.cb, tex.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
-    VkBufferImageCopy copy{};
-    copy.bufferOffset = at;
-    copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    copy.imageExtent = {t.width, t.height, 1};
-    vkCmdCopyBufferToImage(f.cb, f.upload.buf, tex.image.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+    uint32_t src = t.image;
+    for (uint32_t l = 0; l < levels; ++l) {
+        const uint32_t w = std::max(1u, uint32_t(t.width) >> l), hgt = std::max(1u, uint32_t(t.height) >> l);
+        const VkDeviceSize n = VkDeviceSize(w) * hgt * 4;
+        const VkDeviceSize at = take(f, f.upload_used, kUploadBytes, n, 16, "texture uploads in one frame (bytes)");
+        decode_texture(t.format, src, w, hgt, tlut, f.upload.map + at);
+        src += texture_bytes(t.format, w, hgt);
+        VkBufferImageCopy copy{};
+        copy.bufferOffset = at;
+        copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, l, 0, 1};
+        copy.imageExtent = {w, hgt, 1};
+        vkCmdCopyBufferToImage(f.cb, f.upload.buf, tex.image.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+    }
     transition(f.cb, tex.image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
     ++stats().textures_uploaded;
-    return tex.image.view;
+    return tex.image;
 }
 
 // ---- GX's transform unit, on the CPU ----
@@ -774,6 +914,28 @@ void pack_draw(const State& s, DrawBlock& b) {
     b.misc[2] = uint32_t(s.alpha_ref0) | uint32_t(s.alpha_ref1) << 8;
     // APPROX: destination alpha only where blending doesn't read the source's.
     if (s.dst_alpha_enable && s.blend_type != 1) b.misc[3] = 1u | uint32_t(s.dst_alpha) << 8;
+    // Fog (GXSetFog's start, end, near and far): with the depth zs from 0
+    // at near to 1 at far, the distance into the fog (eye distance - start) /
+    // (end - start) is A / (B - zs) - C in perspective (A = far * near /
+    // ((far - near) (end - start)), B = far / (far - near), C = start /
+    // (end - start)) and A * zs - C orthographic (A = (far - near) / (end -
+    // start), C = (start - near) / (end - start)).
+    if (s.fog_type != 0) {
+        if (s.fog_type == 1 || s.fog_type == 3 || s.fog_type == 9 || s.fog_type == 11 || s.fog_type > 15)
+            unsupported("a fog type", s.fog_type);
+        const float n = s.fog_near, fr = s.fog_far, range = s.fog_end - s.fog_start;
+        if (range == 0.0f || fr == n) unsupported("fog with an empty range", 0);
+        b.fog[0] = s.fog_type;
+        b.fog[1] = uint32_t(s.fog_color.r) | uint32_t(s.fog_color.g) << 8 | uint32_t(s.fog_color.b) << 16;
+        if (s.fog_type & 8) {
+            b.fog_abc[0] = (fr - n) / range, b.fog_abc[2] = (s.fog_start - n) / range;
+        } else {
+            b.fog_abc[0] = fr * n / ((fr - n) * range), b.fog_abc[1] = fr / (fr - n), b.fog_abc[2] = s.fog_start / range;
+        }
+    }
+    b.depth_range[0] = std::clamp(s.viewport[4], 0.0f, 1.0f), b.depth_range[1] = std::clamp(s.viewport[5], 0.0f, 1.0f);
+    for (unsigned i = 0; i < 8; ++i)
+        if (s.tex_scale_manual[i]) b.tcscale[i][0] = 1, b.tcscale[i][1] = s.tex_scale_s[i], b.tcscale[i][2] = s.tex_scale_t[i];
     for (unsigned i = 0; i < s.num_tev_stages; ++i) {
         const TevStage& t = s.tev[i];
         // Indirect texturing changes a stage's coordinates only through a
@@ -806,22 +968,87 @@ class Renderer final : public Sink {
 public:
     void draw(const State& s, const Draw& d) override;
     void copy_display(const State& s, uint32_t xfb, bool clear) override;
-    void copy_texture(const State&, uint32_t dest, bool) override {
-        unsupported("a copy from the EFB to a texture", dest);
-    }
+    void copy_texture(const State& s, uint32_t dest, bool clear) override;
 } g_renderer;
+
+// Clears a rectangle of the EFB to GXSetCopyClear's colour and depth, as a
+// copy with its clear flag does.
+void clear_efb(const State& s, const uint16_t rect[4]) {
+    begin_rendering();
+    VkClearAttachment ca[2]{};
+    ca[0].aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    ca[0].clearValue.color = {{s.clear_color.r / 255.0f, s.clear_color.g / 255.0f, s.clear_color.b / 255.0f, s.clear_color.a / 255.0f}};
+    ca[1].aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+    ca[1].clearValue.depthStencil = {float(s.clear_z) / float(0xFFFFFF), 0};
+    const uint32_t x = std::min<uint32_t>(rect[0], kEfbWidth), y = std::min<uint32_t>(rect[1], kEfbHeight);
+    VkClearRect r{{{int32_t(x), int32_t(y)}, {std::min<uint32_t>(rect[2], kEfbWidth - x), std::min<uint32_t>(rect[3], kEfbHeight - y)}}, 0, 1};
+    if (r.rect.extent.width && r.rect.extent.height) vkCmdClearAttachments(cur().cb, 2, ca, 1, &r);
+    end_rendering();
+}
+
+// GXCopyTex: the EFB's source rectangle into a texture image the later
+// GXLoadTexObj of `dest` picks up (texture()), converted as the format says,
+// halved by a 2x2 box with the mipmap flag. The copy stays on the GPU.
+void Renderer::copy_texture(const State& s, uint32_t dest, bool clear) {
+    ++stats().texture_copies;
+    const CopyFormat cf = copy_format(s.tex_dst_format);
+    const uint32_t w = s.tex_dst_width, h = s.tex_dst_height;
+    if (w == 0 || h == 0 || w > 1024 || h > 1024) unsupported("a texture copy's size", w);
+    begin_frame();
+    end_rendering();
+    Frame& f = cur();
+    EfbCopy& c = g_copies[norm_addr(dest)];
+    if (c.image.img && (c.width != w || c.height != h)) g.garbage.emplace_back(g.frame_number, c.image), c.image = Image{};
+    if (!c.image.img)
+        c.image = make_image(w, h, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+                             VK_IMAGE_ASPECT_COLOR_BIT);
+    c.width = w, c.height = h, c.format = s.tex_dst_format;
+    c.guest_hash = hash_bytes(g_mem + norm_addr(dest), texture_bytes(cf.mem_format, w, h), 0);
+
+    transition(f.cb, g.efb_color, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
+    transition(f.cb, c.image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
+    if (++f.sets > kSetsPerFrame) unsupported("draws in one frame", f.sets);
+    VkDescriptorSetAllocateInfo ai = vk_struct<VkDescriptorSetAllocateInfo>(VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO);
+    ai.descriptorPool = f.pool, ai.descriptorSetCount = 1, ai.pSetLayouts = &g.copy_set_layout;
+    VkDescriptorSet set;
+    vk_check(vkAllocateDescriptorSets(g.device, &ai, &set), "vkAllocateDescriptorSets");
+    VkDescriptorImageInfo ii{g.efb_sampler, g.efb_color.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+    VkWriteDescriptorSet wr = vk_struct<VkWriteDescriptorSet>(VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET);
+    wr.dstSet = set, wr.descriptorCount = 1, wr.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, wr.pImageInfo = &ii;
+    vkUpdateDescriptorSets(g.device, 1, &wr, 0, nullptr);
+
+    VkRenderingAttachmentInfo color = vk_struct<VkRenderingAttachmentInfo>(VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO);
+    color.imageView = c.image.view, color.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    color.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE, color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    VkRenderingInfo ri = vk_struct<VkRenderingInfo>(VK_STRUCTURE_TYPE_RENDERING_INFO);
+    ri.renderArea = {{0, 0}, {w, h}}, ri.layerCount = 1, ri.colorAttachmentCount = 1, ri.pColorAttachments = &color;
+    vkCmdBeginRendering(f.cb, &ri);
+    vkCmdBindPipeline(f.cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g.copy_pipeline);
+    vkCmdBindDescriptorSets(f.cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g.copy_layout, 0, 1, &set, 0, nullptr);
+    const VkViewport vp{0, 0, float(w), float(h), 0, 1};
+    const VkRect2D sc{{0, 0}, {w, h}};
+    vkCmdSetViewport(f.cb, 0, 1, &vp);
+    vkCmdSetScissor(f.cb, 0, 1, &sc);
+    const CopyBlock pc{{float(s.tex_src[0]), float(s.tex_src[1]), float(s.tex_src[2]), float(s.tex_src[3])},
+                       {cf.mode, s.tex_dst_mipmap ? 1u : 0u, 0, 0}};
+    vkCmdPushConstants(f.cb, g.copy_layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof pc, &pc);
+    vkCmdDraw(f.cb, 3, 1, 0, 0);
+    vkCmdEndRendering(f.cb);
+    transition(f.cb, c.image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
+    if (clear) clear_efb(s, s.tex_src);
+}
 
 void Renderer::draw(const State& s, const Draw& d) {
     ++stats().draws;
     stats().vertices += d.count;
     const uint8_t prim = d.primitive;
-    if (prim >= kLines) unsupported("lines and points", prim);
-    if (s.fog_type != 0) unsupported("fog", s.fog_type);
+    const bool lines = prim == kLines || prim == kLineStrip, points = prim == kPoints;
     if (s.num_ind_stages != 0) unsupported("indirect texture stages", s.num_ind_stages);
-    if (s.cull == 3 || d.count == 0) return;  // GX_CULL_ALL draws nothing
+    if (s.ztex_op != 0) unsupported("a Z texture", s.ztex_op);
+    if (d.count == 0 || (s.cull == 3 && !lines && !points)) return;  // GX_CULL_ALL draws no triangles
     if (s.scissor_offset[0] != 0 || s.scissor_offset[1] != 0) unsupported("a scissor box offset", s.scissor_offset[0]);
 
-    // vertices, transformed, as a triangle list
+    // vertices, transformed
     std::vector<GpuVertex> v(d.count);
     for (uint32_t i = 0; i < d.count; ++i) {
         InVertex in;
@@ -829,6 +1056,7 @@ void Renderer::draw(const State& s, const Draw& d) {
         transform(s, in, v[i]);
     }
     std::vector<uint32_t> order;
+    std::vector<GpuVertex> wide;  // lines and points become quads in screen space
     switch (prim) {
     case kQuads:
     case kQuads2:
@@ -843,11 +1071,51 @@ void Renderer::draw(const State& s, const Draw& d) {
             else order.insert(order.end(), {i - 2, i - 1, i});
         }
         break;
-    default:  // fan
+    case kTriangleFan:
         for (uint32_t i = 2; i < d.count; ++i) order.insert(order.end(), {0u, i - 1, i});
         break;
+    default: {
+        // GX widens a line across its minor axis (vertically if it's more
+        // horizontal than vertical), by the line width in sixths of a pixel;
+        // a point is a square of the point size. Offsets are made in pixels
+        // and taken back into clip space at each vertex's w. APPROX: the
+        // texture coordinate offsets (GXSetLineWidth's second argument).
+        const float vw = std::max(std::fabs(s.viewport[2]), 1.0f), vh = std::max(std::fabs(s.viewport[3]), 1.0f);
+        auto shifted = [&](const GpuVertex& p, float dx_px, float dy_px) {
+            GpuVertex q = p;
+            q.pos[0] += dx_px * 2.0f / vw * p.pos[3];
+            q.pos[1] += dy_px * 2.0f / vh * p.pos[3];
+            return q;
+        };
+        if (points) {
+            const float r = s.point_size / 2;
+            for (const GpuVertex& p : v) {
+                const GpuVertex a = shifted(p, -r, -r), b = shifted(p, r, -r), c = shifted(p, r, r), e = shifted(p, -r, r);
+                wide.insert(wide.end(), {a, b, c, a, c, e});
+            }
+            break;
+        }
+        const float r = s.line_width / 2;
+        const uint32_t step = prim == kLines ? 2 : 1;
+        for (uint32_t i = 0; i + 1 < d.count; i += step) {
+            const GpuVertex& a = v[i];
+            const GpuVertex& b = v[i + 1];
+            if (a.pos[3] == 0 || b.pos[3] == 0) continue;
+            const float dx = (b.pos[0] / b.pos[3] - a.pos[0] / a.pos[3]) * vw, dy = (b.pos[1] / b.pos[3] - a.pos[1] / a.pos[3]) * vh;
+            const bool horizontal = std::fabs(dx) >= std::fabs(dy);
+            const float ox = horizontal ? 0 : r, oy = horizontal ? r : 0;
+            const GpuVertex a0 = shifted(a, -ox, -oy), a1 = shifted(a, ox, oy), b0 = shifted(b, -ox, -oy), b1 = shifted(b, ox, oy);
+            wide.insert(wide.end(), {a0, a1, b1, a0, b1, b0});
+        }
+        break;
     }
-    if (order.empty()) return;
+    }
+    if (order.empty() && wide.empty()) return;
+    if (!wide.empty()) {
+        v = std::move(wide);
+        order.resize(v.size());
+        for (uint32_t i = 0; i < order.size(); ++i) order[i] = i;
+    }
 
     DrawBlock block;
     pack_draw(s, block);
@@ -861,8 +1129,9 @@ void Renderer::draw(const State& s, const Draw& d) {
         const TexMap& tm = s.tex[t.map & 7];
         if (!tm.loaded) unsupported("a TEV stage reading a texture map with nothing loaded", t.map);
         begin_frame();
-        views[t.map & 7] = texture(s, tm);
-        samps[t.map & 7] = sampler(tm.mode0);
+        const Image& im = texture(s, tm);
+        views[t.map & 7] = im.view;
+        samps[t.map & 7] = sampler(tm.mode0, tm.mode1, im.levels);
     }
 
     begin_rendering();
@@ -904,7 +1173,10 @@ void Renderer::draw(const State& s, const Draw& d) {
     vkCmdSetScissor(cb, 0, 1, &sc);
     // GX culls by its screen-space winding: front faces are clockwise there,
     // as in Vulkan's framebuffer space (both y down).
-    vkCmdSetCullMode(cb, s.cull == 1 ? VK_CULL_MODE_FRONT_BIT : s.cull == 2 ? VK_CULL_MODE_BACK_BIT : VK_CULL_MODE_NONE);
+    vkCmdSetCullMode(cb, lines || points ? VK_CULL_MODE_NONE  // GX culls triangles only
+                         : s.cull == 1   ? VK_CULL_MODE_FRONT_BIT
+                         : s.cull == 2   ? VK_CULL_MODE_BACK_BIT
+                                         : VK_CULL_MODE_NONE);
     vkCmdSetFrontFace(cb, VK_FRONT_FACE_CLOCKWISE);
     vkCmdSetDepthTestEnable(cb, s.z_enable ? VK_TRUE : VK_FALSE);
     vkCmdSetDepthWriteEnable(cb, s.z_enable && s.z_update ? VK_TRUE : VK_FALSE);
@@ -954,21 +1226,7 @@ void Renderer::copy_display(const State& s, uint32_t, bool clear) {
                        &blit, VK_FILTER_LINEAR);
         transition(cb, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_IMAGE_ASPECT_COLOR_BIT);
     }
-    if (clear) {
-        begin_rendering();
-        VkClearAttachment ca[2]{};
-        ca[0].aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        ca[0].clearValue.color = {{s.clear_color.r / 255.0f, s.clear_color.g / 255.0f, s.clear_color.b / 255.0f,
-                                   s.clear_color.a / 255.0f}};
-        ca[1].aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
-        ca[1].clearValue.depthStencil = {float(s.clear_z) / float(0xFFFFFF), 0};
-        VkClearRect rect{{{int32_t(s.disp_src[0]), int32_t(s.disp_src[1])},
-                          {std::min<uint32_t>(s.disp_src[2], kEfbWidth - s.disp_src[0]),
-                           std::min<uint32_t>(s.disp_src[3], kEfbHeight - s.disp_src[1])}},
-                         0, 1};
-        if (rect.rect.extent.width && rect.rect.extent.height) vkCmdClearAttachments(cb, 2, ca, 1, &rect);
-        end_rendering();
-    }
+    if (clear) clear_efb(s, s.disp_src);
     vk_check(vkEndCommandBuffer(cb), "vkEndCommandBuffer");
     VkCommandBufferSubmitInfo cbi = vk_struct<VkCommandBufferSubmitInfo>(VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO);
     cbi.commandBuffer = cb;
@@ -1089,7 +1347,8 @@ bool create_resources() {
         f.upload = make_buffer(kUploadBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
     }
     g.efb_color = make_image(kEfbWidth, kEfbHeight, kEfbColor,
-                             VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                             VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                                 VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
                              VK_IMAGE_ASPECT_COLOR_BIT);
     g.efb_depth = make_image(kEfbWidth, kEfbHeight, kEfbDepth, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, VK_IMAGE_ASPECT_DEPTH_BIT);
     g.blank = make_image(1, 1, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
@@ -1108,6 +1367,7 @@ bool create_resources() {
     vk_check(vkCreatePipelineLayout(g.device, &pl, nullptr, &g.layout), "vkCreatePipelineLayout");
     g.vert = shader(k_gx_vert, sizeof k_gx_vert);
     g.frag = shader(k_gx_frag, sizeof k_gx_frag);
+    create_copy_pipeline();
 
     // The first frame: the EFB starts black (what GX's memory holds after
     // the SDK's start-up clears is the game's business), the blank texture
