@@ -160,6 +160,7 @@ if(QILIN_RUNTIME_GEN_DIR)
         recomp/runtime/gx_fifo.cpp
         recomp/runtime/vi.cpp
         recomp/runtime/wpad.cpp
+        recomp/runtime/input.cpp
         recomp/runtime/audio.cpp
         recomp/runtime/nand.cpp
     )

@@ -11,6 +11,9 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+### Added
+- **A scripted Wii Remote** (`QILIN_INPUT`, `recomp/runtime/input.*`): a virtual remote on channel 0 presses buttons on a schedule for headless, repeatable runs. WPAD drives KPAD as KPAD's code expects (connect callback, then sampling callbacks at the report rate, `WPADRead`'s status), with the data format, pointer control and the remote speaker's control protocol; no motion or pointer data is made up. With it, A at the title takes the game to its first sound.
+
 ## [0.15.0] - 2026-11-19
 The game runs: it initialises completely, saves on first boot, reaches its title scene and keeps running, a frame copied out on every retrace, with the audio clock at the console's rate. Nothing is shown or heard yet (headless GX; the DSP stops at the first voice), and with no remote connected the game waits at its title.
 
