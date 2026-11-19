@@ -11,6 +11,12 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+### Added
+- **The other Qilin recomps' UI conventions** (`docs/naming.md`): the window is named after the game and opens at the largest whole multiple of the picture that fits the display; F11 or Alt+Enter switch borderless fullscreen; the game's data folder is `<per-user data>/qilin/beatthebeat` (an old `BeatTheBeat-QilinComp` folder moves there on the first run).
+- **Controllers** (SDL's gamepads, any it knows, hot-plugged): the first one plays the Wii Remote held upright (south face button A, east and the right trigger B, west 1, north 2, Start +, Back −, Guide Home, the d-pad or left stick); the game's rumble reaches it. The keyboard gains the other recomps' keys (Space or K, L, J, I, Tab) beside its own.
+- **The settings file** (`beatthebeat.ini` in the data folder, written with comments on the first run; `settings.*`): presets `original`, `low-end` and `desktop`, keys overriding them, and the console's own settings the game reads (language, 60 Hz, widescreen, …), which were fixed in the code before. A malformed line stops at start, naming the file and line (tested).
+- **Enhancements:** internal resolution (`internal_scale`, the frame buffer at 1–8×: viewports, scissors, clears, display and texture copies scaled; texture copies keep the resolution), anisotropic filtering (`anisotropy`), and `vsync` (mailbox or FIFO; off: immediate). At 3× (1920×1368) the title draws the same picture (coverage and mean colour as at 1×), the GPU at 1.75 ms a frame on a GTX 1080 Ti.
+
 ### Changed
 - **Efficiency, measured** (`QILIN_PROFILE=1`, `docs/runtime.md`): at the title the runtime went from 61% of a desktop core to 12% windowed and 8% headless (unchecked build).
   - Textures follow the console's coherency rule (`coherence.*`): a texture is re-checked only when the game flushed or DMA wrote a page under it (`DC*` natives, lifted `dcbf`/`dcbst` through `rt::cache_store`, disc and NAND reads), then hashed once. Texture checks went from 102 µs to 0.3 µs a draw.

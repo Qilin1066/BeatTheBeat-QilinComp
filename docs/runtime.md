@@ -128,6 +128,17 @@ GX is replaced at its API, as the roadmap says: its own code drives the GPU's re
 - **Keyboard as the Wii Remote** (held upright): A = X or Space, B = Z or Left Shift, 1, 2, + = Enter, − = Backspace, Home = H, the D-pad = arrows. A remote is connected whenever there is a window (or a `QILIN_INPUT` script); the two add up.
 - **First run** (GTX 1080 Ti, Windows): 60 s windowed with A pressed from 24 s: 3,581 frames presented, the title's music and voices through the speakers, no stop.
 
+## The player's side: settings, window, controllers, enhancements (after v0.16.0)
+
+As in the other Qilin recomps (`docs/naming.md`): the window is named after the game and opens at the largest whole multiple of the picture (854×480 at 16:9, 640×480 at 4:3) that fits nine tenths of the main display; F11 or Alt+Enter switch borderless fullscreen. The data folder is `<per-user data>/qilin/beatthebeat` (`settings.cpp`'s `game_data_dir`; an old `BeatTheBeat-QilinComp` folder moves there once).
+
+- **The settings file** (`settings.*`, `beatthebeat.ini`): `[display]` has the preset (`original`, `low-end`, `desktop`) and the keys that override it; `[console]` the Wii's own settings, which `console.hpp` hands to the SC and VI natives. `parse_settings` is apart from the file, and unit-tested; a malformed line ends the start with the file, line and reason.
+- **Controllers** (`host.cpp`): SDL's gamepad API, hot-plugged; the first controller plays the Wii Remote held upright, merged with the keyboard. `WPADControlMotor` rumbles it (through an SDL user event, so the main thread does it).
+- **Internal resolution** (`internal_scale`): GX's coordinates stay in EFB pixels; the renderer multiplies them where they meet the images (the EFB, viewports, scissors, clears, the display blit, texture copies, which keep the resolution, and the statistics' readback). Line and point widths follow, being computed relative to the viewport.
+- **Anisotropic filtering** (`anisotropy`): on samplers that filter linearly, within the GPU's limit; a GPU without it says so and filters as the console does.
+- **vsync**: on, mailbox (no tearing, presenting never waits) or FIFO; off, immediate where there is one.
+- Not done yet: MSAA, widescreen beyond 16:9, high refresh rates, a settings menu in the window.
+
 ## Efficiency (after v0.16.0)
 
 `QILIN_PROFILE=1` reports the process's CPU time against the wall clock, the time in draws (texture checks included), presenting frames and the mixer, what's left (lifted code, the OS), and each renderer ring's peak use in a frame. Measured at the title (45 s, A pressed four times; Windows, a desktop CPU and a GTX 1080 Ti):

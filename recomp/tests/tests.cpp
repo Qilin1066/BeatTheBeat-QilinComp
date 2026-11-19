@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <fstream>
 #include <print>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -22,6 +23,7 @@
 #include "libraries.hpp"
 #include "lifter.hpp"
 #include "native.hpp"
+#include "settings.hpp"
 #include "sha256.hpp"
 
 using namespace qilin;
@@ -1119,9 +1121,38 @@ void test_input_script() {
     CHECK(!rt::parse_input_script("A@1,Z@2", p, bad) && bad == "Z@2");
 }
 
+// ---------------------------------------------------------------- settings
+void test_settings() {
+    auto parse = [](const char* text, rt::Settings& s, std::string& error, unsigned& line) {
+        std::istringstream in(text);
+        s = rt::Settings{};
+        return rt::parse_settings(in, s, error, line);
+    };
+    rt::Settings s;
+    std::string error;
+    unsigned line = 0;
+    // a preset, then a key overriding it; comments and blank lines
+    CHECK(parse("# comment\n[display]\npreset = desktop\nanisotropy = 4  # trailing\n\n[console]\nlanguage = 2\nwidescreen = false\n",
+                s, error, line));
+    CHECK(s.preset == "desktop" && s.internal_scale == 3 && s.anisotropy == 4 && s.language == 2 && !s.widescreen);
+    CHECK(parse("[display]\npreset = original\n", s, error, line) && s.internal_scale == 1 && s.anisotropy == 1);
+    // each malformed form names its line
+    struct Bad {
+        const char* text;
+        unsigned line;
+    };
+    for (const Bad& b : {Bad{"[display]\ninternal_scale = 9\n", 2}, Bad{"[display]\nanisotropy = 3\n", 2},
+                         Bad{"[display]\nvsync = yes\n", 2}, Bad{"[nowhere]\n", 1}, Bad{"[display]\npreset = fast\n", 2},
+                         Bad{"[display]\nnot_a_key = 1\n", 2}, Bad{"[display]\nfullscreen\n", 2},
+                         Bad{"[console]\nlanguage = -1\n", 2}, Bad{"[display\n", 1}, Bad{"[console]\nsound_mode = 3\n", 2}}) {
+        CHECK(!parse(b.text, s, error, line) && line == b.line && !error.empty());
+    }
+}
+
 }  // namespace
 
 int main() {
+    test_settings();
     test_textures();
     test_input_script();
     test_estimates();

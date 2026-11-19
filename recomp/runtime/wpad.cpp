@@ -18,6 +18,7 @@
 #include <cstdio>
 
 #include "console.hpp"
+#include "host.hpp"
 #include "input.hpp"
 #include "interrupts.hpp"
 #include "native.hpp"
@@ -248,8 +249,12 @@ QILIN_NATIVE(WPADDisconnect) {
     if (const uint32_t cb = wpad.connect_cb[ch])
         post_interrupt([ch, cb](Context& ctx) { call_back(ctx, cb, ch, static_cast<uint32_t>(kErrNoController)); }, kIoLatency);
 }
-// Rumble: accepted; the host has no rumble output yet.
-QILIN_NATIVE(WPADControlMotor) { channel(c); }
+// WPADControlMotor(chan, command): rumble on (1) or off (0), on the
+// controller playing the remote (host.cpp), while rumble is enabled.
+QILIN_NATIVE(WPADControlMotor) {
+    const uint32_t ch = channel(c);
+    if (ch == 0) host::rumble(c.r[4] == 1 && wpad.motor_enabled);
+}
 QILIN_NATIVE(WPADEnableMotor) { wpad.motor_enabled = c.r[3] & 0xFF; }
 QILIN_NATIVE(WPADIsMotorEnabled) { c.r[3] = wpad.motor_enabled ? 1 : 0; }
 

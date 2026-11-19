@@ -174,6 +174,7 @@ if(QILIN_RUNTIME_GEN_DIR)
         recomp/runtime/nand.cpp
         recomp/runtime/profile.cpp
         recomp/runtime/coherence.cpp
+        recomp/runtime/settings.cpp
     )
     target_link_libraries(qilin_run PRIVATE qilin_gen_runtime qilin_dol qilin_warnings)
     if(WIN32)
@@ -280,7 +281,7 @@ endif()
 # ---- Tests (no game files needed) ----
 enable_testing()
 add_executable(qilin_tests recomp/tests/tests.cpp recomp/runtime/native.cpp recomp/runtime/interrupts.cpp recomp/runtime/timebase.cpp
-    recomp/runtime/gx_texture.cpp recomp/runtime/input.cpp recomp/runtime/profile.cpp)
+    recomp/runtime/gx_texture.cpp recomp/runtime/input.cpp recomp/runtime/profile.cpp recomp/runtime/settings.cpp)
 target_link_libraries(qilin_tests PRIVATE qilin_core qilin_runtime qilin_warnings)
 target_compile_definitions(qilin_tests PRIVATE QILIN_HEADLESS_ONLY)  # input.cpp without the host side
 qilin_tool(qilin_tests)

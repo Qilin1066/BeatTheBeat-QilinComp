@@ -94,18 +94,32 @@ cmake -S . -B build-rt -DQILIN_RUNTIME_GEN_DIR=$PWD/gen-rt && cmake --build buil
 build-rt/qilin_run path/to/extracted-disc
 ```
 
-`qilin_run` takes the folder Dolphin's **Extract Entire Disc** writes (`sys/` and `files/`); a `.wbfs` or `.iso` can't be read directly, since a Wii disc is encrypted with a key this project can't include. It opens a window; closing it quits. Anything the runtime can't do yet stops the run with a message saying what, who called it, and what the run did before. `docs/runtime.md` has the details. Keep `pal_symbols.txt` and the extracted disc outside the repository.
+`qilin_run` takes the folder Dolphin's **Extract Entire Disc** writes (`sys/` and `files/`); a `.wbfs` or `.iso` can't be read directly, since a Wii disc is encrypted with a key this project can't include. It opens a window named after the game, at the largest whole multiple of the picture that fits the screen; **F11** or **Alt+Enter** switch borderless fullscreen, and closing the window quits. Anything the runtime can't do yet stops the run with a message saying what, who called it, and what the run did before. `docs/runtime.md` has the details. Keep `pal_symbols.txt` and the extracted disc outside the repository.
 
-| Wii Remote | Keyboard |
+The Wii Remote is played upright, by a controller or the keyboard (both at once work):
+
+| Wii Remote | Controller (any SDL knows) | Keyboard |
+|---|---|---|
+| A | south face button (Xbox A, PlayStation ✕) | Space, K or X |
+| B (the trigger) | east face button, right trigger | L, Z or Left Shift |
+| 1, 2 | west, north face buttons | 1 or J, 2 or I |
+| +, − | Start, Back | Enter, Backspace or Tab |
+| Home | Guide | H |
+| D-pad | d-pad or left stick | arrow keys |
+
+The first controller connected plays the remote (another takes over if it's unplugged); the game's rumble reaches it.
+
+**The game's data folder** is `qilin/beatthebeat` in the per-user application data (`%LOCALAPPDATA%`, `~/Library/Application Support` or `~/.local/share`), as the other Qilin recomps keep theirs: saves in `nand/` (or wherever `QILIN_NAND` points), `pipelines.bin` (compiled shaders, so later runs start without compile stutters) and **the settings file, `beatthebeat.ini`**, written with comments on the first run:
+
+| `[display]` | |
 |---|---|
-| A | X or Space |
-| B | Z or Left Shift |
-| 1, 2 | 1, 2 |
-| +, − | Enter, Backspace |
-| Home | H |
-| D-pad | arrow keys |
+| `preset` | `original` (the console's picture), `low-end` (a Raspberry Pi 4–class board), `desktop` (3× internal resolution, 16× anisotropic filtering); keys after it override it |
+| `fullscreen` | `true` / `false` |
+| `internal_scale` | the frame buffer at 1–8× the console's 640×528 |
+| `anisotropy` | 1, 2, 4, 8 or 16 |
+| `vsync` | `true` (no tearing) / `false` (the lowest latency) |
 
-Saves go to a per-user folder (`%LOCALAPPDATA%`, `~/Library/Application Support` or `~/.local/share`, under `BeatTheBeat-QilinComp/nand`), or wherever `QILIN_NAND` points. The same folder keeps `pipelines.bin`, the compiled shaders, so later runs start without compile stutters. For tests and repeatable runs:
+`[console]` holds what the game reads as the Wii's own settings: `language`, `sixty_hz`, `widescreen`, `progressive`, `sound_mode`, `sensor_bar_above`, `dpd_sensitivity`. A malformed line stops the runtime at start, naming the file and line. `QILIN_SETTINGS=<file>` uses another file. For tests and repeatable runs:
 
 | Variable | Effect |
 |---|---|

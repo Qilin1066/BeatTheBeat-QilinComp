@@ -46,6 +46,7 @@
 #include "machine.hpp"
 #include "native.hpp"
 #include "profile.hpp"
+#include "settings.hpp"
 
 #include "copy_frag.h"
 #include "copy_vert.h"
@@ -217,6 +218,8 @@ struct Vk {
     uint32_t family = 0;
     VkPhysicalDeviceMemoryProperties memory{};
     VkDeviceSize ubo_align = 256;
+    uint32_t scale = 1;          // the internal resolution (settings: internal_scale)
+    float max_anisotropy = 1;    // texture filtering (settings: anisotropy), within the GPU's limit
     SDL_Window* window = nullptr;
     // the swapchain
     VkSwapchainKHR swapchain = VK_NULL_HANDLE;
@@ -367,11 +370,14 @@ bool make_swapchain() {
     vkGetPhysicalDeviceSurfacePresentModesKHR(g.gpu, g.surface, &n, nullptr);
     std::vector<VkPresentModeKHR> modes(n);
     vkGetPhysicalDeviceSurfacePresentModesKHR(g.gpu, g.surface, &n, modes.data());
-    // Mailbox if there is one: presenting never waits for the display, so
-    // the game's own clock (VI's retrace) paces it.
+    // The game's own clock (VI's retrace) paces the frames, so presenting
+    // shouldn't wait for the display. With vsync: mailbox (no tearing),
+    // else FIFO (always there). Without: immediate (the lowest latency),
+    // else mailbox, else FIFO.
+    auto has = [&](VkPresentModeKHR m) { return std::find(modes.begin(), modes.end(), m) != modes.end(); };
     VkPresentModeKHR mode = VK_PRESENT_MODE_FIFO_KHR;
-    for (auto m : modes)
-        if (m == VK_PRESENT_MODE_MAILBOX_KHR) mode = m;
+    if (!settings().vsync && has(VK_PRESENT_MODE_IMMEDIATE_KHR)) mode = VK_PRESENT_MODE_IMMEDIATE_KHR;
+    else if (has(VK_PRESENT_MODE_MAILBOX_KHR)) mode = VK_PRESENT_MODE_MAILBOX_KHR;
 
     VkSwapchainCreateInfoKHR si = vk_struct<VkSwapchainCreateInfoKHR>(VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR);
     si.surface = g.surface;
@@ -443,7 +449,7 @@ uint32_t pipeline_key(const State& s) {
 // GPU and driver (Vulkan's cache header: size, version 1, vendor, device,
 // the driver's cache UUID).
 std::filesystem::path pipeline_cache_path() {
-    const std::filesystem::path dir = user_data_dir();
+    const std::filesystem::path dir = game_data_dir();
     return dir.empty() ? dir : dir / "pipelines.bin";
 }
 
@@ -581,6 +587,8 @@ VkSampler sampler(uint32_t mode0, uint32_t mode1 = 0, uint32_t levels = 1) {
     si.mipmapMode = min_code & 2 ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST;
     si.addressModeU = wrap(mode0 & 3), si.addressModeV = wrap((mode0 >> 2) & 3);
     si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    // Anisotropic filtering (a setting, beyond the console) where GX filters linearly.
+    if (g.max_anisotropy > 1 && (min_code & 4)) si.anisotropyEnable = VK_TRUE, si.maxAnisotropy = g.max_anisotropy;
     if ((min_code & 3) && levels > 1) {
         si.maxLod = std::min(float((mode1 >> 8) & 0xFF) / 16.0f, float(levels - 1));
         si.minLod = std::min(float(mode1 & 0xFF) / 16.0f, si.maxLod);  // Vulkan needs minLod <= maxLod
@@ -732,7 +740,7 @@ void begin_rendering() {
     VkRenderingAttachmentInfo depth = color;
     depth.imageView = g.efb_depth.view, depth.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
     VkRenderingInfo ri = vk_struct<VkRenderingInfo>(VK_STRUCTURE_TYPE_RENDERING_INFO);
-    ri.renderArea = {{0, 0}, {kEfbWidth, kEfbHeight}}, ri.layerCount = 1;
+    ri.renderArea = {{0, 0}, {kEfbWidth * g.scale, kEfbHeight * g.scale}}, ri.layerCount = 1;
     ri.colorAttachmentCount = 1, ri.pColorAttachments = &color, ri.pDepthAttachment = &depth;
     vkCmdBeginRendering(cb, &ri);
     g.rendering = true;
@@ -1227,7 +1235,9 @@ void clear_efb(const State& s, const uint16_t rect[4]) {
     ca[1].aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
     ca[1].clearValue.depthStencil = {float(s.clear_z) / float(0xFFFFFF), 0};
     const uint32_t x = std::min<uint32_t>(rect[0], kEfbWidth), y = std::min<uint32_t>(rect[1], kEfbHeight);
-    VkClearRect r{{{int32_t(x), int32_t(y)}, {std::min<uint32_t>(rect[2], kEfbWidth - x), std::min<uint32_t>(rect[3], kEfbHeight - y)}}, 0, 1};
+    VkClearRect r{{{int32_t(x * g.scale), int32_t(y * g.scale)},
+                   {std::min<uint32_t>(rect[2], kEfbWidth - x) * g.scale, std::min<uint32_t>(rect[3], kEfbHeight - y) * g.scale}},
+                  0, 1};
     if (r.rect.extent.width && r.rect.extent.height) vkCmdClearAttachments(cur().cb, 2, ca, 1, &r);
     end_rendering();
 }
@@ -1250,7 +1260,7 @@ void Renderer::copy_texture(const State& s, uint32_t dest, bool clear) {
     EfbCopy& c = g_copies[norm_addr(dest)];
     if (c.image.img && (c.width != w || c.height != h)) g.garbage.emplace_back(g.frame_number, c.image), c.image = Image{};
     if (!c.image.img)
-        c.image = make_image(w, h, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+        c.image = make_image(w * g.scale, h * g.scale, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
                              VK_IMAGE_ASPECT_COLOR_BIT);
     c.width = w, c.height = h, c.format = s.tex_dst_format;
     c.guest_bytes = texture_bytes(cf.mem_format, w, h);
@@ -1268,15 +1278,16 @@ void Renderer::copy_texture(const State& s, uint32_t dest, bool clear) {
     color.imageView = c.image.view, color.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
     color.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE, color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
     VkRenderingInfo ri = vk_struct<VkRenderingInfo>(VK_STRUCTURE_TYPE_RENDERING_INFO);
-    ri.renderArea = {{0, 0}, {w, h}}, ri.layerCount = 1, ri.colorAttachmentCount = 1, ri.pColorAttachments = &color;
+    ri.renderArea = {{0, 0}, {w * g.scale, h * g.scale}}, ri.layerCount = 1, ri.colorAttachmentCount = 1, ri.pColorAttachments = &color;
     vkCmdBeginRendering(f.cb, &ri);
     vkCmdBindPipeline(f.cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g.copy_pipeline);
     vkCmdBindDescriptorSets(f.cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g.copy_layout, 0, 1, &set, 0, nullptr);
-    const VkViewport vp{0, 0, float(w), float(h), 0, 1};
-    const VkRect2D sc{{0, 0}, {w, h}};
+    const VkViewport vp{0, 0, float(w * g.scale), float(h * g.scale), 0, 1};
+    const VkRect2D sc{{0, 0}, {w * g.scale, h * g.scale}};
     vkCmdSetViewport(f.cb, 0, 1, &vp);
     vkCmdSetScissor(f.cb, 0, 1, &sc);
-    const CopyBlock pc{{float(s.tex_src[0]), float(s.tex_src[1]), float(s.tex_src[2]), float(s.tex_src[3])},
+    const float k = float(g.scale);  // the copy keeps the internal resolution
+    const CopyBlock pc{{float(s.tex_src[0]) * k, float(s.tex_src[1]) * k, float(s.tex_src[2]) * k, float(s.tex_src[3]) * k},
                        {cf.mode, s.tex_dst_mipmap ? 1u : 0u, 0, 0}};
     vkCmdPushConstants(f.cb, g.copy_layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof pc, &pc);
     vkCmdDraw(f.cb, 3, 1, 0, 0);
@@ -1409,12 +1420,14 @@ void Renderer::draw(const State& s, const Draw& d) {
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline(key));
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g.layout, 0, 1, &set, 0, nullptr);
     vkCmdBindVertexBuffers(cb, 0, 1, &vs.buf, &vs.offset);
-    VkViewport vp{s.viewport[0], s.viewport[1], s.viewport[2], s.viewport[3], s.viewport[4], s.viewport[5]};
+    // GX's viewport and scissor are in EFB pixels: times the internal scale.
+    const float k = float(g.scale);
+    VkViewport vp{s.viewport[0] * k, s.viewport[1] * k, s.viewport[2] * k, s.viewport[3] * k, s.viewport[4], s.viewport[5]};
     vp.minDepth = std::clamp(vp.minDepth, 0.0f, 1.0f), vp.maxDepth = std::clamp(vp.maxDepth, 0.0f, 1.0f);
     vkCmdSetViewport(cb, 0, 1, &vp);
-    const int32_t sx = static_cast<int32_t>(std::min(s.scissor[0], kEfbWidth)), sy = static_cast<int32_t>(std::min(s.scissor[1], kEfbHeight));
-    VkRect2D sc{{sx, sy},
-                {std::min(s.scissor[2], kEfbWidth - static_cast<uint32_t>(sx)), std::min(s.scissor[3], kEfbHeight - static_cast<uint32_t>(sy))}};
+    const uint32_t sx = std::min(s.scissor[0], kEfbWidth), sy = std::min(s.scissor[1], kEfbHeight);
+    VkRect2D sc{{int32_t(sx * g.scale), int32_t(sy * g.scale)},
+                {std::min(s.scissor[2], kEfbWidth - sx) * g.scale, std::min(s.scissor[3], kEfbHeight - sy) * g.scale}};
     vkCmdSetScissor(cb, 0, 1, &sc);
     // GX culls by its screen-space winding: front faces are clockwise there,
     // as in Vulkan's framebuffer space (both y down).
@@ -1466,9 +1479,9 @@ void Renderer::copy_display(const State& s, uint32_t, bool clear) {
         const int32_t x0 = int32_t((float(g.extent.width) - w) / 2), y0 = int32_t((float(g.extent.height) - h) / 2);
         VkImageBlit blit{};
         blit.srcSubresource = blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-        const int32_t sx = s.disp_src[0], sy = s.disp_src[1];
-        blit.srcOffsets[0] = {sx, sy, 0};
-        blit.srcOffsets[1] = {std::min<int32_t>(sx + s.disp_src[2], kEfbWidth), std::min<int32_t>(sy + s.disp_src[3], kEfbHeight), 1};
+        const int32_t k = int32_t(g.scale), sx = s.disp_src[0], sy = s.disp_src[1];
+        blit.srcOffsets[0] = {sx * k, sy * k, 0};
+        blit.srcOffsets[1] = {std::min<int32_t>(sx + s.disp_src[2], kEfbWidth) * k, std::min<int32_t>(sy + s.disp_src[3], kEfbHeight) * k, 1};
         blit.dstOffsets[0] = {x0, y0, 0};
         blit.dstOffsets[1] = {x0 + int32_t(w), y0 + int32_t(h), 1};
         vkCmdBlitImage(cb, g.efb_color.img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
@@ -1482,14 +1495,14 @@ void Renderer::copy_display(const State& s, uint32_t, bool clear) {
         const char* v = std::getenv("QILIN_FRAME_STATS");
         return v ? static_cast<uint32_t>(std::strtoul(v, nullptr, 10)) : 0u;
     }();
-    const uint32_t rw = std::min<uint32_t>(s.disp_src[2], kEfbWidth - std::min<uint32_t>(s.disp_src[0], kEfbWidth));
-    const uint32_t rh = std::min<uint32_t>(s.disp_src[3], kEfbHeight - std::min<uint32_t>(s.disp_src[1], kEfbHeight));
+    const uint32_t rw = std::min<uint32_t>(s.disp_src[2], kEfbWidth - std::min<uint32_t>(s.disp_src[0], kEfbWidth)) * g.scale;
+    const uint32_t rh = std::min<uint32_t>(s.disp_src[3], kEfbHeight - std::min<uint32_t>(s.disp_src[1], kEfbHeight)) * g.scale;
     const bool sample = stats_every && g.frame_number % stats_every == 0 && rw && rh;
     if (sample) {
         transition(cb, g.efb_color, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
         VkBufferImageCopy region{};
         region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-        region.imageOffset = {int32_t(s.disp_src[0]), int32_t(s.disp_src[1]), 0};
+        region.imageOffset = {int32_t(s.disp_src[0] * g.scale), int32_t(s.disp_src[1] * g.scale), 0};
         region.imageExtent = {rw, rh, 1};
         vkCmdCopyImageToBuffer(cb, g.efb_color.img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, f.readback.buf, 1, &region);
     }
@@ -1586,6 +1599,17 @@ bool create_device() {
     if (!f13.dynamicRendering || !f13.synchronization2) return fail("the GPU lacks dynamic rendering or synchronization2");
     VkPhysicalDeviceVulkan13Features want13 = vk_struct<VkPhysicalDeviceVulkan13Features>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES);
     want13.dynamicRendering = VK_TRUE, want13.synchronization2 = VK_TRUE;
+    // Anisotropic filtering, if the settings ask for it and the GPU has it.
+    VkPhysicalDeviceFeatures2 want = vk_struct<VkPhysicalDeviceFeatures2>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2);
+    want.pNext = &want13;
+    if (settings().anisotropy > 1) {
+        if (f2.features.samplerAnisotropy) {
+            want.features.samplerAnisotropy = VK_TRUE;
+            g.max_anisotropy = std::min(float(settings().anisotropy), props.limits.maxSamplerAnisotropy);
+        } else {
+            std::fprintf(stderr, "qilin_run: this GPU has no anisotropic filtering: textures are filtered as the console does\n");
+        }
+    }
 
     std::vector<const char*> exts = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
     vkEnumerateDeviceExtensionProperties(g.gpu, nullptr, &n, nullptr);
@@ -1597,7 +1621,7 @@ bool create_device() {
     VkDeviceQueueCreateInfo qi = vk_struct<VkDeviceQueueCreateInfo>(VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO);
     qi.queueFamilyIndex = g.family, qi.queueCount = 1, qi.pQueuePriorities = &priority;
     VkDeviceCreateInfo di = vk_struct<VkDeviceCreateInfo>(VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO);
-    di.pNext = &want13, di.queueCreateInfoCount = 1, di.pQueueCreateInfos = &qi;
+    di.pNext = &want, di.queueCreateInfoCount = 1, di.pQueueCreateInfos = &qi;
     di.enabledExtensionCount = static_cast<uint32_t>(exts.size()), di.ppEnabledExtensionNames = exts.data();
     if (vkCreateDevice(g.gpu, &di, nullptr, &g.device) != VK_SUCCESS) return fail("vkCreateDevice failed");
 #define QILIN_VK_LOAD_DEVICE(f)                                                                     \
@@ -1630,13 +1654,13 @@ bool create_resources() {
         f.vtx = make_ring(kVertexBytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
         f.ubo = make_ring(kUniformBytes, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
         f.upload = make_ring(kUploadBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
-        f.readback = make_buffer(VkDeviceSize(kEfbWidth) * kEfbHeight * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        f.readback = make_buffer(VkDeviceSize(kEfbWidth) * kEfbHeight * 4 * g.scale * g.scale, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
     }
-    g.efb_color = make_image(kEfbWidth, kEfbHeight, kEfbColor,
+    g.efb_color = make_image(kEfbWidth * g.scale, kEfbHeight * g.scale, kEfbColor,
                              VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
                                  VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
                              VK_IMAGE_ASPECT_COLOR_BIT);
-    g.efb_depth = make_image(kEfbWidth, kEfbHeight, kEfbDepth,
+    g.efb_depth = make_image(kEfbWidth * g.scale, kEfbHeight * g.scale, kEfbDepth,
                              VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_DEPTH_BIT);
     g.blank = make_image(1, 1, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                          VK_IMAGE_ASPECT_COLOR_BIT);
@@ -1697,6 +1721,7 @@ void window_resized() { g.resized = true; }
 
 bool init_vulkan(SDL_Window* window) {
     g.window = window;
+    g.scale = settings().internal_scale;
     vkGetInstanceProcAddr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(SDL_Vulkan_GetVkGetInstanceProcAddr());
     if (!vkGetInstanceProcAddr) return fail("no Vulkan loader");
 #define QILIN_VK_LOAD_GLOBAL(f) f = reinterpret_cast<PFN_##f>(vkGetInstanceProcAddr(nullptr, #f));

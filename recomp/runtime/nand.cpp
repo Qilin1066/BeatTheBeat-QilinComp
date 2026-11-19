@@ -18,6 +18,7 @@
 #include "interrupts.hpp"
 #include "machine.hpp"
 #include "native.hpp"
+#include "settings.hpp"
 
 namespace qilin::rt {
 
@@ -44,7 +45,7 @@ struct Nand {
 
 std::filesystem::path default_root() {
     if (const char* p = std::getenv("QILIN_NAND"); p && *p) return p;
-    const std::filesystem::path dir = user_data_dir();
+    const std::filesystem::path dir = game_data_dir();
     return dir.empty() ? dir : dir / "nand";
 }
 
