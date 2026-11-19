@@ -89,12 +89,14 @@ Before a milestone commit, all of these must hold: tests pass, warnings are clea
 - The decomp's placeholder names (`fn_80038350__Fv`) carry US addresses; the PAL address is in the symbol list.
 - Size alignment can't place a run of equal-size functions: it put base's register accessors three functions early (fixed by `SIGNATURES` in `port_symbols.py`). A native whose name could be misplaced states its code (`QILIN_NATIVE_CODE`), and binding fails if it differs. Base starts at `0x800DA6C0`; the three functions before it are the game's.
 - The extracted disc is the owner's and lives outside the repo (ask for its path; `sys/`, `files/`). `qilin_run` takes the folder. A `.wbfs` can't be read (Wii disc key).
+- GX is replaced at its API (its register writes go through pointers in memory, which can't be caught cheaply). Lifted code's FIFO stores (constant address 0xCC008000, found by `hwaccess`) become `rt::fifo_st*` calls in the lifter. Prefer lifting pure GX functions (object init/get, arithmetic) and decoding their output natively; native `GXInit` runs the lifted `__GXInitGX` for the SDK's defaults. Check a candidate is pure: no `hwaccess` hits, no `lwz rX,-1568(r2)` (GX's state pointer), no hardware-touching calls.
+- Before writing a native, read how the SDK function and its callers use the result (e.g. `WPADGetStatus() == 3` in `KPADInitEx`, `SCCheckStatus() == 1` busy in `OSInit`). Where a value is the console's own (a size, a constant), lift the function that returns it instead of copying the number.
 - Interrupts reach lifted code only at safe points: `OSEnableInterrupts`/`OSRestoreInterrupts` turning them on, and the idle scheduler. `OSLoadContext` throws `rt::Resume` to unwind an interrupt handler; it stops anywhere else.
 - Library split (`docs/code-analysis.md`): lift game/NW4R/MSL/runtime/etc. (74%); replace OS, DVD, GX, AX, pad, WPAD, NAND… (25%); drop MetroTRK/NdevExi2A (1%).
 
 ## Status (v0.12.0)
 
-- Runtime (v0.13.0): `qilin_run <extracted disc folder>` gets through the static constructors and `main`'s start-up to the graphics manager's `GXInit`. The OS's thread, mutex, message, time and alarm units are lifted (by unit, `kLiftUnits`) over a native `SelectThread` (one host thread per guest thread, `threads.cpp`) and interrupts at safe points (`interrupts.cpp`); DVD reads the extracted disc (`dvd.cpp`). None of the thread, interrupt, alarm or DVD-read code has run yet: the game reaches `GXInit` first (`qilin_run` prints 0 switches, interrupts, files). 48 of 2,080 replaced or dropped functions have native code.
+- Runtime (v0.14.0): `qilin_run <extracted disc folder>` runs `main`'s start-up (graphics with the SDK's GX defaults, controllers, the Home Button Menu loading its files) and stops at `AICheckInit` (audio). The OS's thread, mutex, message, time and alarm units are lifted (by unit, `kLiftUnits`) over a native `SelectThread` (one host thread per guest thread) and interrupts at safe points; DVD, alarms and retraces have run (5 files, 17 interrupts, 7 retraces). GX is native at its API with a headless sink (`gx.cpp`, `gx_fifo.cpp`); no draw has happened yet, nor a switch between two threads. 178 of 2,052 replaced or dropped functions have native code.
 
 - 8,171 functions, all 157 jump tables proven, 98.80% of `.text` reached as code (the rest is identified as padding, dead code or data).
 - 8,103 functions lifted (slices 1, 3 and 4: integer, floating point, paired singles). Left: 56 privileged and 7 FPSCR (replaced libraries), 5 `fres`/`frsqrte`.
@@ -107,7 +109,7 @@ Before a milestone commit, all of these must hold: tests pass, warnings are clea
 
 ## Next steps, in order
 
-1. GX (roadmap step 4): its CPU side first (the state the setters build, the FIFO and display-list command stream), then Vulkan. Agree the approach with the owner. Once the game gets past `GXInit`, threads, interrupts, alarms and DVD reads run for the first time: watch the counters `qilin_run` prints.
+1. Audio (AI, AX, DSP): the game stops at `AICheckInit`. NW4R snd (lifted) runs from AX's audio-frame callback, so AX is the rhythm clock and must run at the console's rate, sounding or not. Then the GX renderer on Vulkan once the game draws (the CPU side is in `gx.*`; the owner approved CPU side first, then Vulkan).
 2. The boot information confirmed in Dolphin (`lowmem.py`).
 3. The rest of the runtime, from its to-do list: OS (threads, time, memory, interrupts as the lifted code calls them), then GX on Vulkan (including the FIFO stores), AX, DVD, NAND, input. Exception tables and a timing model as the runtime needs them.
 

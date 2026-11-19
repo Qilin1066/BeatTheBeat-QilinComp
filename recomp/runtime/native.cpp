@@ -160,6 +160,10 @@ void report_stats() {
                  "qilin_run: so far: %" PRIu64 " thread switches (%" PRIu64 " threads started), %" PRIu64
                  " interrupts (%" PRIu64 " from the decrementer), %" PRIu64 " files opened, %" PRIu64 " bytes read\n",
                  s.switches, s.threads_started, s.interrupts, s.decrementer, s.files_opened, s.bytes_read);
+    std::fprintf(stderr,
+                 "qilin_run:          %" PRIu64 " draws (%" PRIu64 " vertices), %" PRIu64 " frames copied out, %" PRIu64
+                 " copies to textures, %" PRIu64 " retraces\n",
+                 s.draws, s.vertices, s.display_copies, s.texture_copies, s.retraces);
 }
 
 const Symbol* symbol_at(uint32_t addr) {

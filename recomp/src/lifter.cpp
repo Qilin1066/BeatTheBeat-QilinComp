@@ -1,5 +1,7 @@
 #include "lifter.hpp"
 
+#include "hwaccess.hpp"
+
 #include <algorithm>
 #include <bitset>
 #include <cctype>
@@ -63,8 +65,17 @@ private:
         return std::format("p{}", n);
     }
 
+    // Stores to the GX write-gather pipe: the runtime takes them
+    // (rt::fifo_st8/16/32) instead of memory. Found by hwaccess's constant
+    // propagation: the SDK's inline vertex functions write it at a constant
+    // address from the caller.
+    std::string store_fn(uint32_t pc, std::string_view fn) const {
+        return fifo_.contains(pc) ? "fifo_" + std::string(fn) : std::string(fn);
+    }
+
     const Cfg& cfg_;
     const Function& f_;
+    std::set<uint32_t> fifo_;
     std::string body_;
     std::set<unsigned> gprs_, fprs_, ps1_;
     std::set<uint32_t> targets_;  // labels that something jumps to
@@ -158,7 +169,9 @@ void Emitter::instruction(uint32_t pc, const Insn& in) {
     auto store = [&](const std::string& fn, const std::string& ea, bool update) {
         use(rd);
         if (ra) use(ra);
-        line(std::format("{{ const uint32_t ea = {}; QILIN_PC({}); rt::{}(ea, {});{} }}", ea, hex(pc), fn, S,
+        if (fifo_.contains(pc) && (fn.ends_with("r") || update))
+            throw Unsupported{std::format("{} to the GX FIFO (only plain stores are taken over)", s.name)};
+        line(std::format("{{ const uint32_t ea = {}; QILIN_PC({}); rt::{}(ea, {});{} }}", ea, hex(pc), store_fn(pc, fn), S,
                          update ? std::format(" {} = ea;", A) : ""));
     };
     auto crop = [&](const std::string& expr) {  // crb(cr,A) and crb(cr,B) as a, b
@@ -523,9 +536,12 @@ void Emitter::floating(uint32_t pc, const Insn& in) {
     auto store = [&](const std::string& ea, bool update, const char* how) {
         if (a) use(a);
         const std::string v = F(d);
-        const std::string st = std::string(how) == "s"   ? std::format("rt::st32(ea, rt::stfs({}))", v)
+        if (fifo_.contains(pc) && (update || std::string(how) == "d"))
+            throw Unsupported{std::format("{} to the GX FIFO (only stfs and stfiwx are taken over)", s.name)};
+        const std::string st32 = store_fn(pc, "st32");
+        const std::string st = std::string(how) == "s"   ? std::format("rt::{}(ea, rt::stfs({}))", st32, v)
                                : std::string(how) == "d" ? std::format("rt::st64(ea, rt::bits({}))", v)
-                                                         : std::format("rt::st32(ea, static_cast<uint32_t>(rt::bits({})))", v);
+                                                         : std::format("rt::{}(ea, static_cast<uint32_t>(rt::bits({})))", st32, v);
         line(std::format("{{ const uint32_t ea = {}; QILIN_PC({}); {};{} }}", ea, hex(pc), st,
                          update ? std::format(" {} = ea;", R(a)) : ""));
     };
@@ -631,7 +647,8 @@ void Emitter::paired(uint32_t pc, const Insn& in) {
         if (a) use(a);
         const std::string gqr = std::format("c.spr[{}]", 912 + i);
         const std::string op = load ? std::format("rt::psq_l({}, {}, ea, {}, {}, {});", F(d), P(d), w ? "true" : "false", gqr, hex(pc))
-                                    : std::format("rt::psq_st({}, {}, ea, {}, {}, {});", F(d), P(d), w ? "true" : "false", gqr, hex(pc));
+                                    : std::format("rt::{}({}, {}, ea, {}, {}, {});", store_fn(pc, "psq_st"), F(d), P(d),
+                                                  w ? "true" : "false", gqr, hex(pc));
         line(std::format("{{ const uint32_t ea = {}; QILIN_PC({}); {}{} }}", ea, hex(pc), op,
                          update ? std::format(" {} = ea;", R(a)) : ""));
     };
@@ -858,6 +875,8 @@ LiftResult Emitter::run() {
         bool stops = false;
     };
     std::vector<Node> nodes;
+    for (const HwAccess& h : hardware_accesses(cfg_, f_))
+        if (h.store && hw_region(h.ea) == "GX FIFO (write-gather pipe)") fifo_.insert(h.pc);
     for (uint32_t pc : f_.insns) {
         const Insn in = cfg_.insn(pc);
         body_.clear();

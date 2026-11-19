@@ -67,6 +67,14 @@ void write_f64(double d) {
 
 }  // namespace
 
+// The GX FIFO isn't mapped here, as under Unicorn: a store to it stops as
+// any store to an unmapped address does (checked memory sets g_pc first).
+namespace qilin::rt {
+void fifo_st8(uint32_t ea, uint32_t) { throw Stop{Stop::Memory, g_pc, ea}; }
+void fifo_st16(uint32_t ea, uint32_t) { throw Stop{Stop::Memory, g_pc, ea}; }
+void fifo_st32(uint32_t ea, uint32_t) { throw Stop{Stop::Memory, g_pc, ea}; }
+}  // namespace qilin::rt
+
 int main(int argc, char** argv) {
     if (argc != 2) {
         std::println(stderr, "usage: qilin_difftest <main.dol>");

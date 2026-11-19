@@ -30,6 +30,11 @@ void post_interrupt(std::function<void(Context&)> handler);
 // now. Writing it again replaces the deadline, as on the hardware.
 void set_decrementer(uint32_t ticks);
 
+// A periodic interrupt (VI's retrace): `handler` runs every `period` ticks of
+// the time base, as a queued handler runs. A late one runs once and the next
+// is a period after it: the game sees no burst of retraces after a stall.
+void add_periodic(uint64_t period, std::function<void(Context&)> handler);
+
 // The exception handlers the OS installed (__OSSetExceptionHandler), by
 // exception number.
 uint32_t exception_handler(unsigned exception);

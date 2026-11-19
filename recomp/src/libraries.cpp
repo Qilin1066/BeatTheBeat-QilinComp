@@ -84,6 +84,47 @@ constexpr std::string_view kLiftAnyway[] = {
     "GXInitLightDir",
     "GXGetLightDir",
     "GXInitLightColor",
+    // GX's object functions: they fill in or read the texture and TLUT
+    // objects the caller passes, in the SDK's own layout, and touch neither
+    // the hardware nor GX's state. GXLoadTexObj and GXLoadTlut, native,
+    // decode what they leave.
+    "GXInitTexObj",
+    "GXInitTexObjCI",
+    "GXInitTexObjLOD",
+    "GXInitTexObjWrapMode",
+    "GXInitTexObjTlut",
+    "GXInitTexObjFilter",
+    "GXInitTexObjUserData",
+    "GXGetTexObjUserData",
+    "GXGetTexObjAll",
+    "GXGetTexObjData",
+    "GXGetTexObjWidth",
+    "GXGetTexObjHeight",
+    "GXGetTexObjFmt",
+    "GXGetTexObjWrapS",
+    "GXGetTexObjWrapT",
+    "GXGetTexObjMipMap",
+    "GXGetTexObjLODAll",
+    "GXGetTexObjTlut",
+    "GXInitTlutObj",
+    "GXGetTexBufferSize",
+    "__GetImageTileCount",
+    // GX arithmetic and compositions of other GX calls: the Y scale for a
+    // frame buffer height, overscan, and GXSetTevDirect (GXSetTevIndirect
+    // with nothing indirect).
+    "GXGetYScaleFactor",
+    "GXAdjustForOverscan",
+    "GXSetTevDirect",
+    // WPAD's work memory size: a constant of the Bluetooth stack, reached by
+    // two tail calls. The game makes a heap of it for WPAD; lifted, its heap
+    // layout is the console's.
+    "WPADGetWorkMemorySize",
+    "WUDGetAllocatedMemSize",
+    "__ntd_get_allocated_mem_size",
+    // GXInit's defaults: __GXInitGX calls GX's setters (native) with the
+    // SDK's own default arguments. It reads only constants and the SDK's
+    // default render mode, and touches no hardware.
+    "__GXInitGX",
     // OSContext.c: these only clear or read the context structures and the
     // current-context pointer in low memory. Saving and loading a context
     // (the switch itself) stays native, and so does OSInitContext, which

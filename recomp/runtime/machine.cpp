@@ -1,5 +1,8 @@
 #include "machine.hpp"
 
+#include <cstdio>
+#include <cstring>
+
 #if defined(_WIN32)
 #include <windows.h>
 #else
@@ -27,6 +30,23 @@ bool map_guest_memory() {
 #endif
     g_mem = base;
     return true;
+}
+
+namespace {
+uint32_t g_scratch_next = 0, g_scratch_end = 0;
+}
+
+void set_scratch(uint32_t lo, uint32_t hi) { g_scratch_next = lo, g_scratch_end = hi; }
+
+uint32_t guest_alloc(uint32_t bytes, uint32_t align) {
+    const uint32_t at = (g_scratch_next + align - 1) & ~(align - 1);
+    if (!g_scratch_end || at + bytes > g_scratch_end) {
+        std::fprintf(stderr, "qilin_run: the runtime's guest scratch (%u bytes) is used up\n", kScratchBytes);
+        throw Stop{Stop::Unsupported, 0, bytes};
+    }
+    g_scratch_next = at + bytes;
+    std::memset(g_mem + at, 0, bytes);
+    return at;
 }
 
 }  // namespace qilin::rt

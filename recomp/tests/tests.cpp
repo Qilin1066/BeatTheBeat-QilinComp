@@ -709,6 +709,14 @@ void test_hwaccess() {
     if (found.size() != 2) return;
     CHECK(found[0].pc == 0x80003264u && found[0].ea == 0xCC008000u && found[0].size == 4 && found[0].store);
     CHECK(found[1].pc == 0x80003270u && found[1].ea == 0xCC002000u && found[1].size == 2 && !found[1].store);
+
+    // The lifter hands exactly the FIFO stores to the runtime; the other
+    // stores stay memory stores.
+    const LiftResult r = Lifter(c).lift(c.functions().at(0x80003260));
+    CHECK(r.ok);
+    CHECK(r.code.contains("rt::fifo_st32(ea, rt::stfs(f1))"));
+    CHECK(r.code.contains("rt::st32(ea, r5)"));
+    CHECK(!r.code.contains("rt::fifo_st32(ea, r5)"));
 }
 
 void test_paired() {

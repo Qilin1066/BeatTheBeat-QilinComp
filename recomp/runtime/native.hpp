@@ -73,6 +73,7 @@ struct Stats {
     uint64_t switches = 0, threads_started = 0;
     uint64_t interrupts = 0, decrementer = 0;
     uint64_t files_opened = 0, bytes_read = 0;
+    uint64_t draws = 0, vertices = 0, display_copies = 0, texture_copies = 0, retraces = 0;
 };
 Stats& stats();
 void report_stats();

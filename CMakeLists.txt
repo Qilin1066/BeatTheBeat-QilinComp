@@ -7,7 +7,7 @@ if(APPLE AND NOT CMAKE_OSX_DEPLOYMENT_TARGET)
     set(CMAKE_OSX_DEPLOYMENT_TARGET 10.15 CACHE STRING "oldest macOS the runtime runs on")
 endif()
 # The single source of the version number (see CHANGELOG.md for the scheme).
-project(BeatTheBeatQilinComp VERSION 0.13.0 LANGUAGES C CXX)
+project(BeatTheBeatQilinComp VERSION 0.14.0 LANGUAGES C CXX)
 
 # ---- Language: C++23 everywhere (recompiler, runtime, generated code) ----
 set(CMAKE_CXX_STANDARD 23)
@@ -156,7 +156,10 @@ if(QILIN_RUNTIME_GEN_DIR)
         recomp/runtime/threads.cpp
         recomp/runtime/interrupts.cpp
         recomp/runtime/dvd.cpp
+        recomp/runtime/gx.cpp
+        recomp/runtime/gx_fifo.cpp
         recomp/runtime/vi.cpp
+        recomp/runtime/wpad.cpp
     )
     target_link_libraries(qilin_run PRIVATE qilin_gen_runtime qilin_dol qilin_warnings)
 endif()

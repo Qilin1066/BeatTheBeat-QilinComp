@@ -24,7 +24,8 @@ Roadmap step 1, **analysis**, is nearly done; step 2, the **recompiler core**, i
 | Differential test under UBSan (`-DQILIN_UBSAN=ON`, or `tools/difftest/build_ubsan.py` on any host) | ✅ no undefined behaviour in 64,824 trials |
 | Lifter slice 4: paired singles and GQR quantisation (from IBM's 750CL manual; a reference model in the difftest, since Unicorn has none) | ✅ 8,103 of 8,171 functions lift; the rest are replaced libraries and 5 estimate-instruction users |
 | Runtime skeleton: `qilin_run`, the registry of native functions, the runtime's own lift (`qilin lift --runtime`) | ✅ starts the game and stops, naming it, at the first replaced function without native code (`docs/runtime.md`) |
-| Runtime: the OS's threads and alarms (lifted, over a native switch and interrupt delivery), DVD over an extracted disc | 🔨 the game runs its start-up up to `GXInit`; the thread, interrupt and DVD code isn't exercised yet (the game reaches GX first) |
+| Runtime: the OS's threads and alarms (lifted, over a native switch and interrupt delivery), DVD over an extracted disc | ✅ run by the game: asynchronous file loads, alarms, retraces |
+| GX's CPU side (state, FIFO vertex stream, display lists), VI's retrace, input start-up | 🔨 the game initialises graphics, controllers and the Home Button Menu and loads its files; stops at audio. Nothing is drawn yet (no renderer; the game hasn't reached a draw) |
 | Runtime: OS, DVD, NAND, GX on Vulkan, AX audio, input | later (see roadmap) |
 
 The repository's first version (0.1.0-alpha.1, a Dolphin-based preview, and a native boot probe on top of DolRecomp) was written with ChatGPT and has been retired. `docs/prior-art.md` §1 says what it did and what carried over.

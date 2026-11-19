@@ -401,11 +401,19 @@ inline double dequantize(uint32_t ea, unsigned type, int scale) {
     default: return lfs(ld32(ea));
     }
 }
+void fifo_st8(uint32_t ea, uint32_t v);
+void fifo_st16(uint32_t ea, uint32_t v);
+void fifo_st32(uint32_t ea, uint32_t v);
+
+// Fifo: the store goes to the GX write-gather pipe (psq_st there, which the
+// GX library's matrix loads do), not to memory.
+template <bool Fifo = false>
 inline void quantize(uint32_t ea, double v, unsigned type, int scale) {
     if (type == 0) {
         uint32_t w = stfs(v);
         if ((w & 0x7F800000u) == 0 && (bits(v) & 0x7FFFFFFFFFFFFFFFull) != 0) w = 0;  // a denormal stores 0.0
-        st32(ea, w);
+        if constexpr (Fifo) fifo_st32(ea, w);
+        else st32(ea, w);
         return;
     }
     const double lo = type == 6 ? -128.0 : type == 7 ? -32768.0 : 0.0;
@@ -417,8 +425,13 @@ inline void quantize(uint32_t ea, double v, unsigned type, int scale) {
         x = x < lo ? lo : x > hi ? hi : x;
     }
     const auto i = static_cast<uint32_t>(static_cast<int32_t>(x));
-    if (type & 1) st16(ea, i);
-    else st8(ea, i);
+    if constexpr (Fifo) {
+        if (type & 1) fifo_st16(ea, i);
+        else fifo_st8(ea, i);
+    } else {
+        if (type & 1) st16(ea, i);
+        else st8(ea, i);
+    }
 }
 // psq_l: W = 1 loads ps0 only, and ps1 becomes 1.0. Both loads happen before
 // either half is written, so a fault leaves frD as it was. It writes lifted
@@ -433,12 +446,16 @@ inline void psq_l(double& p0, double& p1, uint32_t ea, bool w, uint32_t gqr, uin
     p0 = a;
     p1 = b;
 }
+template <bool Fifo = false>
 inline void psq_st(double p0, double p1, uint32_t ea, bool w, uint32_t gqr, uint32_t pc) {
     const unsigned t = gqr_st_type(gqr);
     if (t >= 1 && t <= 3) fp_unknown(pc);
     const int s = gqr_st_scale(gqr);
-    quantize(ea, p0, t, s);
-    if (!w) quantize(ea + quant_size(t), p1, t, s);
+    quantize<Fifo>(ea, p0, t, s);
+    if (!w) quantize<Fifo>(ea + quant_size(t), p1, t, s);
+}
+inline void fifo_psq_st(double p0, double p1, uint32_t ea, bool w, uint32_t gqr, uint32_t pc) {
+    psq_st<true>(p0, p1, ea, w, gqr, pc);
 }
 
 #ifdef QILIN_DETERMINISTIC_TIME
@@ -461,6 +478,11 @@ uint32_t mftb(Context& c, unsigned tbr);
 inline constexpr uint64_t kTimeBaseHz = 60'750'000, kNsPerSecond = 1'000'000'000;
 uint64_t time_base();
 void syscall(Context& c, uint32_t pc);
+// fifo_st8/16/32 (declared above psq_st): stores to the GX write-gather pipe
+// (0xCC008000). The lifter emits them for the stores hwaccess finds there
+// (the SDK's inline vertex functions, compiled into lifted code). The
+// runtime decodes the command stream; the differential test stops on them as
+// it does on any address it doesn't map.
 // `qilin lift --runtime` only: a function of a replaced library, by its index
 // in the generated g_natives table. Runs the native code registered for it
 // (native.hpp) and returns to the caller as a blr would; stops with

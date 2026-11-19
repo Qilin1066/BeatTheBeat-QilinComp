@@ -19,6 +19,10 @@ struct ConsoleSettings {
     // 4 Spanish, 5 Italian, 6 Dutch. This PAL disc has English, French,
     // German, Italian and Spanish.
     uint8_t language = 1;
+    uint8_t sound_mode = 1;  // 0 mono, 1 stereo, 2 surround
+    // The Wii Remote pointer: the sensor bar's place and its sensitivity (1-5).
+    bool sensor_bar_above = false;
+    uint8_t dpd_sensitivity = 3;
 };
 
 inline const ConsoleSettings& console() {

@@ -47,7 +47,10 @@ struct Os {
 QILIN_NATIVE(OSInit) {
     if (os.initialised) return;  // as the original: a second call does nothing
     os.initialised = true;
-    os.mem1_lo = kMem1ArenaLo, os.mem1_hi = kMem1ArenaHi;
+    // The runtime's guest scratch comes off the top of the MEM1 arena, so the
+    // game's heaps never reach it.
+    os.mem1_lo = kMem1ArenaLo, os.mem1_hi = kMem1ArenaHi - kScratchBytes;
+    set_scratch(os.mem1_hi, kMem1ArenaHi);
     os.mem2_lo = kMem2ArenaLo, os.mem2_hi = kMem2ArenaHi;
     poke32(kBusClockAddr, kBusClock);
     poke32(kCpuClockAddr, kCpuClock);
@@ -109,6 +112,17 @@ QILIN_NATIVE(DCStoreRange) {}
 QILIN_NATIVE(DCFlushRange) {}
 QILIN_NATIVE(DCInvalidateRange) {}
 QILIN_NATIVE(ICInvalidateRange) {}
+
+// ---- the locked cache ----
+// A 16 KB scratchpad at 0xE0000000 that DMA fills and empties. NW4R turns it
+// on and off around its work, but no lifted code addresses it (nothing
+// outside the replaced libraries builds 0xE000xxxx, and only the debugger
+// stub touches the DMA registers): so there is no DMA, and an access to it
+// would stop under checked memory.
+bool g_lc_enabled = false;
+QILIN_NATIVE(LCEnable) { g_lc_enabled = true; }
+QILIN_NATIVE(LCDisable) { g_lc_enabled = false; }
+QILIN_NATIVE(LCQueueLength) { c.r[3] = 0; }  // no DMA transfers pending
 
 // ---- reports ----
 // OSRegisterVersion(const char* id) reports the library's version string.

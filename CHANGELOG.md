@@ -11,6 +11,19 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-11-19
+GX's CPU side: the state the game's GX calls set up, the vertex stream lifted code writes to the FIFO, and VI's retrace. The game initialises its graphics (with the SDK's own GX defaults), controllers and Home Button Menu, loads files from the disc through asynchronous reads, sleeps on alarms, and stops where the Home Button Menu starts its sound. The thread, interrupt, alarm and DVD code from v0.13.0 has now run.
+
+### Added
+- **The GX FIFO in lifted code:** the lifter turns the stores `hwaccess` finds on the write-gather pipe (322 in 12 functions in the runtime's lift; `stw`, `sth`, `stfs`; and `psq_st` in the GX library itself) into `rt::fifo_st8/16/32` and `rt::fifo_psq_st`. Other stores stay plain. In the differential test they stop as the original does under Unicorn: 64,824 trials, 0 mismatches, as before.
+- **Native GX** (`recomp/runtime/gx.*`, `gx_fifo.cpp`): about 110 setters, loaders and copies keeping GX's state as the API describes it; `GXBegin` and the FIFO stores make draws, `GXCallDisplayList` walks a list's draws, anything else stops. A headless sink counts draws and copies until the Vulkan renderer exists.
+- **The SDK's own GX defaults and numbers:** native `GXInit` calls the lifted `__GXInitGX`; `GXSetTevOp` takes its presets from the SDK's tables in the game's data (found through its code); `GXSetDispCopyYScale` ports the SDK's line arithmetic. Lifted out of GX: the texture, TLUT and light object functions, `GXGetTexBufferSize`, `GXGetYScaleFactor`, `GXAdjustForOverscan`, `GXSetTevDirect`, `__GXInitGX`; the natives decode those objects in the SDK's layout, read from its getters.
+- **VI:** `VIConfigure`, frame buffers, flush, black, retrace callbacks, and the retrace as a periodic interrupt at the field rate (59.94 or 50 Hz) that wakes `VIWaitForRetrace` (which sleeps through the lifted `OSSleepThread`). Periodic interrupts in `interrupts.cpp`.
+- **Input:** WPAD's start-up as KPAD and the controller manager use it, with no remote connected until there is a host input backend; `WPADGetWorkMemorySize` lifted (the console's heap size); GameCube pads: none. Console settings for the pointer and the sound mode.
+- **SC** start-up (`SCInit`, `SCCheckStatus`, `SCGetSoundMode`), the **locked cache** (no lifted code addresses it), and **guest scratch** for the runtime's own guest objects.
+- `qilin_run` also reports draws, vertices, frames copied out, copies to textures and retraces.
+- **Tests:** the lifter hands exactly the FIFO stores to the runtime.
+
 ## [0.13.0] - 2026-11-19
 The OS and the disc under the game: the OS's threads, mutexes, messages, time and alarms are lifted over a native thread switch and interrupt delivery, and the game's files come from an extracted disc. `qilin_run` gets through the static constructors and `main`'s start-up (video mode, file manager) to its graphics manager's `GXInit`. The new thread, interrupt, alarm and DVD read code is wired in but not yet exercised: the game reaches `GXInit` before it uses any of it.
 

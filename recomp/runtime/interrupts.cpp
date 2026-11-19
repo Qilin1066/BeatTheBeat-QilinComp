@@ -7,6 +7,7 @@
 #include <condition_variable>
 #include <deque>
 #include <mutex>
+#include <vector>
 
 #include "native.hpp"
 
@@ -25,6 +26,18 @@ std::array<uint32_t, 32> g_handlers{};
 // Per host thread: a thread switch during a delivery's reschedule leaves
 // this thread mid-delivery, not the one that runs next.
 thread_local bool t_delivering = false;
+
+struct Periodic {
+    uint64_t due, period;
+    std::function<void(Context&)> handler;
+};
+std::vector<Periodic> g_periodic;  // the running guest thread only
+
+bool periodic_due(uint64_t now) {
+    for (const Periodic& p : g_periodic)
+        if (now >= p.due) return true;
+    return false;
+}
 
 // The queue: any host thread may post.
 std::mutex g_mutex;
@@ -69,6 +82,15 @@ void deliver(Context& c, bool decrementer) {
             g_dec_armed = false;
             ++stats().interrupts, ++stats().decrementer;
             run_decrementer(c);
+        }
+        const uint64_t now = time_base();
+        for (size_t i = 0; i < g_periodic.size(); ++i) {
+            if (now < g_periodic[i].due) continue;
+            g_periodic[i].due += g_periodic[i].period;
+            if (g_periodic[i].due <= now) g_periodic[i].due = now + g_periodic[i].period;
+            ++stats().interrupts;
+            const auto handler = g_periodic[i].handler;  // a copy: the handler may add a timer
+            run_posted(c, handler);
         }
         for (;;) {
             std::function<void(Context&)> handler;
@@ -122,10 +144,15 @@ uint32_t set_exception_handler(unsigned exception, uint32_t handler) {
     return old;
 }
 
+void add_periodic(uint64_t period, std::function<void(Context&)> handler) {
+    g_periodic.push_back(Periodic{time_base() + period, period, std::move(handler)});
+}
+
 void deliver_due(Context& c) {
     if (t_delivering || !g_enabled) return;
     const bool dec = decrementer_due();
-    if (dec || g_queued.load(std::memory_order_acquire)) deliver(c, dec);
+    if (dec || g_queued.load(std::memory_order_acquire) || (!g_periodic.empty() && periodic_due(time_base())))
+        deliver(c, dec);
 }
 
 bool wait_and_deliver(Context& c) {
@@ -133,10 +160,15 @@ bool wait_and_deliver(Context& c) {
         std::unique_lock l(g_mutex);
         for (;;) {
             if (!g_queue.empty()) break;
-            if (!g_dec_armed) return false;  // nothing queued, no timer, and nothing can queue one yet
+            // The next timer: the decrementer or a periodic interrupt.
+            bool any = g_dec_armed;
+            uint64_t next = g_dec_deadline;
+            for (const Periodic& p : g_periodic)
+                if (!any || p.due < next) next = p.due, any = true;
+            if (!any) return false;  // nothing queued, no timer, and nothing can queue one yet
             const uint64_t now = time_base();
-            if (now >= g_dec_deadline) break;
-            const uint64_t ns = (g_dec_deadline - now) * kNsPerSecond / kTimeBaseHz;
+            if (now >= next) break;
+            const uint64_t ns = (next - now) * kNsPerSecond / kTimeBaseHz;
             g_wake.wait_for(l, std::chrono::nanoseconds(ns));
         }
     }

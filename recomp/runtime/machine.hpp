@@ -16,6 +16,13 @@ inline constexpr uint32_t kMem2 = 0x90000000u, kMem2Bytes = 64u << 20;
 // g_mem; false if the host refuses.
 bool map_guest_memory();
 
+// Guest memory for the runtime's own objects that the game's code works on
+// (GX's FIFO object, VI's thread queue): a block OSInit keeps back from the
+// top of the MEM1 arena. Zeroed; never freed. Stops when it runs out.
+inline constexpr uint32_t kScratchBytes = 64u << 10;
+void set_scratch(uint32_t lo, uint32_t hi);
+uint32_t guest_alloc(uint32_t bytes, uint32_t align);
+
 // Thrown by the native code that ends the game (PPCHalt after exit's
 // destructors): not an error.
 struct Exit {

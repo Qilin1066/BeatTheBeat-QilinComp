@@ -1,6 +1,6 @@
 # The runtime (roadmap step 3)
 
-Last updated 2026-11-19 (v0.13.0: the OS's threads, mutexes, messages, time and alarms lifted over a native thread switch and interrupt delivery; DVD over an extracted disc; `main` runs up to `GXInit`. v0.12.0: the skeleton).
+Last updated 2026-11-19 (v0.14.0: GX's CPU side, VI with its retrace, the first input and SC functions; the game initialises its graphics, controllers and Home Button Menu, loads files and stops at audio. v0.13.0: the OS's threads, mutexes, messages, time and alarms lifted over a native thread switch and interrupt delivery; DVD. v0.12.0: the skeleton).
 
 ## Building and running
 
@@ -71,9 +71,34 @@ The disc's own file table (`sys/fst.bin`) gives the entry numbers and directorie
 - Bytes past a file's end are zero (the game rounds lengths up to 32; on the console they would be whatever follows on the disc).
 - Cancels only change how a pending completion reports, since reads finish at once.
 
+## GX (`recomp/runtime/gx.*`, `gx_fifo.cpp`; v0.14.0: the CPU side)
+
+GX is replaced at its API, as the roadmap says: its own code drives the GPU's registers through pointers loaded from memory, which the runtime couldn't catch without checking every load and store. The native GX keeps the state the game's calls set up **as the API describes it** (vertex descriptors and formats, the transform unit's matrices, lighting, texture coordinate generation, TEV stages and colours, blending and depth, textures, copies), which is what the renderer will read. Until the Vulkan renderer exists, a headless sink receives the draws and copies and counts them.
+
+- **The SDK's own defaults:** native `GXInit` calls the **lifted** `__GXInitGX`, which calls the native setters with the SDK's default arguments (it reads only constants and the SDK's default render mode, and touches no hardware). So the state after `GXInit` is the SDK's by construction.
+- **Pure GX functions are lifted:** the texture, TLUT and light object functions (`GXInitTexObj*`, `GXGetTexObj*`, `GXInitTlutObj`, `GXInitLight*` …), `GXGetTexBufferSize`, `GXGetYScaleFactor`, `GXAdjustForOverscan` and `GXSetTevDirect`. They work only on what the caller passes, in the SDK's layout. The natives that consume those objects (`GXLoadTexObj`, `GXLoadTlut`, `GXLoadLightObjImm`) decode the SDK's layout, read from its getters (the texture object's size, address, format, wrap modes and mipmap flag; the TLUT's format, address and entries; the light's colour, attenuation, position and direction).
+- **Numbers the game depends on come from the SDK's code:** `GXSetDispCopyYScale` returns the frame buffer's line count by the SDK's arithmetic (ported instruction by instruction); `GXSetTevOp` takes its presets from the SDK's own tables in the game's data, found through `GXSetTevOp`'s instructions and checked at first use; `GXClearVtxDesc` leaves the position direct, as the SDK's does.
+- **The FIFO:** lifted code writes vertices straight to the write-gather pipe (`0xCC008000`) where the SDK's inline vertex functions were compiled into it: 322 stores in 12 functions (NW4R's quads, lines and glyphs, the Home Button Menu, the Mii library, a few of the game's own). The lifter turns exactly those stores (found by `hwaccess`'s constant propagation) into `rt::fifo_st8/16/32` calls, and `stfs`/`psq_st` there into the same with their conversions; every other store stays a plain memory store. Native `GXBegin` opens a draw, the stores append its vertex bytes, and the draw goes to the sink when its vertex count has arrived. `GXCallDisplayList` walks a display list's draw commands. FIFO data outside a draw, or any command other than a draw, a NOP or a vertex-cache invalidation, stops with its value: nothing in the game needs one yet. In the differential test these calls stop with a memory fault, as the original does under Unicorn, so its results are unchanged.
+- **Vertex sizes** follow the descriptors and formats: matrix indices a byte each, indexed attributes one or two bytes (three indices for NBT3 normals), direct ones by their component count and type; a component type GX doesn't define stops.
+- **Not modelled yet, and saying so:** fog range adjustment (stops if enabled), the 16-bit depth formats' scale and offset, performance metrics, the bounding box, and CPU access to the embedded frame buffer (the `GXPoke*` state is accepted; a peek would stop as an unregistered function).
+
+## VI (`recomp/runtime/vi.cpp`)
+
+`VIConfigure` records the render mode; `VISetNextFrameBuffer`, `VIFlush`, `VISetBlack` and the pre- and post-retrace callbacks are kept. **The retrace** is a periodic interrupt at the console's field rate (59.94 Hz in the 60 Hz setting, 50 Hz otherwise), run as the SDK's retrace interrupt runs: the pre-retrace callback, the flushed frame buffer goes on screen, the post-retrace callback, then the threads in `VIWaitForRetrace` wake. `VIWaitForRetrace` sleeps on a thread queue in guest memory through the lifted `OSSleepThread`, so other threads run meanwhile. A late retrace runs once, and the next is a period after it: the game never sees a burst of retraces after a stall.
+
+## Input (`recomp/runtime/wpad.cpp`)
+
+KPAD, the Wii Remote processing, is lifted; WPAD is native at its API. **Until there is a host input backend, no remote is connected:** a state a console is in whenever remotes are off, which KPAD and the Home Button Menu handle as on hardware. `WPADGetWorkMemorySize` is lifted, with the two tail calls under it, so the heap the game makes for WPAD has the console's size. The pointer's settings (sensitivity, the sensor bar's place) are console settings. GameCube controllers: none plugged in.
+
+## Other native pieces
+
+- **The locked cache** (`LCEnable`, `LCDisable`, `LCQueueLength`): a 16 KB scratchpad filled by DMA. NW4R turns it on and off, but no lifted code addresses it (nothing outside the replaced libraries builds `0xE000xxxx`; only the debugger stub touches the DMA registers), so there is no DMA, and an access would stop under checked memory.
+- **SC** (`SCInit`, `SCCheckStatus`, and the settings: progressive scan, 60 Hz, aspect, language, sound mode): the settings are the runtime's, so there is nothing to load.
+- **Guest scratch** (`guest_alloc` in `machine.*`): 64 KB OSInit keeps back from the top of the MEM1 arena, for the runtime's own objects the game's code works on (GX's FIFO object, VI's thread queue).
+
 ## Native code so far
 
-48 of the 2,080 replaced and dropped functions:
+178 of the 2,052 replaced and dropped functions (v0.14.0); v0.13.0's 48 were:
 
 - `os.cpp`: `OSInit`, the interrupt enable (`OSDisableInterrupts`, `OSEnableInterrupts`, `OSRestoreInterrupts`), the twelve arena getters and setters, the cache range functions (nothing to do: guest memory has no caches behind it), the exception table (`__OSSetExceptionHandler`, `__OSGetExceptionHandler`), `PPCMtdec`, `OSRegisterShutdownFunction` (kept for when shutdown is native), `OSRegisterVersion` (the version string, to stderr) and `PPCHalt`.
 - `threads.cpp`: `SelectThread`, `OSSetCurrentContext`, `OSInitContext`, `OSLoadContext`.
@@ -106,8 +131,8 @@ It prints every low-memory word `OSInit` and `__start` read (arenas, clocks, con
 
 ## Where bring-up stands
 
-`main` runs: the game's init (VI, the console settings, the video mode), its file manager (`DVDInit`, the language), and its graphics manager, whose constructor calls `GXInit`. That is the next stop.
+`main` runs its whole start-up: the video mode, the file manager, the graphics manager (`GXInit` with the SDK's defaults, the display copy set up, the first frame copied out, `VIConfigure`, the first retraces), NW4R's 3D and layout libraries, the controller manager (WPAD, KPAD), and the Home Button Menu's manager, which loads its files from the disc. It stops at `AICheckInit`, where the Home Button Menu starts its sound.
 
-**Not exercised yet:** the game reaches `GXInit` before it opens a file, sleeps, sets an alarm or creates a thread (`qilin_run` reports 0 of each). So the thread switch, interrupt delivery, alarms and the DVD reads are built and wired in, and compile warning-free on every target, but no run has gone through them. The first frames after GX will.
+**Exercised now** (v0.14.0's run): 5 files opened and 863,689 bytes read through asynchronous DVD reads, 17 interrupts (5 from the decrementer, through the lifted alarm code and `OSSleepTicks`; the rest retraces and DVD completions), 7 retraces, 1 frame copied out. Still not exercised: a switch between two threads (only one thread has slept and woken yet) and any draw.
 
-Next: **GX** (roadmap step 4). GX is the largest replaced library (181 functions, 111 of them called from lifted code), and lifted code also writes the GX FIFO directly (322 stores in 12 functions). Its CPU side (the state the setters build, the command stream the FIFO and display lists carry) is needed whatever draws it; the Vulkan renderer comes on top.
+Next: **audio** (AI, AX, DSP). NW4R's sound system (lifted) runs from AX's audio-frame callback, so AX is also the clock the game's rhythm timing follows, and it has to run at the console's rate from the start, sounding or not. Then the Vulkan renderer for GX, once the game draws.
