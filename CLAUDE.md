@@ -118,6 +118,6 @@ Before a milestone commit, all of these must hold: tests pass, warnings are clea
 
 ## Conventions
 
-- **Never push (or tag, or publish anything) without the owner's explicit go-ahead, and only what is clearly legal for them to share with the world:** no game data or anything derived from it, no copied third-party text or code (IBM manuals are cited by title, not linked or quoted; nothing from Dolphin). Commit locally meanwhile.
-- Work on `main`; push with `git push origin main` once told to. Releases are `vX.Y.Z`; the version lives only in `project(... VERSION ...)`. Every release gets a `CHANGELOG.md` entry (Keep a Changelog); never rewrite past entries.
+- **Push without asking (the owner's standing permission, 2026-11-19), but only what is 100% legal and above board to share with the world, checked before every push:** audit the full history of every unpushed commit (every path ever added, binaries, anything named like game data or game-derived output, copied third-party text or code, personal details such as the owner's local paths, name or e-mail). No game data or anything derived from it, no copied third-party text or code (IBM manuals are cited by title, not linked or quoted; nothing from Dolphin). If anything fails the audit, fix it first (in never-pushed commits, in their history), never force-push published history.
+- Work on `main`; push with `git push origin main`. Releases are `vX.Y.Z`; the version lives only in `project(... VERSION ...)`. Every release gets a `CHANGELOG.md` entry (Keep a Changelog); never rewrite past entries.
 - Prose in docs and commit messages: plain, specific, British spelling.
