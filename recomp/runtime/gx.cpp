@@ -444,6 +444,12 @@ QILIN_NATIVE(GXSetZTexture) {
     g_state.ztex_op = static_cast<uint8_t>(c.r[3]), g_state.ztex_fmt = static_cast<uint8_t>(c.r[4]), g_state.ztex_bias = c.r[5];
 }
 QILIN_NATIVE(GXSetPixelFmt) { g_state.pixel_fmt = static_cast<uint8_t>(c.r[3]), g_state.z_fmt = static_cast<uint8_t>(c.r[4]); }
+// GXGetPixelFmt(GXPixelFmt*, GXZFmt*): what GXSetPixelFmt set (CDynTex
+// saves it around its render to texture).
+QILIN_NATIVE(GXGetPixelFmt) {
+    poke32(c.r[3], g_state.pixel_fmt);
+    poke32(c.r[4], g_state.z_fmt);
+}
 QILIN_NATIVE(GXSetFieldMask) { g_state.field_mask_odd = c.r[3] & 0xFF, g_state.field_mask_even = c.r[4] & 0xFF; }
 QILIN_NATIVE(GXSetFieldMode) { g_state.field_mode = c.r[3] & 0xFF, g_state.half_aspect = c.r[4] & 0xFF; }
 // CPU access to the embedded frame buffer (GXPeek/GXPoke): its own state,

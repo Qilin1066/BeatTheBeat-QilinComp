@@ -187,6 +187,28 @@ QILIN_NATIVE(WPADSendStreamData) {
 QILIN_NATIVE(WPADGetSpeakerVolume) { c.r[3] = g_speaker_volume[0]; }
 QILIN_NATIVE(WPADSetSpeakerVolume) { g_speaker_volume[0] = static_cast<uint8_t>(c.r[3]); }
 
+// WPADGetInfoAsync(chan, WPADInfo*, callback): the remote's state, as the
+// Home Button menu reads it (24-byte records, the battery at +20): five
+// 4-byte flags (pointer on, speaker on, attachment, low battery, nearly
+// empty), then the battery level (0-4), LEDs, protocol and firmware bytes.
+// The virtual remote has a full battery and player 1's LED. The callback
+// gets (chan, result) when the remote has answered.
+QILIN_NATIVE(WPADGetInfoAsync) {
+    const uint32_t ch = channel(c), info = c.r[4], cb = c.r[5];
+    if (!wpad.connected[ch]) {
+        c.r[3] = static_cast<uint32_t>(kErrNoController);
+        return;
+    }
+    poke32(info + 0, wpad.dpd[ch] ? 1 : 0);
+    poke32(info + 4, g_speaker_on[ch] ? 1 : 0);
+    poke32(info + 8, 0), poke32(info + 12, 0), poke32(info + 16, 0);
+    poke8(info + 20, 4);
+    poke8(info + 21, uint8_t(1u << ch));
+    poke8(info + 22, 0), poke8(info + 23, 0);
+    if (cb) post_interrupt([ch, cb](Context& ctx) { call_back(ctx, cb, ch, 0); }, kIoLatency);
+    c.r[3] = 0;
+}
+
 QILIN_NATIVE(WPADIsDpdEnabled) { c.r[3] = wpad.dpd[channel(c)] ? 1 : 0; }
 // WPADControlDpd(chan, command, callback): the pointer camera on (non-zero)
 // or off; the callback gets (chan, result) when the remote has done it.

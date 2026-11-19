@@ -60,7 +60,7 @@ When it stops, `qilin_run` says what it has done so far (thread switches, thread
 
 Agreed with the owner on 2026-11-18: the OS's software is lifted, and only what is under it is native.
 
-- **Lifted units** (`kLiftUnits`): `OSThread.c`, `OSMutex.c`, `OSMessage.c`, `OSTime.c`, `OSAlarm.c`. None has a privileged instruction. The SDK's own code decides which thread runs and when an alarm fires, with its priorities and queues exactly. From `OSContext.c`, `OSClearContext`, `OSGetCurrentContext` and `OSGetStackPointer` are lifted too.
+- **Lifted units** (`kLiftUnits`): `OSThread.c`, `OSMutex.c`, `OSMessage.c`, `OSTime.c`, `OSAlarm.c`, `OSAlloc.c` (the OS heap allocator, lists in arena memory). None has a privileged instruction. The SDK's own code decides which thread runs and when an alarm fires, with its priorities and queues exactly. From `OSContext.c`, `OSClearContext`, `OSGetCurrentContext` and `OSGetStackPointer` are lifted too.
 - **`SelectThread` is native** (`recomp/runtime/threads.cpp`), following the build's own code step by step: run queues, the bitmask of non-empty queues, the reschedule flag, the switch callback, the idle context. Lifted, its idle loop would spin forever, waiting in a loop with no call in it for an interrupt to make a thread ready. Only its context save and load differ: each guest thread runs on its own host thread, which keeps the guest registers in its own `rt::Context`, and a switch hands a run token to the next thread's host thread and waits for its own turn. One guest thread runs at a time, as on the Wii's single core. Host threads rather than fibres or stack switching, to keep the runtime free of platform assembly.
 - **Its globals come from its own instructions** at start-up (eight D-form instructions at known offsets: the small-data offsets from `r13` and two `lis`/`addi` pairs). If they aren't where the supported build has them, `qilin_run` refuses to start.
 - **A new thread** starts on its own host thread the first time it is chosen, with the registers `OSCreateThread` left in its context and the interrupt enable its saved MSR gives it, at its entry point; when the entry returns, it goes on into `OSExitThread`, as the link register `OSCreateThread` set sends it. A thread that has exited ends its host thread when it switches away. `OSInitContext` is native so that a thread structure reused for a new thread retires the host thread still waiting on the old one.
@@ -127,6 +127,16 @@ GX is replaced at its API, as the roadmap says: its own code drives the GPU's re
 - **Audio:** what AI plays goes to the default output device at 32 kHz through an SDL audio stream; more than 100 ms queued drops a frame (counted), so latency stays bounded.
 - **Keyboard as the Wii Remote** (held upright): A = X or Space, B = Z or Left Shift, 1, 2, + = Enter, − = Backspace, Home = H, the D-pad = arrows. A remote is connected whenever there is a window (or a `QILIN_INPUT` script); the two add up.
 - **First run** (GTX 1080 Ti, Windows): 60 s windowed with A pressed from 24 s: 3,581 frames presented, the title's music and voices through the speakers, no stop.
+
+## The runtime's to-do list from its own lift (after v0.15.0)
+
+Lifted code reaches a replaced function only through its generated stub (`fn_ADDR` calling `rt::native`), so `gen-rt` lists exactly which replaced functions the game can call: 260. Of those, 40 had no native code (each would stop when first reached); now:
+
+- **Native:** NAND's asynchronous read, seek, length, safe close and private create (the synchronous work, the result through the callback as an interrupt), `NANDPrivateOpen`, `NANDDelete`; `OSPanic` (prints its file, line and format, stops); `OSReturnToMenu`, `OSReturnToDataManager`, `OSRestart`, `OSShutdownSystem` (no system to go to: the run ends, status 0); `__DVDTestAlarm` (the native DVD sets no OS alarms); `GXGetPixelFmt`; MetroTRK's `__write_file` (MSL's console text, to stderr); `WPADGetInfoAsync` (layout from the Home Button menu's reads: five 4-byte flags, battery +20, LEDs, protocol, firmware; a full battery).
+- **Lifted:** `OSAlloc.c`.
+- **Left, each stopping when reached:** display-list recording (`GXBeginDisplayList`/`GXEndDisplayList`), the system font (`OSGetFontTexture`/`OSGetFontWidth`: the console's ROM font, which the runtime doesn't have), `VIGetNextField`, the balance board (`WBC*`, `WPADControlBLC`), MotionPlus (`WPADiControlMpls`, `WPADiGetMplsCalibration`), remote pairing (`WPAD*SimpleSync*`, `WPADSaveConfig`).
+
+`QILIN_FRAME_STATS=N` reads back every Nth frame's EFB rectangle and prints numbers only (coverage, mean colour, colour buckets), to tell drawn frames from empty ones without looking: the health screen, the title and the screen after A at the title all come out fully covered and detailed.
 
 ## Input: a scripted remote (`recomp/runtime/input.*`, after v0.15.0)
 

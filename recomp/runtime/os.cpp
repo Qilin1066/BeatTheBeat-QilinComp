@@ -175,6 +175,36 @@ QILIN_NATIVE(WriteUARTN) {
     c.r[3] = 0;
 }
 
+// MetroTRK's console write (mslsupp.c), which MSL's __TRK_write_console
+// calls as __write_file(handle 1, buffer, size_t* count, idle): the debugger
+// is dropped, so the text goes where the UART's does. Returns __no_io_error.
+QILIN_NATIVE(__write_file) {
+    const uint32_t buf = c.r[4], n = peek32(c.r[5]);
+    for (uint32_t i = 0; i < n; ++i) std::fputc(static_cast<char>(peek8(buf + i)), stderr);
+    c.r[3] = 0;
+}
+
+// ---- the game ending itself ----
+// OSPanic(file, line, format, ...): the SDK prints and halts. The format is
+// shown as written (its arguments aren't formatted), with where it came
+// from, and the run stops.
+QILIN_NATIVE(OSPanic) {
+    std::fprintf(stderr, "qilin_run: OSPanic in %s line %u: %s\n", reinterpret_cast<const char*>(g_mem + c.r[3]), c.r[4],
+                 reinterpret_cast<const char*>(g_mem + c.r[5]));
+    throw Stop{Stop::Trap, c.lr - 4, c.r[4]};
+}
+// Leaving the game: to the Wii Menu, the Data Management screen, a restart,
+// or off. There is no system to go to, so the run ends (status 0), as when
+// the game ends itself.
+[[noreturn]] void leave(const char* where) {
+    std::fprintf(stderr, "qilin_run: the game %s: the run ends\n", where);
+    throw Exit{0};
+}
+QILIN_NATIVE(OSReturnToMenu) { leave("returns to the Wii Menu"); }
+QILIN_NATIVE(OSReturnToDataManager) { leave("returns to Data Management"); }
+QILIN_NATIVE(OSRestart) { leave("restarts"); }
+QILIN_NATIVE(OSShutdownSystem) { leave("turns the console off"); }
+
 // ---- reports ----
 // OSRegisterVersion(const char* id) reports the library's version string.
 QILIN_NATIVE(OSRegisterVersion) {

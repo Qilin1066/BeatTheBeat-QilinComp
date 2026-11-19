@@ -66,7 +66,8 @@ namespace {
     X(vkCmdBeginRendering) X(vkCmdEndRendering) X(vkCmdBindPipeline) X(vkCmdBindDescriptorSets)                     \
     X(vkCmdBindVertexBuffers) X(vkCmdDraw) X(vkCmdSetViewport) X(vkCmdSetScissor) X(vkCmdSetCullMode)               \
     X(vkCmdSetFrontFace) X(vkCmdSetDepthTestEnable) X(vkCmdSetDepthWriteEnable) X(vkCmdSetDepthCompareOp)           \
-    X(vkCmdBlitImage) X(vkCmdCopyBufferToImage) X(vkCmdClearAttachments) X(vkCmdClearColorImage) X(vkCmdPushConstants)
+    X(vkCmdBlitImage) X(vkCmdCopyBufferToImage) X(vkCmdClearAttachments) X(vkCmdClearColorImage) X(vkCmdPushConstants)    \
+    X(vkCmdCopyImageToBuffer)
 
 PFN_vkGetInstanceProcAddr vkGetInstanceProcAddr = nullptr;
 #define QILIN_VK_DECLARE(f) PFN_##f f = nullptr;
@@ -141,7 +142,7 @@ struct Frame {
     VkFence fence = VK_NULL_HANDLE;
     VkSemaphore acquired = VK_NULL_HANDLE;
     VkDescriptorPool pool = VK_NULL_HANDLE;
-    Buffer vtx, ubo, upload;
+    Buffer vtx, ubo, upload, readback;
     VkDeviceSize vtx_used = 0, ubo_used = 0, upload_used = 0;
     uint32_t sets = 0;
 };
@@ -1226,6 +1227,24 @@ void Renderer::copy_display(const State& s, uint32_t, bool clear) {
                        &blit, VK_FILTER_LINEAR);
         transition(cb, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_IMAGE_ASPECT_COLOR_BIT);
     }
+    // QILIN_FRAME_STATS=N: every Nth frame's EFB rectangle read back and
+    // summed up (numbers only), to tell a drawn frame from an empty one
+    // without looking at it.
+    static const uint32_t stats_every = [] {
+        const char* v = std::getenv("QILIN_FRAME_STATS");
+        return v ? static_cast<uint32_t>(std::strtoul(v, nullptr, 10)) : 0u;
+    }();
+    const uint32_t rw = std::min<uint32_t>(s.disp_src[2], kEfbWidth - std::min<uint32_t>(s.disp_src[0], kEfbWidth));
+    const uint32_t rh = std::min<uint32_t>(s.disp_src[3], kEfbHeight - std::min<uint32_t>(s.disp_src[1], kEfbHeight));
+    const bool sample = stats_every && g.frame_number % stats_every == 0 && rw && rh;
+    if (sample) {
+        transition(cb, g.efb_color, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
+        VkBufferImageCopy region{};
+        region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        region.imageOffset = {int32_t(s.disp_src[0]), int32_t(s.disp_src[1]), 0};
+        region.imageExtent = {rw, rh, 1};
+        vkCmdCopyImageToBuffer(cb, g.efb_color.img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, f.readback.buf, 1, &region);
+    }
     if (clear) clear_efb(s, s.disp_src);
     vk_check(vkEndCommandBuffer(cb), "vkEndCommandBuffer");
     VkCommandBufferSubmitInfo cbi = vk_struct<VkCommandBufferSubmitInfo>(VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO);
@@ -1250,6 +1269,23 @@ void Renderer::copy_display(const State& s, uint32_t, bool clear) {
         if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) g.resized = true;
         else vk_check(r, "vkQueuePresentKHR");
         ++stats().frames_presented;
+    }
+    if (sample) {
+        vk_check(vkWaitForFences(g.device, 1, &f.fence, VK_TRUE, UINT64_MAX), "vkWaitForFences");
+        uint64_t lit = 0, sum[3] = {};
+        uint8_t seen[4096] = {};
+        uint32_t colours = 0;
+        for (uint32_t i = 0; i < rw * rh; ++i) {
+            const uint8_t* p = f.readback.map + 4 * size_t(i);
+            if (p[0] | p[1] | p[2]) ++lit;
+            for (unsigned k = 0; k < 3; ++k) sum[k] += p[k];
+            const uint32_t bucket = uint32_t(p[0] >> 4) << 8 | uint32_t(p[1] >> 4) << 4 | uint32_t(p[2] >> 4);
+            if (!seen[bucket]) seen[bucket] = 1, ++colours;
+        }
+        const double n = double(rw) * rh;
+        std::fprintf(stderr, "qilin_run: frame %llu: %ux%u, %.1f%% not black, mean colour %.0f %.0f %.0f, %u colour buckets\n",
+                     static_cast<unsigned long long>(g.frame_number), rw, rh, 100.0 * double(lit) / n, double(sum[0]) / n,
+                     double(sum[1]) / n, double(sum[2]) / n, colours);
     }
     g.frame = (g.frame + 1) % kFrames;
     ++g.frame_number;
@@ -1345,6 +1381,7 @@ bool create_resources() {
         f.vtx = make_buffer(kVertexBytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
         f.ubo = make_buffer(kUniformBytes, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
         f.upload = make_buffer(kUploadBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+        f.readback = make_buffer(VkDeviceSize(kEfbWidth) * kEfbHeight * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
     }
     g.efb_color = make_image(kEfbWidth, kEfbHeight, kEfbColor,
                              VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |

@@ -157,6 +157,8 @@ constexpr std::string_view kLiftAnyway[] = {
 constexpr std::string_view kLiftUnits[] = {
     "revolution/os/OSThread.c",
     "revolution/os/OSMutex.c",
+    // The OS's heap allocator: lists in arena memory, no hardware.
+    "revolution/os/OSAlloc.c",
     "revolution/os/OSMessage.c",
     // The time base (mftb, which lifted code reads) and conversions of it.
     "revolution/os/OSTime.c",

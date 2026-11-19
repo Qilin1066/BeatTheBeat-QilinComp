@@ -295,6 +295,35 @@ QILIN_NATIVE(NANDPrivateSafeOpenAsync) {
     c.r[3] = static_cast<uint32_t>(kOk);
 }
 
+// The other asynchronous requests: the synchronous call's work and result
+// (arguments first, then callback and block), through the callback. The
+// Mii library (RFL) reads its database this way.
+template <void (*Sync)(Context&)>
+void async_of(Context& c, unsigned callback_reg) {
+    const uint32_t callback = c.r[callback_reg], block = c.r[callback_reg + 1];
+    Sync(c);
+    complete(callback, static_cast<int32_t>(c.r[3]), block);
+    c.r[3] = static_cast<uint32_t>(kOk);
+}
+QILIN_NATIVE(NANDReadAsync) { async_of<qilin_native_NANDRead>(c, 6); }            // (info, buffer, length, cb, block)
+QILIN_NATIVE(NANDSeekAsync) { async_of<qilin_native_NANDSeek>(c, 6); }            // (info, offset, whence, cb, block)
+QILIN_NATIVE(NANDGetLengthAsync) { async_of<qilin_native_NANDGetLength>(c, 5); }  // (info, u32* length, cb, block)
+// A safe close commits a copy written in /tmp; files are only safe-opened for
+// reading here (NANDPrivateSafeOpenAsync), so it's a close.
+QILIN_NATIVE(NANDSafeCloseAsync) { async_of<qilin_native_NANDClose>(c, 4); }  // (info, cb, block)
+// "Private" versions take any path in the flash, not only the title's.
+QILIN_NATIVE(NANDPrivateOpen) { qilin_native_NANDOpen(c); }
+QILIN_NATIVE(NANDPrivateCreateAsync) { async_of<qilin_native_NANDCreate>(c, 6); }  // (path, perm, attr, cb, block)
+// NANDDelete(path): a file, or a directory with what's in it; NOEXISTS if
+// it isn't there.
+QILIN_NATIVE(NANDDelete) {
+    const std::filesystem::path p = host_path(c, guest_string(c.r[3]));
+    std::error_code ec;
+    if (p.empty()) c.r[3] = static_cast<uint32_t>(kInvalid);
+    else if (!std::filesystem::exists(p, ec)) c.r[3] = static_cast<uint32_t>(kNoExists);
+    else c.r[3] = static_cast<uint32_t>(std::filesystem::remove_all(p, ec) && !ec ? kOk : kAccess);
+}
+
 // NANDGetType(path, u8* type): file 1, directory 2; NOEXISTS if neither.
 QILIN_NATIVE(NANDGetType) {
     const std::filesystem::path p = host_path(c, guest_string(c.r[3]));

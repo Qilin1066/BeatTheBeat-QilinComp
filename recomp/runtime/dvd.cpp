@@ -165,6 +165,11 @@ void cancel(uint32_t block) {
     if (g_pending.contains(block)) g_cancelled.insert(block);
 }
 
+// __DVDTestAlarm(alarm): whether an OS alarm is one of DVD's own (OSAlarm's
+// reset handling leaves those alone). The native DVD sets no OS alarms, so
+// none is.
+QILIN_NATIVE(__DVDTestAlarm) { c.r[3] = 0; }
+
 QILIN_NATIVE(DVDInit) {
     if (!disc.open) no_disc(c.lr - 4);
 }

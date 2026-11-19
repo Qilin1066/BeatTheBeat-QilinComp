@@ -18,6 +18,9 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 - **A window, the Vulkan renderer, sound and the keyboard** (`host.cpp`, `gx_vulkan.cpp`, `gx_texture.cpp`, `shaders/`): `qilin_run` opens a window and draws GX with Vulkan 1.3 (GX's transform and lighting on the CPU, the TEV in one fragment shader, GX's texture formats decoded and cached), plays AI's output on the default audio device and takes the keyboard as a Wii Remote. SDL3, Khronos' Vulkan headers and glslang are fetched at configure time, pinned by hash, never committed. `QILIN_HEADLESS=1` (or `-DQILIN_HEADLESS_ONLY=ON`) runs as before. Unsupported GX features stop with a message.
 - **More of GX on Vulkan:** copies from the EFB to textures (with the copy formats' conversions), mipmaps with the texture object's filters, LOD range and bias (layout read from the SDK's `GXInitTexObjLOD`), lines and points, fog, manual texture-coordinate scaling; Z textures now stop instead of being ignored.
 
+- **The runtime's to-do list from its own lift:** of the 260 replaced functions the game's code can call, 40 had no native code; NAND's asynchronous calls, `NANDPrivateOpen`, `NANDDelete`, `OSPanic`, the OS's exits, `__DVDTestAlarm`, `GXGetPixelFmt`, `__write_file` and `WPADGetInfoAsync` now do, and `OSAlloc.c` is lifted. What's left (display-list recording, the ROM font, the balance board, MotionPlus, pairing) stops when reached.
+- **`QILIN_FRAME_STATS=N`:** numbers about every Nth frame (coverage, mean colour), to tell drawn frames from empty ones without looking.
+
 ### Changed
 - **One dependency fewer:** the shaders' SPIR-V is committed beside their GLSL with a hash stamp the configure checks; glslang is fetched only with `-DQILIN_BUILD_SHADERS=ON`. A default build needs SDL3 and the Vulkan headers.
 
