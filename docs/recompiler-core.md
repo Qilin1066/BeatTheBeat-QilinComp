@@ -186,7 +186,7 @@ The many trials that end in a memory fault come from random pointers; better-sha
 ### Lifter changes for the runtime (v0.14.0, v0.15.0)
 - **FIFO stores:** stores `hwaccess` finds on the GX write-gather pipe become `rt::fifo_st8/16/32` (`stfs` through its conversion, `psq_st` as `rt::fifo_psq_st`); others stay memory stores. `hwaccess` keeps callee-saved registers' constants across calls (v0.15.0).
 - **Loop polls:** every backward branch gets `if (rt::poll_due()) [[unlikely]] { c.r[1] = r1; rt::poll(c); }`, a safe point for interrupts (`runtime.md`). In the differential test `rt::poll` does nothing.
-- **Estimates:** `frsqrte` and `fres` lift through `rt::frsqrte`/`rt::fres`: exact for zeros, infinities, NaNs and negative square roots; anything needing Broadway's table stops (`fp_unknown`). `ps_res` and `ps_rsqrte` stay unsupported (no lifted code uses them).
+- **Estimates:** `frsqrte` and `fres` lift through `rt::frsqrte`/`rt::fres`: exact for zeros, infinities, NaNs and negative square roots; anything needing Broadway's table stops (`fp_unknown`) in the difftest's build; the game's runtime build defines `QILIN_APPROX_ESTIMATES` (the owner's decision: no console to measure the table on) and gives the exact result rounded to 12 fraction bits, within the 750CL manual's 1/4096, marked APPROX. `ps_res` and `ps_rsqrte` stay unsupported (no lifted code uses them).
 
 ## Next
 1. The runtime (`runtime.md`): the game runs to its title (v0.15.0); next GX on Vulkan, the mixer, input.

@@ -912,6 +912,15 @@ void test_estimates() {
         stopped = s.kind == rt::Stop::Unsupported && s.pc == 0x80001238u;
     }
     CHECK(stopped);
+    // The runtime's approximation (QILIN_APPROX_ESTIMATES): 12 fraction bits,
+    // rounded to nearest, so within IBM's stated 1/4096 relative accuracy.
+    CHECK(bits(rt::estimate_12(1.0)) == bits(1.0));
+    CHECK((bits(rt::estimate_12(1.0 / 3.0)) & ((1ull << 40) - 1)) == 0);
+    CHECK(rt::estimate_12(2.0 - 0x1p-20) == 2.0);  // rounding carries into the exponent
+    for (double x = 0.01; x < 1000.0; x *= 1.37) {
+        const double exact = 1.0 / std::sqrt(x), e = rt::estimate_12(exact);
+        CHECK(std::fabs(e - exact) / exact <= 1.0 / 4096.0);
+    }
 }
 
 // ---------------------------------------------------------------- library plan

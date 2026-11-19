@@ -141,7 +141,9 @@ if(QILIN_RUNTIME_GEN_DIR)
     file(GLOB QILIN_RUNTIME_GEN_SOURCES CONFIGURE_DEPENDS "${QILIN_RUNTIME_GEN_DIR}/*.cpp")
     add_library(qilin_gen_runtime STATIC ${QILIN_RUNTIME_GEN_SOURCES} recomp/runtime/dispatch.cpp recomp/runtime/timebase.cpp)
     target_include_directories(qilin_gen_runtime PUBLIC "${QILIN_RUNTIME_GEN_DIR}")
-    target_compile_definitions(qilin_gen_runtime PUBLIC QILIN_CHECKED_MEMORY)
+    # QILIN_APPROX_ESTIMATES: frsqrte/fres approximated where Broadway's table
+    # is needed (guest.hpp); the difftest's build keeps stopping there.
+    target_compile_definitions(qilin_gen_runtime PUBLIC QILIN_CHECKED_MEMORY QILIN_APPROX_ESTIMATES)
     target_link_libraries(qilin_gen_runtime PUBLIC qilin_runtime PRIVATE qilin_warnings)
     if(MSVC)
         target_compile_options(qilin_gen_runtime PRIVATE /wd4702)  # as for qilin_gen_checked

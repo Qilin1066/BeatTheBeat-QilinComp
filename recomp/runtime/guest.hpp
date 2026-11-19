@@ -344,25 +344,44 @@ inline double fctiwz(double b) {
 }
 
 // The estimates (frsqrte, fres): Broadway reads them from tables no source
-// here pins down, so lifted code stops on any input that needs the table.
-// The architecture defines the rest exactly: a NaN stays a NaN (quietened),
-// a zero gives an infinity of its sign, an infinity gives a zero, and a
+// here pins down (the owner has no console to measure them on). The
+// architecture defines the rest exactly: a NaN stays a NaN (quietened), a
+// zero gives an infinity of its sign, an infinity gives a zero, and a
 // negative number's square root is the default NaN. Under non-IEEE mode a
 // denormal input counts as a zero of its sign.
-inline double frsqrte(double b, uint32_t pc) {
+//
+// Where the table is needed: the differential test stops (fp_unknown), so it
+// never compares a guess. The game's runtime build defines
+// QILIN_APPROX_ESTIMATES (the owner's decision, 2026-11-19): APPROX, the
+// exact result rounded to 12 fraction bits, within the 1/4096 relative
+// accuracy IBM's 750CL manual states for both. Callers refine with Newton
+// steps, so results are right but for the last bits.
+inline double estimate_12(double r) {  // round to nearest at 12 fraction bits
+    constexpr uint64_t kDrop = 52 - 12;
+    return dbl((bits(r) + (1ull << (kDrop - 1))) & ~((1ull << kDrop) - 1));
+}
+inline double frsqrte(double b, [[maybe_unused]] uint32_t pc) {
     if (std::isnan(b)) return quiet(b);
     const double x = ni_d(b);
     if (x == 0.0) return std::copysign(HUGE_VAL, x);
     if (x < 0.0) return dbl(0x7FF8000000000000ull);
     if (std::isinf(x)) return 0.0;
+#ifdef QILIN_APPROX_ESTIMATES
+    return estimate_12(1.0 / std::sqrt(x));
+#else
     fp_unknown(pc);
+#endif
 }
-inline double fres(double b, uint32_t pc) {  // single precision
+inline double fres(double b, [[maybe_unused]] uint32_t pc) {  // single precision
     if (std::isnan(b)) return single_nan(quiet(b));
     const double x = ni_s(b);
     if (x == 0.0) return std::copysign(HUGE_VAL, x);
     if (std::isinf(x)) return std::copysign(0.0, x);
+#ifdef QILIN_APPROX_ESTIMATES
+    return ni_s(to_single(estimate_12(1.0 / x)));
+#else
     fp_unknown(pc);
+#endif
 }
 
 // fcmpu/fcmpo: the CR field (FL, FG, FE, FU). FPSCR's FPCC and VX bits aren't kept.
