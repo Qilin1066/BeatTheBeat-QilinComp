@@ -84,6 +84,8 @@ bool bind_natives() {
 
 size_t natives_bound() { return g_bound; }
 
+NativeGuard g_native_guard = nullptr;
+
 void native(Context& c, uint32_t index) {
     const Fn fn = g_slots[index];
     if (!fn) throw Stop{Stop::Unregistered, g_natives[index].addr, c.lr};
@@ -93,6 +95,7 @@ void native(Context& c, uint32_t index) {
     // the audio clock (an interrupt every 3 ms) from missing frames while a
     // thread is busy.
     deliver_due(c);
+    if (g_native_guard) g_native_guard(c, g_natives[index]);
     fn(c);
     c.ret = c.lr;  // as the function's blr
 }

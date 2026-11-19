@@ -1487,6 +1487,36 @@ void Renderer::draw(const State& s, const Draw& d) {
     vkCmdDraw(cb, static_cast<uint32_t>(order.size()), 1, 0, 0);
 }
 
+// A frame (RGBA rows, top first) as a 24-bit BMP (bottom-up BGR rows, each
+// padded to 4 bytes). A file that can't be written stops: the run asked.
+void write_bmp(const char* dir, uint64_t number, const uint8_t* rgba, uint32_t w, uint32_t h) {
+    char path[1024];
+    std::snprintf(path, sizeof path, "%s/frame_%06llu.bmp", dir, static_cast<unsigned long long>(number));
+    std::FILE* out = std::fopen(path, "wb");
+    if (!out) {
+        std::fprintf(stderr, "qilin_run: QILIN_FRAME_DUMP: can't write %s\n", path);
+        throw Stop{Stop::Unsupported, 0, 0};
+    }
+    const uint32_t row = (w * 3 + 3) & ~3u, image = row * h;
+    uint8_t header[54] = {'B', 'M'};
+    auto put32 = [&](unsigned at, uint32_t v) {
+        for (unsigned i = 0; i < 4; ++i) header[at + i] = uint8_t(v >> (8 * i));
+    };
+    put32(2, 54 + image), put32(10, 54), put32(14, 40), put32(18, w), put32(22, h);
+    header[26] = 1, header[28] = 24;
+    put32(34, image);
+    std::fwrite(header, 1, sizeof header, out);
+    std::vector<uint8_t> line(row, 0);
+    for (uint32_t y = h; y-- > 0;) {
+        for (uint32_t x = 0; x < w; ++x) {
+            const uint8_t* p = rgba + 4 * (size_t(y) * w + x);
+            line[3 * x] = p[2], line[3 * x + 1] = p[1], line[3 * x + 2] = p[0];
+        }
+        std::fwrite(line.data(), 1, row, out);
+    }
+    std::fclose(out);
+}
+
 // The picture's place in the window, as the settings say: whole multiples
 // of the console's picture (854x480 at 16:9, 640x480 at 4:3; the sharpest),
 // the largest that keeps its shape, or the whole window.
@@ -1616,9 +1646,16 @@ void Renderer::copy_display(const State& s, uint32_t, bool clear) {
         // QILIN_FRAME_STATS=N: every Nth frame's picture read back and summed
         // up (numbers only), to tell a drawn frame from an empty one without
         // looking at it.
+        // QILIN_FRAME_DUMP=<folder>: those frames written there too, as
+        // frame_<n>.bmp (every 60th without QILIN_FRAME_STATS), to see a
+        // scripted or hidden run's picture afterwards.
+        static const char* dump_dir = [] {
+            const char* v = std::getenv("QILIN_FRAME_DUMP");
+            return v && *v ? v : nullptr;
+        }();
         static const uint32_t stats_every = [] {
             const char* v = std::getenv("QILIN_FRAME_STATS");
-            return v ? static_cast<uint32_t>(std::strtoul(v, nullptr, 10)) : 0u;
+            return v ? static_cast<uint32_t>(std::strtoul(v, nullptr, 10)) : dump_dir ? 60u : 0u;
         }();
         const bool sample = stats_every && g.frame_number % stats_every == 0;
         if (sample) {
@@ -1646,6 +1683,7 @@ void Renderer::copy_display(const State& s, uint32_t, bool clear) {
             std::fprintf(stderr, "qilin_run: frame %llu: %ux%u, %.1f%% not black, mean colour %.0f %.0f %.0f, %u colour buckets\n",
                          static_cast<unsigned long long>(g.frame_number), rw, rh, 100.0 * double(lit) / n, double(sum[0]) / n,
                          double(sum[1]) / n, double(sum[2]) / n, colours);
+            if (dump_dir) write_bmp(dump_dir, g.frame_number, f.readback.map, rw, rh);
         }
         g.frame = (g.frame + 1) % kFrames;
         ++g.frame_number;

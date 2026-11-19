@@ -6,7 +6,9 @@
 // stops: nothing in the game needs one yet, and guessing would draw wrong
 // without a word. Runtime code: no std::format.
 #include <cstdio>
+#include <cstring>
 
+#include "coherence.hpp"
 #include "gx.hpp"
 #include "native.hpp"
 
@@ -62,6 +64,25 @@ struct Stream {
     uint32_t expected = 0;  // bytes
 } g_stream;
 
+// GXBeginDisplayList .. GXEndDisplayList: the command stream goes to guest
+// memory instead of the GPU, as the console's FIFO does when pointed at a
+// buffer. Only draws are recorded (GXBegin and the vertex bytes after it,
+// which is what GXCallDisplayList decodes and all the game records: RFL's
+// Mii models); any other GX call while recording stops (native.cpp asks
+// recording_guard), since it would have to be serialised as well.
+struct Recording {
+    bool on = false;
+    uint32_t start = 0, size = 0, pos = 0;
+} g_rec;
+
+void record8(uint32_t v, uint32_t pc) {
+    if (g_rec.pos >= g_rec.size) {
+        std::fprintf(stderr, "qilin_run: GX: the display list at %08X overflows its %u bytes\n", g_rec.start, g_rec.size);
+        throw Stop{Stop::Unsupported, pc, g_rec.start};
+    }
+    poke8(g_rec.start + g_rec.pos++, static_cast<uint8_t>(v));
+}
+
 void finish(Draw& d) {
     sink().draw(state(), d);
     d.vertices.clear();
@@ -78,8 +99,12 @@ void begin(uint8_t primitive, uint8_t vtxfmt, uint16_t count, uint32_t pc) {
     d.vertex_size = vertex_size(state(), vtxfmt);
     d.vertices.clear();
     g_stream.expected = d.vertex_size * count;
+    if (g_rec.on) {  // the draw command: primitive | format, then the count
+        record8(primitive | vtxfmt, pc);
+        record8(count >> 8, pc), record8(count & 0xFF, pc);
+    }
     if (g_stream.expected == 0) {
-        finish(d);
+        if (!g_rec.on) finish(d);
         return;
     }
     d.vertices.reserve(g_stream.expected);
@@ -99,9 +124,12 @@ void append(uint32_t ea, uint32_t v, unsigned bytes) {
                      d.vertex_size);
         throw Stop{Stop::Unsupported, store_pc(), static_cast<uint32_t>(d.vertices.size())};
     }
+    if (g_rec.on)  // into the list, as the bytes arrive (big-endian, as the pipe writes them)
+        for (unsigned i = bytes; i-- > 0;) record8(v >> (8 * i), store_pc());
     if (d.vertices.size() == g_stream.expected) {
         g_stream.open = false;
-        finish(d);
+        if (g_rec.on) d.vertices.clear();
+        else finish(d);
     }
 }
 
@@ -146,6 +174,51 @@ QILIN_NATIVE(GXBegin) {
         throw Stop{Stop::Unsupported, c.lr - 4, prim};
     }
     begin(static_cast<uint8_t>(prim), static_cast<uint8_t>(vf), static_cast<uint16_t>(c.r[5]), c.lr - 4);
+}
+
+// While recording, the other GX calls stop: they would have to go into the
+// list too, and only draws are recorded yet.
+void recording_guard(Context& c, const NativeEntry& e) {
+    if (std::strcmp(e.library, "gx") != 0 || std::strcmp(e.name, "GXBegin") == 0 || std::strcmp(e.name, "GXEndDisplayList") == 0)
+        return;
+    std::fprintf(stderr, "qilin_run: GX: %s while a display list is recorded (only draws are recorded yet)\n", e.name);
+    throw Stop{Stop::Unsupported, c.lr - 4, e.addr};
+}
+
+// GXBeginDisplayList(list, size): commands go to the list from here.
+QILIN_NATIVE(GXBeginDisplayList) {
+    const uint32_t list = c.r[3], size = c.r[4];
+    if (g_rec.on || g_stream.open) {
+        std::fprintf(stderr, "qilin_run: GX: GXBeginDisplayList inside %s\n", g_rec.on ? "another list" : "a draw");
+        throw Stop{Stop::Unsupported, c.lr - 4, list};
+    }
+    if ((list & 31) || (size & 31) || size == 0) {  // the FIFO writes 32-byte bursts
+        std::fprintf(stderr, "qilin_run: GX: GXBeginDisplayList(%08X, %u) isn't 32-byte aligned\n", list, size);
+        throw Stop{Stop::Unsupported, c.lr - 4, list};
+    }
+    require_guest_range(list, size, c.lr - 4, "GXBeginDisplayList's list");
+    g_rec = {true, list, size, 0};
+    g_native_guard = recording_guard;
+}
+
+// GXEndDisplayList(): the list's length, padded with NOPs (zero bytes) to the
+// FIFO's 32-byte bursts. The bytes are memory the GPU wrote, so caches over
+// them are re-checked (coherence.hpp).
+QILIN_NATIVE(GXEndDisplayList) {
+    if (!g_rec.on) {
+        std::fprintf(stderr, "qilin_run: GX: GXEndDisplayList without GXBeginDisplayList\n");
+        throw Stop{Stop::Unsupported, c.lr - 4, 0};
+    }
+    if (g_stream.open) {
+        std::fprintf(stderr, "qilin_run: GX: GXEndDisplayList inside a draw (%u of its vertex bytes missing)\n",
+                     g_stream.expected - static_cast<uint32_t>(g_stream.draw.vertices.size()));
+        throw Stop{Stop::Unsupported, c.lr - 4, g_rec.start};
+    }
+    while (g_rec.pos & 31) record8(0, c.lr - 4);
+    note_guest_write(g_rec.start, g_rec.pos);
+    g_rec.on = false;
+    g_native_guard = nullptr;
+    c.r[3] = g_rec.pos;
 }
 
 // GXCallDisplayList(list, bytes): its draw commands; NOPs and vertex-cache

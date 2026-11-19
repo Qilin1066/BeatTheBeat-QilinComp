@@ -258,6 +258,47 @@ QILIN_NATIVE(WPADControlMotor) {
 QILIN_NATIVE(WPADEnableMotor) { wpad.motor_enabled = c.r[3] & 0xFF; }
 QILIN_NATIVE(WPADIsMotorEnabled) { c.r[3] = wpad.motor_enabled ? 1 : 0; }
 
+// ---- pairing ("simple sync": the console's SYNC button, the game's screen
+// for adding a remote, the HOME menu) ----
+// WPAD's four calls are tail calls into WUD, the Bluetooth device manager
+// (WUDStartSyncSimple, WUDStartFastSyncSimple, WUDStopSyncSimple,
+// WUDSetSyncSimpleCallback), and these follow WUD's own code for a manager
+// that is ready with no new remote in range: a start succeeds unless a
+// search is already running (__wudStartSyncDevice: 1, or 0 when busy), the
+// search finds nothing and so reports nothing to the callback, and a stop
+// returns 1 if it ended a search, else 0. The host's controllers are
+// connected by the runtime (host.cpp), not by pairing.
+bool g_syncing = false;
+uint32_t g_sync_callback = 0;
+
+void start_sync(Context& c) {
+    c.r[3] = g_syncing ? 0 : 1;
+    g_syncing = true;
+}
+QILIN_NATIVE(WPADStartSimpleSync) { start_sync(c); }
+QILIN_NATIVE(WPADStartFastSimpleSync) { start_sync(c); }
+QILIN_NATIVE(WPADStopSimpleSync) {
+    c.r[3] = g_syncing ? 1 : 0;
+    g_syncing = false;
+}
+QILIN_NATIVE(WPADSetSimpleSyncCallback) {
+    const uint32_t old = g_sync_callback;
+    g_sync_callback = c.r[3];
+    c.r[3] = old;
+}
+
+// WPADSaveConfig(callback): as WPAD's code does it, the remote's speaker
+// volume and rumble setting go into the console's settings (SC), which are
+// written out asynchronously; the callback gets SC's result (0: done) when
+// they are. Here the settings live in the runtime (the HOME menu's rumble
+// switch is WPADEnableMotor's), so the write always succeeds; it returns 1,
+// as WPAD does when both settings were taken. SC busy (SCCheckStatus not 0)
+// can't happen: the runtime's SC is always ready.
+QILIN_NATIVE(WPADSaveConfig) {
+    if (const uint32_t cb = c.r[3]) post_interrupt([cb](Context& ctx) { call_back(ctx, cb, 0, 0); }, kIoLatency);
+    c.r[3] = 1;
+}
+
 // ---- revolution/pad: GameCube controllers. None are plugged in. ----
 QILIN_NATIVE(PADInit) { c.r[3] = 1; }
 // PADRead(PADStatus status[4]): 12 bytes each, the error byte at +10. Every

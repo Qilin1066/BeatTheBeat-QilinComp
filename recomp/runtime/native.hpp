@@ -30,6 +30,10 @@ struct NativeEntry {
 };
 extern const NativeEntry g_natives[];
 extern const size_t g_native_count;
+// Called before every native while set (it throws Stop to refuse one): GX
+// sets it while a display list is recorded (gx_fifo.cpp).
+using NativeGuard = void (*)(Context& c, const NativeEntry& e);
+extern NativeGuard g_native_guard;
 
 // Generated (symbols.cpp): every named function, by address. For reports,
 // and for the few guest functions the runtime calls by name (main).

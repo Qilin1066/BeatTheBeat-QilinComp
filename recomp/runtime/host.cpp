@@ -123,6 +123,17 @@ bool open_audio() {
     return true;
 }
 
+// QILIN_HIDDEN=1: the renderer runs as with a window, but the window isn't
+// shown and nothing is played (scripted runs on a computer someone is
+// using, with QILIN_FRAME_DUMP to see the frames).
+bool hidden() {
+    static const bool h = [] {
+        const char* v = std::getenv("QILIN_HIDDEN");
+        return v && *v && *v != '0';
+    }();
+    return h;
+}
+
 // The window: the largest whole multiple of the picture (640x480 at 4:3,
 // 854x480 at 16:9) that fits nine tenths of the settings' display's usable
 // area, centred on it.
@@ -134,7 +145,8 @@ SDL_Window* open_window() {
     if (SDL_GetDisplayUsableBounds(display, &usable))
         while (width * (scale + 1) <= uint32_t(usable.w) * 9 / 10 && height * (scale + 1) <= uint32_t(usable.h) * 9 / 10) ++scale;
     SDL_WindowFlags flags = SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY;
-    if (settings().fullscreen) flags |= SDL_WINDOW_FULLSCREEN;  // borderless, at the desktop's mode
+    if (hidden()) flags |= SDL_WINDOW_HIDDEN;
+    else if (settings().fullscreen) flags |= SDL_WINDOW_FULLSCREEN;  // borderless, at the desktop's mode
     SDL_Window* w = SDL_CreateWindow(kGameName, int(width * scale), int(height * scale), flags);
     if (w) {
         SDL_SetWindowMinimumSize(w, 160, 120);
@@ -187,7 +199,7 @@ bool run(const std::function<void()>& game) {
         return false;
     }
     if (!gx::init_vulkan(g_window)) return false;
-    open_audio();
+    if (!hidden()) open_audio();
     std::fprintf(stderr,
                  "qilin_run: settings: %s (preset %s, %ux internal resolution, %ux anisotropic filtering)\n"
                  "qilin_run: keys: A = Space, K or X; B = L, Z or Left Shift; 1 = 1 or J; 2 = 2 or I; + = Enter; "
