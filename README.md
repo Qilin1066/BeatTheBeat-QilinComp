@@ -41,6 +41,17 @@ The repository's first version (0.1.0-alpha.1, a Dolphin-based preview, and a na
 
 Releases are tagged `vX.Y.Z` on GitHub, and every release is recorded in [`CHANGELOG.md`](CHANGELOG.md). Past entries are kept, never rewritten. The version lives in one place, `project(... VERSION ...)` in `CMakeLists.txt`, and `qilin --version` prints it. While the recompiler is being built, a minor bump (0.**x**) marks a milestone and a patch bump (0.x.**y**) a fix. 1.0.0 will be the first build that plays the game.
 
+## Installing the game (Windows)
+
+Nothing of the game is in this repository, and a built game can't be shared either: it is compiled from the game's own code. So the installer builds the game on your computer, from your own disc.
+
+1. Extract your disc to a folder (Dolphin: right-click the game, Properties, Filesystem, right-click "Disc", Extract Entire Disc). It must be the European (PAL) *Beat the Beat: Rhythm Paradise*, `SOMP01`.
+2. Double-click **`install.cmd`** and choose that folder.
+
+It checks for the tools it needs (CMake 3.25, Visual Studio 2022 17.10's C++ tools, Python 3.9; if one is missing it gives the `winget` command that installs it), checks the disc, recompiles and builds the game (several minutes, and about 6 GB of space while it builds), and installs it for you only, without administrator rights: a folder under `%LOCALAPPDATA%\Programs`, shortcuts in the Start menu and on the desktop, and an entry in Windows' "Installed apps" whose uninstall removes it again (saves and settings are kept unless asked). The disc folder must stay where it is: the game reads its files from it.
+
+Options (`install.cmd -Option`, or `tools\install\install.ps1`): `-Disc FOLDER`, `-InstallDir FOLDER`, `-Portable` (the folder only: no shortcuts, nothing registered), `-NoDesktop`, `-NoShortcuts`, `-Unchecked` (faster, without the memory checks that name a fault), `-KeepBuild`, `-Jobs N`. On Linux and macOS, build as below for now.
+
 ## Building
 
 The whole project (recompiler, runtime and generated code) is **C++23**. You need CMake ≥ 3.25 and one of:

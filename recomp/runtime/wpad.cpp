@@ -16,6 +16,7 @@
 // checked against how its callers use the result. Runtime code: no
 // std::format.
 #include <cstdio>
+#include <cstdlib>
 
 #include "console.hpp"
 #include "host.hpp"
