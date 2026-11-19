@@ -34,6 +34,7 @@
 
 #include "console.hpp"
 #include "gx.hpp"
+#include "machine.hpp"
 #include "native.hpp"
 
 #include "copy_frag.h"
@@ -625,6 +626,7 @@ uint32_t norm_addr(uint32_t a) { return (a & 0x1FFFFFFFu) | 0x80000000u; }
 struct EfbCopy {
     Image image;
     uint32_t width = 0, height = 0, format = 0;
+    uint32_t guest_bytes = 0;  // the copy's size in guest memory, which guest_hash covers
     uint64_t guest_hash = 0;
 };
 std::unordered_map<uint32_t, EfbCopy> g_copies;
@@ -638,7 +640,8 @@ const Image& texture(const State& s, const TexMap& t) {
     if (!bytes) unsupported("texture format", t.format);
     if (auto it = g_copies.find(norm_addr(t.image)); it != g_copies.end()) {
         EfbCopy& c = it->second;
-        if (c.width == t.width && c.height == t.height && hash_bytes(g_mem + t.image, bytes, 0) == c.guest_hash) return c.image;
+        if (c.width == t.width && c.height == t.height && hash_bytes(g_mem + t.image, c.guest_bytes, 0) == c.guest_hash)
+            return c.image;
         g.garbage.emplace_back(g.frame_number, c.image);  // the CPU rewrote it, or it's read as something else
         g_copies.erase(it);
     }
@@ -760,7 +763,11 @@ void read_vertex(const State& s, const Draw& d, const uint8_t* v, InVertex& out)
         } else {
             const uint32_t index = desc == kIndex8 ? v[off] : be16(v + off);
             off += desc == kIndex8 ? 1 : 2;
-            src = g_mem + s.arrays[a].base + index * s.arrays[a].stride;
+            const uint32_t at = s.arrays[a].base + index * s.arrays[a].stride;
+            const uint32_t n = (a == kClr0 || a == kClr1) ? 4 : 3 * 4;  // at most one element's bytes
+            if (!((at >= kMem1 && at + n <= kMem1 + kMem1Bytes) || (at >= kMem2 && at + n <= kMem2 + kMem2Bytes)))
+                unsupported("an indexed vertex attribute outside MEM1 and MEM2", at);
+            src = g_mem + at;
         }
         const uint32_t cs = (a == kClr0 || a == kClr1) ? 0 : comp_size(f[a].type, a);
         if (a == kPos) {
@@ -832,6 +839,10 @@ void lit_color(const State& s, unsigned which, const InVertex& in, const float v
 }
 
 void transform(const State& s, const InVertex& in, GpuVertex& out) {
+    // A position matrix is three rows of matrix memory (64 rows); its normal
+    // matrix three rows of normal memory (32 rows of three).
+    if (in.pn_idx > 61) unsupported("a position matrix index", in.pn_idx);
+    if (in.has_nrm && size_t(in.pn_idx) * 3 + 9 > s.nrm_mtx.size()) unsupported("a normal matrix index", in.pn_idx);
     const float* pm = &s.mtx[size_t(in.pn_idx) * 4];
     const float p4[4] = {in.pos[0], in.pos[1], in.pos[2], 1.0f};
     float view[3];
@@ -1004,7 +1015,8 @@ void Renderer::copy_texture(const State& s, uint32_t dest, bool clear) {
         c.image = make_image(w, h, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
                              VK_IMAGE_ASPECT_COLOR_BIT);
     c.width = w, c.height = h, c.format = s.tex_dst_format;
-    c.guest_hash = hash_bytes(g_mem + norm_addr(dest), texture_bytes(cf.mem_format, w, h), 0);
+    c.guest_bytes = texture_bytes(cf.mem_format, w, h);
+    c.guest_hash = hash_bytes(g_mem + norm_addr(dest), c.guest_bytes, 0);
 
     transition(f.cb, g.efb_color, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
     transition(f.cb, c.image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);

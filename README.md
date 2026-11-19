@@ -3,10 +3,12 @@
 A static recompilation of **Beat the Beat: Rhythm Paradise** (Nintendo, Wii; *Rhythm Heaven Fever* in North America) into portable C++23 with a Vulkan 1.3 renderer, aimed at 64-bit Windows, Linux and macOS, on x86-64 or ARM64. Anything with a Vulkan 1.3 driver is in scope, including the Raspberry Pi 4 (Mesa 24.3+); every 64-bit Mac with a Metal GPU that runs macOS 10.15 (Catalina) or later, Intel or Apple Silicon, is covered through MoltenVK. Efficiency is the first priority: a Raspberry Pi 4–class board is our reference for typical low-end hardware, not a floor. The requirements and scope are the same as [GBTG-Qilincomp](https://github.com/Qilin1066/GBTGhoulies-Qilincomp)'s.
 
 > **No game data is included, and none ever will be.** You need your own copy of the game: the Europe/Australia release, disc `SOMP01`, revision 0. The tools read `main.dol` and the disc files from a path you give them. `.gitignore` keeps game files, and anything generated from them, out of the repo.
+>
+> This is an independent project, not affiliated with or endorsed by Nintendo. *Rhythm Paradise*, *Rhythm Heaven* and Wii are Nintendo's trademarks.
 
 ## Status
 
-Roadmap step 1, **analysis**, is nearly done; step 2, the **recompiler core**, is in progress: the lifter's integer, floating-point and paired-single slices run, checked against the original code: 8,103 of the game's 8,171 functions lift.
+The recompiler core is done for the game's code: all 8,108 liftable functions lift and match the original under the differential test. The runtime boots the game in a window with Vulkan graphics, sound and keyboard controls, through to its title screen and beyond the first press of A. It is **not playable end to end yet**: the picture is unverified by eye, unsupported GX features stop the run with a message, and rhythm timing isn't measured (`docs/runtime.md` keeps the current list).
 
 | Piece | State |
 |---|---|
@@ -26,8 +28,12 @@ Roadmap step 1, **analysis**, is nearly done; step 2, the **recompiler core**, i
 | Runtime skeleton: `qilin_run`, the registry of native functions, the runtime's own lift (`qilin lift --runtime`) | ✅ starts the game and stops, naming it, at the first replaced function without native code (`docs/runtime.md`) |
 | Runtime: the OS's threads and alarms (lifted, over a native switch and interrupt delivery), DVD over an extracted disc | ✅ run by the game: asynchronous file loads, alarms, retraces |
 | GX's CPU side (state, FIFO vertex stream, display lists), VI's retrace, input start-up | ✅ the game draws every frame (headless: no renderer yet) |
-| Audio clock (AX lifted, AI and DSP native), saves (NAND on a host folder), safe points in lifted loops | 🔨 the game initialises, saves, reaches its title and keeps running at a frame per retrace, the audio clock at the console's rate. Nothing shown or heard yet; no input |
-| Runtime: OS, DVD, NAND, GX on Vulkan, AX audio, input | later (see roadmap) |
+| Audio clock (AX lifted, AI and DSP native), saves (NAND on a host folder), safe points in lifted loops | ✅ the game initialises, saves, reaches its title and keeps running at a frame per retrace, the audio clock at the console's rate |
+| Wii Remote: the keyboard, or a script of timed presses (`QILIN_INPUT`), through WPAD into the game's own KPAD | ✅ presses reach the game's controller code |
+| The DSP mixer: AX's command list (DSP-ADPCM and PCM, resampling, envelopes and ramps, aux effects through AX's callbacks) | ✅ exact where game logic looks; approximations marked; sound on the host's output |
+| GX on Vulkan 1.3: transform and lighting on the CPU, the TEV in one shader, GX's texture formats, mipmaps, copies to textures, fog, lines | 🔨 draws detailed frames (checked by numbers, not yet by eye); some features still stop the run |
+| The SDK API the game's code calls (260 replaced functions) | 🔨 all but 18 natively; the rest stop when reached |
+| Rhythm timing measured against the console, other platforms run, settings | later (see roadmap) |
 
 The repository's first version (0.1.0-alpha.1, a Dolphin-based preview, and a native boot probe on top of DolRecomp) was written with ChatGPT and has been retired. `docs/prior-art.md` §1 says what it did and what carried over.
 
@@ -46,7 +52,7 @@ The whole project (recompiler, runtime and generated code) is **C++23**. You nee
 | Apple Clang | Xcode 16 | |
 | MSVC | Visual Studio 2022 17.10 | |
 
-CMake stops with a clear message if the compiler is older, or if the target is 32-bit. There are no other dependencies.
+CMake stops with a clear message if the compiler is older, or if the target is 32-bit. The recompiler and its tests have no other dependencies. The game's runtime (`qilin_run`) needs two, which CMake fetches at configure time and checks against pinned SHA-256 hashes (neither is in the repository): **SDL3** (zlib licence; a system SDL3 is used if there is one) for the window, audio and keyboard, and **Khronos' Vulkan headers** (Apache-2.0). No Vulkan SDK is needed: the loader comes through SDL. `-DQILIN_HEADLESS_ONLY=ON` builds it with neither.
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
@@ -88,7 +94,26 @@ cmake -S . -B build-rt -DQILIN_RUNTIME_GEN_DIR=$PWD/gen-rt && cmake --build buil
 build-rt/qilin_run path/to/extracted-disc
 ```
 
-`qilin_run` takes the folder Dolphin's **Extract Entire Disc** writes (`sys/` and `files/`); a `.wbfs` or `.iso` can't be read directly, since a Wii disc is encrypted with a key this project can't include. It doesn't get far yet: it stops at the first SDK function the runtime has no native code for, and says which, who called it, and what the run did before. `docs/runtime.md` has the details. Keep `pal_symbols.txt` and the extracted disc outside the repository.
+`qilin_run` takes the folder Dolphin's **Extract Entire Disc** writes (`sys/` and `files/`); a `.wbfs` or `.iso` can't be read directly, since a Wii disc is encrypted with a key this project can't include. It opens a window; closing it quits. Anything the runtime can't do yet stops the run with a message saying what, who called it, and what the run did before. `docs/runtime.md` has the details. Keep `pal_symbols.txt` and the extracted disc outside the repository.
+
+| Wii Remote | Keyboard |
+|---|---|
+| A | X or Space |
+| B | Z or Left Shift |
+| 1, 2 | 1, 2 |
+| +, − | Enter, Backspace |
+| Home | H |
+| D-pad | arrow keys |
+
+Saves go to a per-user folder (`%LOCALAPPDATA%`, `~/Library/Application Support` or `~/.local/share`, under `BeatTheBeat-QilinComp/nand`), or wherever `QILIN_NAND` points. For tests and repeatable runs:
+
+| Variable | Effect |
+|---|---|
+| `QILIN_HEADLESS=1` | no window, sound or keyboard |
+| `QILIN_INPUT=A@5,B+A@12:0.3` | timed presses (seconds after start, optional duration) |
+| `QILIN_RUN_SECONDS=N` | end after N seconds, with counters and each thread's state (exit status 3) |
+| `QILIN_AUDIO_DUMP=out.wav` | record what the console would play |
+| `QILIN_FRAME_STATS=N` | numbers about every Nth frame (coverage, mean colour) |
 
 ### Decoder check
 
@@ -112,8 +137,8 @@ This compares the decoder with GNU objdump (`-M broadway,raw`): mnemonic and eve
 | Path | What |
 |---|---|
 | `recomp/src/` | Recompiler core: `dol` loader, `sha256`, `decoder` (Broadway), `cfg` (function discovery + control flow), `lifter` (Broadway → C++), `libraries` (what's lifted, replaced or dropped), `main` (CLI) |
-| `recomp/runtime/` | What lifted code needs at run time: `guest.hpp` (context, big-endian memory, arithmetic and flag helpers), `dispatch.cpp` (the function table). The game itself: `run.cpp` (`qilin_run`), `machine` (guest memory), `native` (the registry of native functions), `os.cpp` (the OS, natively) |
-| `recomp/tests/` | Unit tests on a synthetic in-memory DOL, the decoder and a synthetic program, so they need no game files |
+| `recomp/runtime/` | What lifted code needs at run time: `guest.hpp` (context, big-endian memory, arithmetic and flag helpers), `dispatch.cpp` (the function table). The game itself: `run.cpp` (`qilin_run`), `machine` (guest memory), `native` (the registry of native functions), `os.cpp`, `threads`, `interrupts`, `dvd`, `nand`, `vi.cpp` (the system), `gx*` and `shaders/` (graphics), `audio.cpp` (AI and the DSP mixer), `wpad.cpp` and `input` (the remote), `host` (window, sound, keyboard) |
+| `recomp/tests/` | Unit tests on a synthetic in-memory DOL, the decoder, a synthetic program, GX's texture formats and the input script, so they need no game files |
 | `tools/check/` | The decoder cross-check against GNU objdump |
 | `tools/difftest/` | The differential test: `harness.cpp` runs lifted code, `difftest.py` the original under Unicorn |
 | `tools/analysis/` | `port_symbols.py`: the decomp's names and libraries ported to PAL |

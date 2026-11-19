@@ -11,18 +11,28 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-11-19
+The game is seen, heard and controlled: `qilin_run` opens a window, draws with Vulkan 1.3, mixes the game's sound and plays it, and takes the keyboard (or a script) as a Wii Remote. It boots to the title and past the first A. Not yet checked by eye, and not playable end to end.
+
 ### Added
 - **A scripted Wii Remote** (`QILIN_INPUT`, `recomp/runtime/input.*`): a virtual remote on channel 0 presses buttons on a schedule for headless, repeatable runs. WPAD drives KPAD as KPAD's code expects (connect callback, then sampling callbacks at the report rate, `WPADRead`'s status), with the data format, pointer control and the remote speaker's control protocol; no motion or pointer data is made up. With it, A at the title takes the game to its first sound.
 - **The DSP mixer** (`recomp/runtime/audio.cpp`): AX's command list carried out in full, read from AX's and NW4R's code. Exact where game logic looks (play positions, loops and ends, DSP-ADPCM with its loop context, envelope and mix ramps, aux round trips, the write-back AX reads); approximations marked in the code (the polyphase resampler, the compressor); unsupported features stop. `QILIN_AUDIO_DUMP=<file.wav>` records what AI plays.
 - **Approximate estimates in the game's build** (`QILIN_APPROX_ESTIMATES`, the owner's decision): where Broadway's `frsqrte`/`fres` table is needed, the exact result rounded to 12 fraction bits (IBM's stated accuracy), marked APPROX. The differential test's build still stops there. The game now runs past the title.
 - **A window, the Vulkan renderer, sound and the keyboard** (`host.cpp`, `gx_vulkan.cpp`, `gx_texture.cpp`, `shaders/`): `qilin_run` opens a window and draws GX with Vulkan 1.3 (GX's transform and lighting on the CPU, the TEV in one fragment shader, GX's texture formats decoded and cached), plays AI's output on the default audio device and takes the keyboard as a Wii Remote. SDL3, Khronos' Vulkan headers and glslang are fetched at configure time, pinned by hash, never committed. `QILIN_HEADLESS=1` (or `-DQILIN_HEADLESS_ONLY=ON`) runs as before. Unsupported GX features stop with a message.
 - **More of GX on Vulkan:** copies from the EFB to textures (with the copy formats' conversions), mipmaps with the texture object's filters, LOD range and bias (layout read from the SDK's `GXInitTexObjLOD`), lines and points, fog, manual texture-coordinate scaling; Z textures now stop instead of being ignored.
-
 - **The runtime's to-do list from its own lift:** of the 260 replaced functions the game's code can call, 40 had no native code; NAND's asynchronous calls, `NANDPrivateOpen`, `NANDDelete`, `OSPanic`, the OS's exits, `__DVDTestAlarm`, `GXGetPixelFmt`, `__write_file` and `WPADGetInfoAsync` now do, and `OSAlloc.c` is lifted. What's left (display-list recording, the ROM font, the balance board, MotionPlus, pairing) stops when reached.
 - **`QILIN_FRAME_STATS=N`:** numbers about every Nth frame (coverage, mean colour), to tell drawn frames from empty ones without looking.
+- **Tests:** GX's texture formats on synthetic tiles (I4, I8, IA8, RGB565, both RGB5A3 forms, RGBA8's split halves, C8 through a TLUT, CMPR's two modes, padded sizes, an unknown format stopping) and the input script's parser (presses, combinations, durations, every malformed form).
 
 ### Changed
 - **One dependency fewer:** the shaders' SPIR-V is committed beside their GLSL with a hash stamp the configure checks; glslang is fetched only with `-DQILIN_BUILD_SHADERS=ON`. A default build needs SDL3 and the Vulkan headers.
+- **The input script** is parsed apart from the environment (`parse_input_script`, tested), and its times count from the runtime's start, as documented, instead of from the first `WPADInit`.
+
+### Fixed
+- **The renderer** stops on a vertex's matrix index past GX's matrix memory, and on an indexed vertex attribute outside MEM1 and MEM2, instead of reading beyond them.
+- **Copies to textures** compare the guest bytes they cover by the copy's own size, so a copy read in a format of another size isn't dropped.
+
+The differential test: 8,108 functions, 64,864 trials, 0 unexplained mismatches.
 
 ## [0.15.0] - 2026-11-19
 The game runs: it initialises completely, saves on first boot, reaches its title scene and keeps running, a frame copied out on every retrace, with the audio clock at the console's rate. Nothing is shown or heard yet (headless GX; the DSP stops at the first voice), and with no remote connected the game waits at its title.

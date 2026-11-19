@@ -12,9 +12,6 @@
 
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
-#include <string>
-#include <vector>
 
 #include "guest.hpp"
 #include "host.hpp"
@@ -23,87 +20,94 @@ namespace qilin::rt {
 
 namespace {
 
-struct Press {
-    uint64_t from, to;  // time-base ticks
-    uint16_t buttons;
-};
-
-struct Script {
-    bool parsed = false, present = false;
-    uint64_t start = 0;
-    std::vector<Press> presses;
-} g_script;
-
-uint16_t button(const std::string& name) {
+uint16_t button(std::string_view name) {
     struct Name {
-        const char* name;
+        std::string_view name;
         uint16_t bit;
     };
-    static const Name names[] = {{"A", kButtonA},         {"B", kButtonB},       {"1", kButton1},
-                                 {"2", kButton2},         {"PLUS", kButtonPlus}, {"MINUS", kButtonMinus},
-                                 {"HOME", kButtonHome},   {"UP", kButtonUp},     {"DOWN", kButtonDown},
-                                 {"LEFT", kButtonLeft},   {"RIGHT", kButtonRight}};
+    static constexpr Name names[] = {{"A", kButtonA},       {"B", kButtonB},       {"1", kButton1},
+                                     {"2", kButton2},       {"PLUS", kButtonPlus}, {"MINUS", kButtonMinus},
+                                     {"HOME", kButtonHome}, {"UP", kButtonUp},     {"DOWN", kButtonDown},
+                                     {"LEFT", kButtonLeft}, {"RIGHT", kButtonRight}};
     for (const Name& n : names)
         if (name == n.name) return n.bit;
     return 0;
 }
 
-[[noreturn]] void bad_script(const std::string& part) {
-    std::fprintf(stderr, "qilin_run: QILIN_INPUT: can't read \"%s\" (BUTTON[+BUTTON]@SECONDS[:DURATION])\n",
-                 part.c_str());
-    std::fflush(stderr);
-    std::_Exit(2);
+// The parts of `s` between commas (or pluses), empty ones included.
+template <class F>
+void split(std::string_view s, char sep, F&& part) {
+    for (size_t i = 0;;) {
+        const size_t j = s.find(sep, i);
+        part(s.substr(i, j == std::string_view::npos ? std::string_view::npos : j - i));
+        if (j == std::string_view::npos) return;
+        i = j + 1;
+    }
 }
 
-void parse() {
+struct Script {
+    bool parsed = false, present = false;
+    std::vector<ScriptedPress> presses;
+} g_script;
+
+// Press times count from the runtime's start: this initialiser runs before main.
+const uint64_t g_start = time_base();
+
+void load() {
     if (g_script.parsed) return;
     g_script.parsed = true;
     const char* v = std::getenv("QILIN_INPUT");
     if (!v || !*v) return;
-    g_script.present = true;
-    g_script.start = time_base();
-    std::string all = v;
-    size_t i = 0;
-    while (i <= all.size()) {
-        const size_t comma = all.find(',', i);
-        const std::string part = all.substr(i, comma == std::string::npos ? std::string::npos : comma - i);
-        i = comma == std::string::npos ? all.size() + 1 : comma + 1;
-        if (part.empty()) continue;
-        const size_t at = part.find('@');
-        if (at == std::string::npos) bad_script(part);
-        uint16_t buttons = 0;
-        const std::string names = part.substr(0, at);
-        for (size_t j = 0; j <= names.size();) {
-            const size_t plus = names.find('+', j);
-            const uint16_t b = button(names.substr(j, plus == std::string::npos ? std::string::npos : plus - j));
-            if (!b) bad_script(part);
-            buttons |= b;
-            j = plus == std::string::npos ? names.size() + 1 : plus + 1;
-        }
-        const std::string when = part.substr(at + 1);
-        char* end = nullptr;
-        const double seconds = std::strtod(when.c_str(), &end);
-        double duration = 0.1;
-        if (*end == ':') duration = std::strtod(end + 1, &end);
-        if (*end || seconds < 0 || duration <= 0) bad_script(part);
-        const auto ticks = [](double s) { return static_cast<uint64_t>(s * static_cast<double>(kTimeBaseHz)); };
-        g_script.presses.push_back({g_script.start + ticks(seconds), g_script.start + ticks(seconds + duration), buttons});
+    std::string bad;
+    if (!parse_input_script(v, g_script.presses, bad)) {
+        std::fprintf(stderr, "qilin_run: QILIN_INPUT: can't read \"%s\" (BUTTON[+BUTTON]@SECONDS[:DURATION])\n", bad.c_str());
+        std::fflush(stderr);
+        std::_Exit(2);
     }
+    g_script.present = true;
 }
 
 }  // namespace
 
+bool parse_input_script(std::string_view script, std::vector<ScriptedPress>& out, std::string& bad) {
+    out.clear();
+    bool ok = true;
+    split(script, ',', [&](std::string_view part) {
+        if (!ok || part.empty()) return;
+        const size_t at = part.find('@');
+        uint16_t buttons = 0;
+        if (at != std::string_view::npos)
+            split(part.substr(0, at), '+', [&](std::string_view name) {
+                const uint16_t b = button(name);
+                buttons = b && buttons != 0xFFFF ? uint16_t(buttons | b) : 0xFFFF;  // 0xFFFF: a name that isn't a button
+            });
+        const std::string when(at == std::string_view::npos ? std::string_view{} : part.substr(at + 1));
+        char* end = nullptr;
+        const double seconds = when.empty() ? -1 : std::strtod(when.c_str(), &end);
+        double duration = 0.1;
+        if (end && *end == ':') duration = std::strtod(end + 1, &end);
+        if (at == std::string_view::npos || buttons == 0 || buttons == 0xFFFF || when.empty() || *end || seconds < 0 ||
+            duration <= 0) {
+            ok = false;
+            bad = part;
+            return;
+        }
+        out.push_back({seconds, seconds + duration, buttons});
+    });
+    return ok;
+}
+
 bool input_source() {
-    parse();
+    load();
     return g_script.present || host::windowed();
 }
 
 uint16_t input_buttons(unsigned channel) {
-    parse();
+    load();
     if (channel != 0) return 0;
-    const uint64_t now = time_base();
     uint16_t held = host::windowed() ? host::keyboard_buttons() : 0;
-    for (const Press& p : g_script.presses)
+    const double now = double(time_base() - g_start) / double(kTimeBaseHz);
+    for (const ScriptedPress& p : g_script.presses)
         if (now >= p.from && now < p.to) held |= p.buttons;
     return held;
 }

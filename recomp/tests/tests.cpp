@@ -16,7 +16,9 @@
 #include "decoder.hpp"
 #include "dol.hpp"
 #include "guest.hpp"
+#include "gx.hpp"
 #include "hwaccess.hpp"
+#include "input.hpp"
 #include "libraries.hpp"
 #include "lifter.hpp"
 #include "native.hpp"
@@ -1022,7 +1024,106 @@ extern const size_t g_symbol_count = 5;
 void call(Context&, uint32_t target, uint32_t from) { bad_jump(from, target); }
 }  // namespace qilin::rt
 
+namespace {
+
+// ---------------------------------------------------------------- GX textures
+// Synthetic tiles in GX's documented layouts, decoded to RGBA8.
+void test_textures() {
+    using namespace rt::gx;
+    std::vector<uint8_t> mem(0x400);
+    uint8_t* const saved = rt::g_mem;
+    rt::g_mem = mem.data() - 0x100;  // guest 0x100 is mem[0]
+    auto px = [](const std::vector<uint8_t>& out, uint32_t w, uint32_t x, uint32_t y) {
+        const uint8_t* p = out.data() + (size_t(y) * w + x) * 4;
+        return uint32_t(p[0]) << 24 | uint32_t(p[1]) << 16 | uint32_t(p[2]) << 8 | p[3];
+    };
+
+    // sizes: whole tiles, padded
+    CHECK(texture_bytes(kTexI4, 8, 8) == 32 && texture_bytes(kTexRgba8, 4, 4) == 64);
+    CHECK(texture_bytes(kTexI8, 9, 5) == 4 * 32);  // 2x2 tiles of 8x4
+    CHECK(texture_bytes(kTexCmpr, 16, 8) == 64 && texture_bytes(3, 4, 4) == 32 && texture_bytes(7, 4, 4) == 0);
+
+    // I8, two tiles side by side (16x4): texel (x, y) of tile t is byte t*32 + y*8 + x
+    for (uint32_t i = 0; i < 64; ++i) mem[i] = uint8_t(i);
+    std::vector<uint8_t> out(16 * 4 * 4);
+    decode_texture(kTexI8, 0x100, 16, 4, nullptr, out.data());
+    CHECK(px(out, 16, 0, 0) == 0x00000000u && px(out, 16, 7, 0) == 0x07070707u);
+    CHECK(px(out, 16, 1, 2) == 0x11111111u && px(out, 16, 8, 0) == 0x20202020u && px(out, 16, 15, 3) == 0x3F3F3F3Fu);
+
+    // I4: two texels a byte, high nibble first, each times 17
+    mem[0] = 0xF1;
+    std::vector<uint8_t> o4(8 * 8 * 4);
+    decode_texture(kTexI4, 0x100, 8, 8, nullptr, o4.data());
+    CHECK(px(o4, 8, 0, 0) == 0xFFFFFFFFu && px(o4, 8, 1, 0) == 0x11111111u);
+
+    // IA8: alpha in the high byte; RGB5A3 both forms; RGB565
+    mem[0] = 0x80, mem[1] = 0x40;                // IA8: a 0x80, i 0x40
+    mem[2] = 0xFC, mem[3] = 0x00;                // RGB5A3 opaque: r 31
+    mem[4] = 0x0F, mem[5] = 0x00;                // RGB5A3 translucent: a 0, r 15
+    mem[6] = 0x07, mem[7] = 0xE0;                // RGB565: g 63
+    std::vector<uint8_t> o16(4 * 4 * 4);
+    decode_texture(kTexIA8, 0x100, 4, 4, nullptr, o16.data());
+    CHECK(px(o16, 4, 0, 0) == 0x40404080u);
+    decode_texture(kTexRgb5A3, 0x100, 4, 4, nullptr, o16.data());
+    CHECK(px(o16, 4, 1, 0) == 0xFF0000FFu && px(o16, 4, 2, 0) == 0xFF000000u);
+    decode_texture(kTexRgb565, 0x100, 4, 4, nullptr, o16.data());
+    CHECK(px(o16, 4, 3, 0) == 0x00FF00FFu);
+
+    // RGBA8: 32 bytes of (A, R) pairs, then 32 of (G, B)
+    for (uint32_t i = 0; i < 16; ++i) mem[2 * i] = 0xA0, mem[2 * i + 1] = uint8_t(i), mem[32 + 2 * i] = 0x11, mem[33 + 2 * i] = 0x22;
+    decode_texture(kTexRgba8, 0x100, 4, 4, nullptr, o16.data());
+    CHECK(px(o16, 4, 1, 1) == 0x051122A0u);
+
+    // C8 through an RGB565 TLUT at guest 0x300
+    std::fill(mem.begin(), mem.begin() + 32, uint8_t{0});
+    mem[0] = 2;
+    mem[0x204] = 0xF8, mem[0x205] = 0x00;  // entry 2: red
+    Tlut tlut;
+    tlut.loaded = true, tlut.data = 0x300, tlut.format = 1, tlut.entries = 16;
+    std::vector<uint8_t> o8(8 * 4 * 4);
+    decode_texture(kTexC8, 0x100, 8, 4, &tlut, o8.data());
+    CHECK(px(o8, 8, 0, 0) == 0xFF0000FFu);
+
+    // CMPR: four 4x4 blocks; c0 > c1 gives four opaque colours, c0 <= c1 a
+    // transparent fourth
+    std::fill(mem.begin(), mem.begin() + 32, uint8_t{0});
+    mem[0] = 0xFF, mem[1] = 0xFF, mem[2] = 0x00, mem[3] = 0x00, mem[4] = 0x1B;  // white, black; row 0: 0 1 2 3
+    mem[8] = 0x00, mem[9] = 0x00, mem[10] = 0xFF, mem[11] = 0xFF, mem[12] = 0xC0;  // black <= white; texel 0: index 3
+    std::vector<uint8_t> oc(8 * 8 * 4);
+    decode_texture(kTexCmpr, 0x100, 8, 8, nullptr, oc.data());
+    CHECK(px(oc, 8, 0, 0) == 0xFFFFFFFFu && px(oc, 8, 1, 0) == 0x000000FFu);
+    CHECK(px(oc, 8, 2, 0) == 0xAAAAAAFFu && px(oc, 8, 3, 0) == 0x555555FFu);
+    CHECK(px(oc, 8, 4, 0) == 0x00000000u);  // second block (top right): transparent
+
+    bool stopped = false;
+    try {
+        decode_texture(7, 0x100, 4, 4, nullptr, o16.data());
+    } catch (const rt::Stop&) {
+        stopped = true;
+    }
+    CHECK(stopped);
+    rt::g_mem = saved;
+}
+
+// ---------------------------------------------------------------- input script
+void test_input_script() {
+    std::vector<rt::ScriptedPress> p;
+    std::string bad;
+    CHECK(rt::parse_input_script("A@5,A@8.5,B+A@12:0.3", p, bad) && p.size() == 3);
+    CHECK(p.size() == 3 && p[0].from == 5.0 && p[0].to == 5.0 + 0.1 && p[0].buttons == rt::kButtonA);
+    CHECK(p.size() == 3 && p[2].buttons == (rt::kButtonA | rt::kButtonB) && p[2].to == 12.0 + 0.3);
+    CHECK(rt::parse_input_script("UP@1,,HOME@2", p, bad) && p.size() == 2);
+    for (const char* s : {"Q@1", "A@", "A@-1", "A@1:0", "A1", "A+@1", "A@1x"}) {
+        CHECK(!rt::parse_input_script(s, p, bad));
+    }
+    CHECK(!rt::parse_input_script("A@1,Z@2", p, bad) && bad == "Z@2");
+}
+
+}  // namespace
+
 int main() {
+    test_textures();
+    test_input_script();
     test_estimates();
     test_libraries();
     test_natives();

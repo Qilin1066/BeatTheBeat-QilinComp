@@ -98,24 +98,21 @@ Before a milestone commit, all of these must hold: tests pass, warnings are clea
 - Interrupts reach lifted code only at safe points: `OSEnableInterrupts`/`OSRestoreInterrupts` turning them on, and the idle scheduler. `OSLoadContext` throws `rt::Resume` to unwind an interrupt handler; it stops anywhere else.
 - Library split (`docs/code-analysis.md`): lift game/NW4R/MSL/runtime/etc. (74%); replace OS, DVD, GX, AX, pad, WPAD, NAND… (25%); drop MetroTRK/NdevExi2A (1%).
 
-## Status (v0.12.0)
+## Status (v0.16.0)
 
-- Runtime (v0.15.0): `qilin_run <extracted disc folder>` initialises the game, saves on first boot, reaches the title scene and keeps running (a frame per retrace, the audio clock at 333 frames a second, 12 threads). Headless GX (draws counted), silent DSP (stops at the first voice), no remote connected, so it waits at the title. Use `QILIN_RUN_SECONDS=N` and `QILIN_NAND=<dir>` for test runs. 215 of 1,969 replaced or dropped functions have native code; all 6,202 lift-side functions lift (8,108 in the difftest lift).
-
+- Runtime: `qilin_run <extracted disc folder>` opens a window (SDL3), draws GX with Vulkan 1.3, plays the DSP mixer's output and takes the keyboard as a Wii Remote; it boots to the title and past the first A (the title then waits; why is unknown without watching it). `QILIN_HEADLESS=1` for test runs, with `QILIN_INPUT` (timed presses), `QILIN_RUN_SECONDS`, `QILIN_NAND`, `QILIN_AUDIO_DUMP`, `QILIN_FRAME_STATS` (numbers about frames, to tell drawn from empty without looking). Nobody has looked at the picture yet: the owner is to check it.
+- The game's code can call 260 replaced functions (found from `gen-rt`: lifted code reaches them only through `fn_ADDR` stubs calling `rt::native`); 18 have no native code and stop when reached (display-list recording, the ROM font, `VIGetNextField`, balance board, MotionPlus, remote pairing). Indirect texturing stops too: which texel channels feed it has no clean source yet.
+- Approximations are marked APPROX in the code (estimates in the game's build, the DSP's resampler and compressor, TEV rounding, CMPR, edge LOD, fog steps, ...). The difftest build keeps stopping where Broadway's estimate tables would be needed.
 - 8,171 functions, all 157 jump tables proven, 98.80% of `.text` reached as code (the rest is identified as padding, dead code or data).
-- 8,103 functions lifted (slices 1, 3 and 4: integer, floating point, paired singles). Left: 56 privileged and 7 FPSCR (replaced libraries), 5 `fres`/`frsqrte`.
-- Difftest: 64,824 trials (8 per function), 0 unexplained mismatches; 170 s on 16 workers.
-- Calls store only dirty registers and reload only live ones (lifted objects 10.6% smaller).
-- Difftest under UBSan: no undefined behaviour.
-- Runtime to-do list: lifted code calls 309 replaced functions (GX 111, OS 63, WPAD 44, AX 27, NAND 23, ...); its only direct hardware access is the GX FIFO (322 stores in 12 functions); 5 lift-side functions (PSMTXInverse, PSMTXInvXpose, PSVECNormalize, PSVECMag, FrSqrt) need the estimate tables.
-- Generated code is warning-free under MSVC 17.14 and Clang 22 (zig, for Windows, Linux and macOS targets); GCC 14 on the generated code is still unchecked (no Linux here; CI builds the tools and tests with GCC 14, but not the game's code). Everything up to v0.15.0 was pushed on 2026-11-19 with the owner's go-ahead, after an audit of every commit (no game data or game-derived files, no third-party code or text, no personal details).
+- Difftest: 8,108 functions, 64,864 trials, 0 unexplained mismatches; about 190 s on 16 workers. Under UBSan: no undefined behaviour (v0.10.0).
+- Generated code is warning-free under MSVC 17.14 and Clang (zig, for Windows, Linux and macOS targets); GCC 14 on the generated code is still unchecked (no Linux here; CI builds the tools and tests with GCC 14, but not the game's code).
 - `qilin lift` output is in fixed 256-function chunks and only changed files are rewritten, so rebuilds are incremental.
 
 ## Next steps, in order
 
-1. The GX renderer on Vulkan (the CPU side is in `gx.*`; the game draws every frame). The mixer in `audio.cpp` (ADPCM/PCM, rate conversion, volumes, aux, output modes) from AX's command list and PBs, read from AX's code. Input: a host backend behind WPAD.
-2. The boot information confirmed in Dolphin (`lowmem.py`).
-3. The rest of the runtime, from its to-do list: OS (threads, time, memory, interrupts as the lifted code calls them), then GX on Vulkan (including the FIFO stores), AX, DVD, NAND, input. Exception tables and a timing model as the runtime needs them.
+1. The owner's look at the window: the picture, the sound's channel order, how far A gets. Fix what that shows.
+2. Whatever stops the game next (each stop names itself), then the rest of the 18 and indirect texturing once a clean source pins it down.
+3. Rhythm timing measured (input to sound), the remote's report rate confirmed, the boot information confirmed in Dolphin (`lowmem.py`), GCC 14 on the generated code, the other platforms.
 
 ## Conventions
 
