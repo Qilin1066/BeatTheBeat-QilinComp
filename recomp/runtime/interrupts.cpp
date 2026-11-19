@@ -50,6 +50,7 @@ constexpr uint64_t kNever = ~uint64_t(0);
 struct Queued {
     uint64_t due;
     std::function<void(Context&)> handler;
+    bool immediate = false;  // posted with no latency: an answer "at once" (the DSP's frame done)
 };
 std::mutex g_mutex;
 std::condition_variable g_wake;
@@ -101,6 +102,29 @@ void run_decrementer(Context& c) {
     t_in_decrementer = false;
 }
 
+// The queued handlers posted with no latency, in posted order. They run
+// right after the interrupt that caused them, before the next period: on
+// the console such an answer (the DSP's "frame done" after AX's mail) comes
+// within the period. Run later, behind a catch-up of several periods, AX
+// would find its DSP still busy at each further audio DMA and skip that
+// frame: the mix fell to about half the DMA rate and the game's beat clock,
+// which follows it, wavered by up to 100 ms (found 2026-11-19).
+void drain_immediate(Context& c) {
+    for (;;) {
+        std::function<void(Context&)> handler;
+        {
+            std::lock_guard l(g_mutex);
+            const auto it = std::find_if(g_queue.begin(), g_queue.end(), [](const Queued& q) { return q.immediate; });
+            if (it == g_queue.end()) return;
+            handler = std::move(it->handler);
+            g_queue.erase(it);
+            update_next_due();
+        }
+        ++stats().interrupts;
+        run_posted(c, handler);
+    }
+}
+
 void deliver(Context& c, bool decrementer) {
     const Context saved = c;
     const bool level = g_enabled;
@@ -128,6 +152,7 @@ void deliver(Context& c, bool decrementer) {
                 ++stats().interrupts;
                 const auto handler = g_periodic[i].handler;  // a copy: the handler may add a timer
                 run_posted(c, handler);
+                drain_immediate(c);
             }
         }
         // The queued handlers that are due, in the order they were posted.
@@ -168,7 +193,7 @@ bool delivering() { return t_in_decrementer; }
 void post_interrupt(std::function<void(Context&)> handler, uint64_t delay) {
     {
         std::lock_guard l(g_mutex);
-        g_queue.push_back(Queued{time_base() + delay, std::move(handler)});
+        g_queue.push_back(Queued{time_base() + delay, std::move(handler), delay == 0});
         update_next_due();  // lifted loops start looking
     }
     g_wake.notify_all();

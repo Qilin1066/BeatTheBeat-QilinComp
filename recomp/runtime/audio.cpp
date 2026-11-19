@@ -462,6 +462,7 @@ void run_frame(uint32_t list) {
         if (peek16(p + pb::kState) == pb::kRunning) mix_voice(p, buses, mode);
         p = half_pair(p + pb::kNext) | 0x80000000u;
     }
+    ++stats().dsp_frames;
     for (unsigned bus = 1; bus < kBuses; ++bus)
         if (aux_on[bus]) aux_round_trip(buses[bus], aux[bus], dpl2 ? 4 : 3, buses[0]);
 
