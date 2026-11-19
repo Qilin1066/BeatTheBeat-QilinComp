@@ -54,8 +54,15 @@ void call_back(Context& c, uint32_t fn, uint32_t r3, uint32_t r4) {
 
 // The remote's reports, as WPAD's interrupt delivers them: the sampling
 // callback, which reads the status with WPADRead.
+void connect_again(Context& c);
+
+// A disconnected remote reconnects when a button is pressed, as on a console.
 void report(Context& c) {
-    if (wpad.connected[0] && wpad.sampling_cb[0]) {
+    if (!wpad.connected[0]) {
+        if (input_buttons(0)) connect_again(c);
+        return;
+    }
+    if (wpad.sampling_cb[0]) {
         ++stats().remote_reports;
         call_back(c, wpad.sampling_cb[0], 0, 0);
     }
@@ -76,6 +83,12 @@ void connect(Context& c) {
     std::fprintf(stderr, "qilin_run: Wii Remote connected (connect callback %s, sampling callback %s)\n", name_of(cb),
                  name_of(wpad.sampling_cb[0]));
     add_periodic(kReportPeriod, report);
+}
+
+void connect_again(Context& c) {
+    wpad.connected[0] = true;
+    ++stats().remotes_connected;
+    if (wpad.connect_cb[0]) call_back(c, wpad.connect_cb[0], 0, 0);
 }
 
 uint32_t channel(const Context& c) {
@@ -224,9 +237,18 @@ QILIN_NATIVE(WPADControlDpd) {
     c.r[3] = 0;
 }
 
-// No remote is connected, so there is none to disconnect.
-QILIN_NATIVE(WPADDisconnect) { channel(c); }
-// Rumble: nothing to rumble with no remote connected.
+// WPADDisconnect(chan): the remote drops its connection; the connect
+// callback gets (chan, WPAD_ERR_NO_CONTROLLER) once it has, and reports
+// stop. A button press connects it again (report()).
+QILIN_NATIVE(WPADDisconnect) {
+    const uint32_t ch = channel(c);
+    if (!wpad.connected[ch]) return;
+    wpad.connected[ch] = false;
+    wpad.dpd[ch] = false, g_speaker_on[ch] = false;
+    if (const uint32_t cb = wpad.connect_cb[ch])
+        post_interrupt([ch, cb](Context& ctx) { call_back(ctx, cb, ch, static_cast<uint32_t>(kErrNoController)); }, kIoLatency);
+}
+// Rumble: accepted; the host has no rumble output yet.
 QILIN_NATIVE(WPADControlMotor) { channel(c); }
 QILIN_NATIVE(WPADEnableMotor) { wpad.motor_enabled = c.r[3] & 0xFF; }
 QILIN_NATIVE(WPADIsMotorEnabled) { c.r[3] = wpad.motor_enabled ? 1 : 0; }

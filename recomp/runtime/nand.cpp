@@ -60,15 +60,9 @@ void poke_string(uint32_t addr, const std::string& s) {
     poke8(addr + static_cast<uint32_t>(s.size()), 0);
 }
 
-std::string guest_string(uint32_t addr) {
-    std::string s;
-    for (uint32_t i = 0; i < 256; ++i) {
-        const char ch = static_cast<char>(peek8(addr + i));
-        if (!ch) break;
-        s += ch;
-    }
-    return s;
-}
+// The flash's paths are at most 63 characters (NAND_MAX_PATH 64 with the
+// NUL); a longer one is a game bug or a misread argument: stop.
+std::string guest_string(const Context& c, uint32_t addr) { return guest_cstring(addr, 63, c.lr - 4, "NAND: a path"); }
 
 [[noreturn]] void no_root(const Context& c) {
     std::fprintf(stderr, "qilin_run: NAND: no folder for the console's flash (set QILIN_NAND)\n");
@@ -76,8 +70,9 @@ std::string guest_string(uint32_t addr) {
 }
 
 // A NAND path on the host: absolute as given, relative from the title's
-// home directory (a game's current directory). Empty if it would leave the
-// flash (a ".." component).
+// home directory (a game's current directory). Empty (the callers' INVALID)
+// if it could leave the flash's folder: a ".." component, or one a host
+// would read as a separator or a drive ('\\', ':').
 std::filesystem::path host_path(const Context& c, const std::string& path) {
     if (nand.root.empty()) no_root(c);
     const std::string full = path.starts_with("/") ? path : nand.home + "/" + path;
@@ -86,7 +81,7 @@ std::filesystem::path host_path(const Context& c, const std::string& path) {
     while (i <= full.size()) {
         const size_t slash = full.find('/', i);
         const std::string part = full.substr(i, slash == std::string::npos ? std::string::npos : slash - i);
-        if (part == "..") return {};
+        if (part == ".." || part.find_first_of("\\:") != std::string::npos) return {};
         if (!part.empty() && part != ".") p /= part;
         if (slash == std::string::npos) break;
         i = slash + 1;
@@ -115,7 +110,7 @@ QILIN_NATIVE(NANDCheck) {
 // read/write, as the game creates its files.
 constexpr uint8_t kPermOwnerReadWrite = 0x30;
 QILIN_NATIVE(NANDGetStatus) {
-    const std::filesystem::path p = host_path(c, guest_string(c.r[3]));
+    const std::filesystem::path p = host_path(c, guest_string(c, c.r[3]));
     std::error_code ec;
     if (p.empty()) {
         c.r[3] = static_cast<uint32_t>(kInvalid);
@@ -134,7 +129,7 @@ QILIN_NATIVE(NANDGetStatus) {
 // NANDCreate(path, permission, attribute): a new empty file; EXISTS if it's
 // there already. Permissions and attributes aren't kept by the host folder.
 QILIN_NATIVE(NANDCreate) {
-    const std::filesystem::path p = host_path(c, guest_string(c.r[3]));
+    const std::filesystem::path p = host_path(c, guest_string(c, c.r[3]));
     std::error_code ec;
     if (p.empty()) {
         c.r[3] = static_cast<uint32_t>(kInvalid);
@@ -154,7 +149,7 @@ int32_t open_at(const std::filesystem::path& p, uint32_t fi, uint32_t mode);
 // NANDOpen(path, fileInfo, mode): 1 read, 2 write, 3 both. Writing keeps the
 // contents, as NAND does.
 QILIN_NATIVE(NANDOpen) {
-    c.r[3] = static_cast<uint32_t>(open_at(host_path(c, guest_string(c.r[3])), c.r[4], c.r[5]));
+    c.r[3] = static_cast<uint32_t>(open_at(host_path(c, guest_string(c, c.r[3])), c.r[4], c.r[5]));
 }
 
 OpenFile* open_file(const Context& c) {
@@ -173,6 +168,7 @@ QILIN_NATIVE(NANDRead) {
         c.r[3] = static_cast<uint32_t>(kAccess);
         return;
     }
+    require_guest_range(c.r[4], c.r[5], c.lr - 4, "NANDRead's buffer");
     f->stream.clear();
     f->stream.read(reinterpret_cast<char*>(g_mem + c.r[4]), c.r[5]);
     const auto n = static_cast<uint32_t>(f->stream.gcount());
@@ -185,6 +181,7 @@ QILIN_NATIVE(NANDWrite) {
         c.r[3] = static_cast<uint32_t>(kAccess);
         return;
     }
+    require_guest_range(c.r[4], c.r[5], c.lr - 4, "NANDWrite's buffer");
     f->stream.clear();
     f->stream.write(reinterpret_cast<const char*>(g_mem + c.r[4]), c.r[5]);
     c.r[3] = f->stream ? c.r[5] : static_cast<uint32_t>(kUnknown);
@@ -200,7 +197,19 @@ QILIN_NATIVE(NANDSeek) {
         return;
     }
     const std::ios::seekdir dir = whence == 0 ? std::ios::beg : whence == 1 ? std::ios::cur : std::ios::end;
+    // A position outside the file: host streams allow it, what the console's
+    // file system answers isn't pinned down here, so it stops.
     f->stream.clear();
+    const auto here = f->stream.tellg();
+    f->stream.seekg(0, std::ios::end);
+    const int64_t length = f->stream.tellg();
+    const int64_t base = whence == 0 ? 0 : whence == 1 ? int64_t(here) : length;
+    if (base + offset < 0 || base + offset > length) {
+        std::fprintf(stderr, "qilin_run: NAND: a seek to %lld in a file of %lld bytes\n", static_cast<long long>(base + offset),
+                     static_cast<long long>(length));
+        throw Stop{Stop::Unsupported, c.lr - 4, static_cast<uint32_t>(offset)};
+    }
+    f->stream.seekg(here);
     f->stream.seekg(offset, dir);
     f->stream.seekp(f->stream.tellg());
     c.r[3] = f->stream ? static_cast<uint32_t>(f->stream.tellg()) : static_cast<uint32_t>(kInvalid);
@@ -227,8 +236,8 @@ QILIN_NATIVE(NANDClose) {
 // name (a safe save's last step, from /tmp). EXISTS if the destination is
 // there already, as on the console: a game deletes the old save first.
 QILIN_NATIVE(NANDMove) {
-    const std::string from_path = guest_string(c.r[3]);
-    const std::filesystem::path from = host_path(c, from_path), dir = host_path(c, guest_string(c.r[4]));
+    const std::string from_path = guest_string(c, c.r[3]);
+    const std::filesystem::path from = host_path(c, from_path), dir = host_path(c, guest_string(c, c.r[4]));
     std::error_code ec;
     if (from.empty() || dir.empty()) {
         c.r[3] = static_cast<uint32_t>(kInvalid);
@@ -290,7 +299,7 @@ QILIN_NATIVE(NANDPrivateSafeOpenAsync) {
         std::fprintf(stderr, "qilin_run: NAND: a safe open for writing isn't modelled yet\n");
         throw Stop{Stop::Unsupported, c.lr - 4, mode};
     }
-    const std::filesystem::path p = host_path(c, guest_string(c.r[3]));
+    const std::filesystem::path p = host_path(c, guest_string(c, c.r[3]));
     complete(c.r[8], open_at(p, c.r[4], mode), c.r[9]);
     c.r[3] = static_cast<uint32_t>(kOk);
 }
@@ -317,7 +326,7 @@ QILIN_NATIVE(NANDPrivateCreateAsync) { async_of<qilin_native_NANDCreate>(c, 6); 
 // NANDDelete(path): a file, or a directory with what's in it; NOEXISTS if
 // it isn't there.
 QILIN_NATIVE(NANDDelete) {
-    const std::filesystem::path p = host_path(c, guest_string(c.r[3]));
+    const std::filesystem::path p = host_path(c, guest_string(c, c.r[3]));
     std::error_code ec;
     if (p.empty()) c.r[3] = static_cast<uint32_t>(kInvalid);
     else if (!std::filesystem::exists(p, ec)) c.r[3] = static_cast<uint32_t>(kNoExists);
@@ -326,7 +335,7 @@ QILIN_NATIVE(NANDDelete) {
 
 // NANDGetType(path, u8* type): file 1, directory 2; NOEXISTS if neither.
 QILIN_NATIVE(NANDGetType) {
-    const std::filesystem::path p = host_path(c, guest_string(c.r[3]));
+    const std::filesystem::path p = host_path(c, guest_string(c, c.r[3]));
     std::error_code ec;
     if (p.empty()) c.r[3] = static_cast<uint32_t>(kInvalid);
     else if (std::filesystem::is_directory(p, ec)) poke8(c.r[4], kTypeDir), c.r[3] = kOk;

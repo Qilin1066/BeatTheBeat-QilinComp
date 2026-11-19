@@ -120,7 +120,9 @@ uint32_t vertex_size(const State& s, unsigned vf) {
         const uint8_t desc = s.desc[a];
         if (desc == kNone) continue;
         if (a == kNrm) {
-            const bool three = s.nbt || f[a].cnt != 0;  // normal, binormal and tangent
+            // The vertex format's element count decides, as the command
+            // processor parses: GX_NRM_XYZ one normal, GX_NRM_NBT/NBT3 three.
+            const bool three = f[a].cnt != 0;
             if (desc == kDirect) n += (three ? 9 : 3) * comp_size(f[a].type, a);
             else n += (three && f[a].cnt == 2 ? 3 : 1) * index(desc);  // NBT3: an index each
         } else if (desc != kDirect) {
@@ -150,6 +152,7 @@ QILIN_NATIVE(GXBegin) {
 // invalidations do nothing here.
 QILIN_NATIVE(GXCallDisplayList) {
     const uint32_t list = c.r[3], bytes = c.r[4];
+    require_guest_range(list, bytes, c.lr - 4, "GXCallDisplayList's list");
     for (uint32_t p = list; p < list + bytes;) {
         const uint8_t cmd = peek8(p++);
         if (cmd == 0x00 || cmd == 0x48) continue;  // NOP, invalidate the vertex cache

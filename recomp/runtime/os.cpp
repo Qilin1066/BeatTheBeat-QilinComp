@@ -165,6 +165,7 @@ QILIN_NATIVE(OSGetConsoleType) { c.r[3] = kConsoleRetail; }
 QILIN_NATIVE(InitializeUART) { c.r[3] = 0; }
 QILIN_NATIVE(WriteUARTN) {
     const uint32_t buf = c.r[3], n = c.r[4];
+    require_guest_range(buf, n, c.lr - 4, "WriteUARTN's text");
     static bool line_start = true;
     for (uint32_t i = 0; i < n; ++i) {
         const char ch = static_cast<char>(peek8(buf + i));
@@ -179,7 +180,9 @@ QILIN_NATIVE(WriteUARTN) {
 // calls as __write_file(handle 1, buffer, size_t* count, idle): the debugger
 // is dropped, so the text goes where the UART's does. Returns __no_io_error.
 QILIN_NATIVE(__write_file) {
+    require_guest_range(c.r[5], 4, c.lr - 4, "__write_file's count");
     const uint32_t buf = c.r[4], n = peek32(c.r[5]);
+    require_guest_range(buf, n, c.lr - 4, "__write_file's text");
     for (uint32_t i = 0; i < n; ++i) std::fputc(static_cast<char>(peek8(buf + i)), stderr);
     c.r[3] = 0;
 }
@@ -189,8 +192,9 @@ QILIN_NATIVE(__write_file) {
 // shown as written (its arguments aren't formatted), with where it came
 // from, and the run stops.
 QILIN_NATIVE(OSPanic) {
-    std::fprintf(stderr, "qilin_run: OSPanic in %s line %u: %s\n", reinterpret_cast<const char*>(g_mem + c.r[3]), c.r[4],
-                 reinterpret_cast<const char*>(g_mem + c.r[5]));
+    const std::string file = guest_cstring(c.r[3], 256, c.lr - 4, "OSPanic's file name");
+    const std::string message = guest_cstring(c.r[5], 1024, c.lr - 4, "OSPanic's message");
+    std::fprintf(stderr, "qilin_run: OSPanic in %s line %u: %s\n", file.c_str(), c.r[4], message.c_str());
     throw Stop{Stop::Trap, c.lr - 4, c.r[4]};
 }
 // Leaving the game: to the Wii Menu, the Data Management screen, a restart,
@@ -208,7 +212,7 @@ QILIN_NATIVE(OSShutdownSystem) { leave("turns the console off"); }
 // ---- reports ----
 // OSRegisterVersion(const char* id) reports the library's version string.
 QILIN_NATIVE(OSRegisterVersion) {
-    std::fprintf(stderr, "[game] %s\n", reinterpret_cast<const char*>(g_mem + c.r[3]));
+    std::fprintf(stderr, "[game] %s\n", guest_cstring(c.r[3], 256, c.lr - 4, "OSRegisterVersion's text").c_str());
 }
 
 }  // namespace

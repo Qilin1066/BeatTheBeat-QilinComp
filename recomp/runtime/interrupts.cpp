@@ -26,7 +26,8 @@ uint64_t g_dec_deadline = 0;
 std::array<uint32_t, 32> g_handlers{};
 // Per host thread: a thread switch during a delivery's reschedule leaves
 // this thread mid-delivery, not the one that runs next.
-thread_local bool t_delivering = false;
+thread_local bool t_delivering = false;      // inside a delivery: no nested one
+thread_local bool t_in_decrementer = false;  // inside the decrementer's handler: OSLoadContext unwinds
 
 constexpr unsigned kMaxCatchUp = 32;  // periods one delivery runs at most (about 100 ms of audio)
 
@@ -55,11 +56,15 @@ std::condition_variable g_wake;
 std::deque<Queued> g_queue;
 std::atomic<uint64_t> g_next_due{kNever};
 
+// Lifted loops test g_irq_pending on every backward branch: it says
+// something is due now. What comes due later (an I/O completion 1 ms
+// ahead) is found by the loops' every-1024th-time check and at every native
+// call, so a loop doesn't take the slow path while a completion waits.
 void update_next_due() {  // under g_mutex
     uint64_t next = kNever;
     for (const Queued& q : g_queue) next = q.due < next ? q.due : next;
     g_next_due.store(next, std::memory_order_release);
-    g_irq_pending.store(!g_queue.empty(), std::memory_order_relaxed);
+    g_irq_pending.store(next != kNever && next <= time_base(), std::memory_order_relaxed);
 }
 
 uint32_t function(const char* name, uint32_t& cache) {
@@ -83,10 +88,17 @@ void run_decrementer(Context& c) {
     if (!handler) throw Stop{Stop::Unsupported, 0, kDecrementer};  // a decrementer interrupt nothing handles
     c.r[3] = kDecrementer;
     c.r[4] = peek32(kCurrentContext);
+    // Only here may OSLoadContext unwind (delivering()): from any other
+    // handler it stops, naming itself, rather than escape uncaught.
+    t_in_decrementer = true;
     try {
         call(c, handler, 0);
     } catch (const Resume&) {
+    } catch (...) {
+        t_in_decrementer = false;
+        throw;
     }
+    t_in_decrementer = false;
 }
 
 void deliver(Context& c, bool decrementer) {
@@ -151,7 +163,7 @@ bool decrementer_due() { return g_dec_armed && time_base() >= g_dec_deadline; }
 
 bool interrupts_enabled() { return g_enabled; }
 void set_interrupts_enabled(bool on) { g_enabled = on; }
-bool delivering() { return t_delivering; }
+bool delivering() { return t_in_decrementer; }
 
 void post_interrupt(std::function<void(Context&)> handler, uint64_t delay) {
     {

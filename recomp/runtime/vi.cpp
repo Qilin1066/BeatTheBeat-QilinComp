@@ -104,7 +104,10 @@ QILIN_NATIVE(VIWaitForRetrace) {
         c.r[3] = vi.queue;
         call_guest(c, sleep);
     }
+    // OSRestoreInterrupts turning them back on is a safe point: what came
+    // due meanwhile runs now, not at the next one.
     set_interrupts_enabled(level);
+    if (level) deliver_due(c);
 }
 // The format the console is showing. A PAL console set to 60 Hz shows
 // EuRGB60. The game only asks whether it is NTSC (0) here.

@@ -14,7 +14,9 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <initializer_list>
+#include <string>
 
 #include "guest.hpp"
 
@@ -136,5 +138,32 @@ inline void poke16(uint32_t a, uint16_t v) {
 }
 inline uint8_t peek8(uint32_t a) { return g_mem[a]; }
 inline void poke8(uint32_t a, uint8_t v) { g_mem[a] = v; }
+
+// A guest range native code reads or writes in bulk (a buffer and its
+// length from the game): it must lie in MEM1 (low memory included) or
+// MEM2, else the run stops naming it, instead of faulting on the unmapped
+// gap or reaching past guest memory.
+inline bool guest_range_ok(uint32_t addr, uint32_t length) {
+    const uint64_t end = uint64_t(addr) + length;
+    return (addr >= 0x80000000u && end <= 0x81800000u) || (addr >= 0x90000000u && end <= 0x94000000u);
+}
+inline void require_guest_range(uint32_t addr, uint32_t length, uint32_t pc, const char* what) {
+    if (guest_range_ok(addr, length)) return;
+    std::fprintf(stderr, "qilin_run: %s: %u bytes at %08X are outside guest memory\n", what, length, addr);
+    throw Stop{Stop::Memory, pc, addr};
+}
+// A NUL-terminated guest string of at most `limit` characters; a longer one
+// (or one running out of guest memory) stops instead of being cut short.
+inline std::string guest_cstring(uint32_t addr, uint32_t limit, uint32_t pc, const char* what) {
+    std::string s;
+    for (uint32_t i = 0; i <= limit; ++i) {
+        if (!guest_range_ok(addr + i, 1)) break;
+        const char ch = static_cast<char>(peek8(addr + i));
+        if (!ch) return s;
+        s += ch;
+    }
+    std::fprintf(stderr, "qilin_run: %s: no string of at most %u characters at %08X\n", what, limit, addr);
+    throw Stop{Stop::Unsupported, pc, addr};
+}
 
 }  // namespace qilin::rt

@@ -1113,7 +1113,7 @@ void test_input_script() {
     CHECK(p.size() == 3 && p[0].from == 5.0 && p[0].to == 5.0 + 0.1 && p[0].buttons == rt::kButtonA);
     CHECK(p.size() == 3 && p[2].buttons == (rt::kButtonA | rt::kButtonB) && p[2].to == 12.0 + 0.3);
     CHECK(rt::parse_input_script("UP@1,,HOME@2", p, bad) && p.size() == 2);
-    for (const char* s : {"Q@1", "A@", "A@-1", "A@1:0", "A1", "A+@1", "A@1x"}) {
+    for (const char* s : {"Q@1", "A@", "A@-1", "A@1:0", "A1", "A+@1", "A@1x", "A@:0.3", "A@nan", "A@1:", "A@inf"}) {
         CHECK(!rt::parse_input_script(s, p, bad));
     }
     CHECK(!rt::parse_input_script("A@1,Z@2", p, bad) && bad == "Z@2");

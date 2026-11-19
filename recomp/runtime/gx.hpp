@@ -63,6 +63,7 @@ struct TevStage {
     uint8_t alpha_op = 0, alpha_bias = 0, alpha_scale = 0, alpha_out = 0;
     bool color_clamp = true, alpha_clamp = true;
     uint8_t coord = 0xFF, map = 0xFF, channel = 0xFF;  // GXSetTevOrder
+    bool tex_disabled = false;  // GX_TEX_DISABLE with the map: the coordinate kept, no texture looked up
     uint8_t ras_swap = 0, tex_swap = 0;
     uint8_t kcolor_sel = 0, kalpha_sel = 0;
     // GXSetTevIndirect
@@ -159,6 +160,7 @@ struct State {
     uint8_t line_tex_offset = 0, point_tex_offset = 0;
     // textures
     std::array<TexMap, 8> tex{};
+    uint64_t tex_loads = 0;  // texture and TLUT loads and invalidations so far: the renderer re-checks after one
     std::array<Tlut, 20> tlut{};
     // copies
     Color clear_color;

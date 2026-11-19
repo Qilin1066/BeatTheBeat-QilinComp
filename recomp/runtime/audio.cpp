@@ -334,6 +334,14 @@ void aux_round_trip(const int32_t (&bus)[kChannelsPerBus][kFrameSamples], uint32
         }
 }
 
+// An address in the command list (two halves, physical): a buffer in MEM1 or
+// MEM2. Zero, or one outside guest memory, stops rather than becoming a
+// write into low memory.
+uint32_t list_addr(uint32_t at, uint32_t list) {
+    const uint32_t phys = half_pair(at);
+    if (phys == 0 || !guest_range_ok(phys | 0x80000000u, 4)) unsupported("an address in the command list", list);
+    return phys | 0x80000000u;
+}
 // One frame. AX's command list (16-bit words; addresses as two halves):
 //   0 studio | 1, 2, 3 mix buffer (by output mode) | 4 first PB
 //   5, 6, 7 aux A, B, C: return volume, input, output
@@ -355,22 +363,22 @@ void run_frame(uint32_t list) {
         if (cmd == 14) break;
         switch (cmd) {
         case 0: case 1: a += 4; break;  // the studio (depop, kept by AX) and the mix buffer
-        case 4: first_pb = half_pair(a) | 0x80000000u, a += 4; break;
+        case 4: first_pb = list_addr(a, list), a += 4; break;
         case 5: case 6: case 7: {
             const unsigned bus = cmd - 4u;
             aux_volume[bus] = peek16(a);
-            aux_in[bus] = half_pair(a + 2) | 0x80000000u, aux_out[bus] = half_pair(a + 6) | 0x80000000u;
+            aux_in[bus] = list_addr(a + 2, list), aux_out[bus] = list_addr(a + 6, list);
             a += 10;
             break;
         }
         case 10: a += 8; break;  // APPROX: the compressor is saturation at the output
         case 11:
             master = peek16(a);
-            output = half_pair(a + 6) | 0x80000000u;
+            output = list_addr(a + 6, list);
             a += 10;
             break;
         case 13:
-            for (unsigned r = 0; r < 4; ++r) remotes[r] = half_pair(a + 4 * r) | 0x80000000u;
+            for (unsigned r = 0; r < 4; ++r) remotes[r] = list_addr(a + 4 * r, list);
             a += 16;
             break;
         case 2: case 3: case 8: case 9: case 12: unsupported("surround or Dolby Pro Logic II output", list);
@@ -400,7 +408,7 @@ void run_frame(uint32_t list) {
     // The remote speakers: silent (no remote speaker output yet; see wpad.cpp).
     constexpr uint32_t kRemoteSamples = 18;  // 6 kHz
     for (uint32_t r : remotes)
-        if (r != 0x80000000u)
+        if (r)
             for (uint32_t i = 0; i < kRemoteSamples; ++i) poke16(r + 2 * i, 0);
 }
 

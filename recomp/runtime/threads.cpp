@@ -110,6 +110,9 @@ void host_main(uint32_t t, uint32_t gen) {
         call(c, exit_to, 0);  // OSExitThread, with the entry's result in r3
         throw Stop{Stop::Unsupported, exit_to, t};  // OSExitThread came back
     } catch (const ThreadEnd&) {
+        // Its context (a local here) is gone: reports mustn't read it.
+        std::lock_guard l(g_lock);
+        if (auto it = g_hosts.find(t); it != g_hosts.end() && it->second.gen == gen) it->second.ctx = nullptr;
         return;
     } catch (const Stop& s) {
         report_stop(s);
@@ -129,8 +132,13 @@ bool dead(uint32_t t) {
 void switch_to(uint32_t next) {
     if (next == t_self) return;
     ++stats().switches;
+    bool self_dead;
     {
         std::lock_guard l(g_lock);
+        // Whether this thread is ending is read before the run token goes:
+        // after, the next thread may already be rewriting its OSThread.
+        self_dead = dead(t_self);
+        if (self_dead) g_hosts.erase(t_self);
         const uint32_t gen = g_gen[next];
         auto it = g_hosts.find(next);
         if (it == g_hosts.end() || it->second.gen != gen) {
@@ -141,11 +149,7 @@ void switch_to(uint32_t next) {
         g_running = next;
     }
     g_cv.notify_all();
-    if (dead(t_self)) {
-        std::lock_guard l(g_lock);
-        g_hosts.erase(t_self);
-        throw ThreadEnd{};
-    }
+    if (self_dead) throw ThreadEnd{};
     wait_turn();
 }
 

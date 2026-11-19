@@ -58,15 +58,7 @@ bool same_name(const std::string& a, const std::string& b) {
     return true;
 }
 
-std::string guest_string(uint32_t addr) {
-    std::string s;
-    for (uint32_t i = 0; i < 1024; ++i) {
-        const char ch = static_cast<char>(peek8(addr + i));
-        if (!ch) return s;
-        s += ch;
-    }
-    return s;
-}
+std::string guest_string(const Context& c, uint32_t addr) { return guest_cstring(addr, 1024, c.lr - 4, "DVD: a path"); }
 
 [[noreturn]] void no_disc(uint32_t pc) {
     std::fprintf(stderr, "qilin_run: the game reads the disc: run qilin_run on the extracted disc's folder "
@@ -132,7 +124,10 @@ bool read(uint32_t fi, uint32_t addr, uint32_t length, uint32_t offset) {
         return false;
     }
     const Entry& e = disc.entries[it->second];
-    if (uint64_t(addr) + length > 0x100000000ull) return false;
+    if (!guest_range_ok(addr, length)) {
+        std::fprintf(stderr, "qilin_run: a read of %u bytes to %08X, outside guest memory\n", length, addr);
+        return false;
+    }
     std::memset(g_mem + addr, 0, length);
     if (offset >= e.size) return true;
     const uint32_t n = std::min(length, e.size - offset);
@@ -145,12 +140,21 @@ bool read(uint32_t fi, uint32_t addr, uint32_t length, uint32_t offset) {
     return true;
 }
 
-// Asynchronous requests not yet completed, and those cancelled meanwhile.
-std::set<uint32_t> g_pending, g_cancelled;
+// Asynchronous requests not yet completed, by command block, each with its
+// request's number: a completion finds its own request still there, or
+// does nothing (it was cancelled and finished, or the block reused).
+std::map<uint32_t, uint64_t> g_pending;
+std::set<uint32_t> g_cancelled;  // cancelled asynchronously: the completion reports it
+uint64_t g_next_request = 1;
 
 void complete(uint32_t fi, int32_t result, uint32_t callback) {
-    post_interrupt([fi, result, callback](Context& c) {
-        g_pending.erase(fi);
+    const uint64_t request = g_next_request++;
+    g_pending[fi] = request;
+    g_cancelled.erase(fi);
+    post_interrupt([fi, result, callback, request](Context& c) {
+        const auto it = g_pending.find(fi);
+        if (it == g_pending.end() || it->second != request) return;
+        g_pending.erase(it);
         const bool cancelled = g_cancelled.erase(fi) != 0;
         poke32(fi + kCbState, cancelled ? kStateCanceled : kStateEnd);
         if (!cancelled && result >= 0) poke32(fi + kCbTransferred, static_cast<uint32_t>(result));
@@ -161,7 +165,23 @@ void complete(uint32_t fi, int32_t result, uint32_t callback) {
     }, kIoLatency);
 }
 
-void cancel(uint32_t block) {
+// A synchronous cancel (DVDCancel, and DVDClose's): as the SDK's, the request
+// is finished before it returns, its callback run with DVD_RESULT_CANCELED,
+// so the game may free the block right after. Its queued completion then
+// finds nothing to do.
+void cancel_now(Context& c, uint32_t block) {
+    if (!g_pending.erase(block)) return;
+    g_cancelled.erase(block);
+    poke32(block + kCbState, kStateCanceled);
+    const uint32_t callback = peek32(block + kCallback);
+    if (!callback) return;
+    const uint32_t r3 = c.r[3], r4 = c.r[4];
+    c.r[3] = static_cast<uint32_t>(kResultCanceled), c.r[4] = block;
+    call_guest(c, callback);
+    c.r[3] = r3, c.r[4] = r4;
+}
+
+void cancel_later(uint32_t block) {
     if (g_pending.contains(block)) g_cancelled.insert(block);
 }
 
@@ -174,18 +194,22 @@ QILIN_NATIVE(DVDInit) {
     if (!disc.open) no_disc(c.lr - 4);
 }
 
-QILIN_NATIVE(DVDConvertPathToEntrynum) { c.r[3] = static_cast<uint32_t>(entry_of(guest_string(c.r[3]))); }
+QILIN_NATIVE(DVDConvertPathToEntrynum) { c.r[3] = static_cast<uint32_t>(entry_of(guest_string(c, c.r[3]))); }
 
 QILIN_NATIVE(DVDFastOpen) { c.r[3] = fast_open(static_cast<int32_t>(c.r[3]), c.r[4]) ? 1 : 0; }
 
 QILIN_NATIVE(DVDOpen) {
-    const std::string path = guest_string(c.r[3]);
+    const std::string path = guest_string(c, c.r[3]);
     const int32_t entry = entry_of(path);
     if (entry < 0) std::fprintf(stderr, "[dvd] %s: not on the disc\n", path.c_str());  // the SDK warns too
     c.r[3] = fast_open(entry, c.r[4]) ? 1 : 0;
 }
 
-QILIN_NATIVE(DVDClose) { c.r[3] = 1; }
+// DVDClose(fileInfo): the SDK's cancels any request still pending on it.
+QILIN_NATIVE(DVDClose) {
+    cancel_now(c, c.r[3]);
+    c.r[3] = 1;
+}
 
 // DVDReadPrio(fileInfo, addr, length, offset, prio): the bytes read, or a
 // negative result.
@@ -200,7 +224,6 @@ QILIN_NATIVE(DVDReadAsyncPrio) {
     const bool ok = read(fi, c.r[4], c.r[5], c.r[6]);
     poke32(fi + kCallback, callback);
     poke32(fi + kCbState, kStateBusy);
-    g_pending.insert(fi);
     complete(fi, ok ? static_cast<int32_t>(c.r[5]) : kResultFatal, callback);
     c.r[3] = 1;
 }
@@ -208,15 +231,16 @@ QILIN_NATIVE(DVDReadAsyncPrio) {
 // The drive: busy while a request waits for its completion, else idle.
 QILIN_NATIVE(DVDGetDriveStatus) { c.r[3] = g_pending.empty() ? kStateEnd : kStateBusy; }
 
-// DVDCancel(block): 0 once cancelled. Requests finish at once here, so a
-// cancel only changes how a pending completion reports.
+// DVDCancel(block): 0 once cancelled, the request finished (cancel_now).
 QILIN_NATIVE(DVDCancel) {
-    cancel(c.r[3]);
+    cancel_now(c, c.r[3]);
     c.r[3] = 0;
 }
+// DVDCancelAsync(block, callback): the pending completion reports the
+// cancel, then the cancel's own callback runs.
 QILIN_NATIVE(DVDCancelAsync) {
     const uint32_t block = c.r[3], callback = c.r[4];
-    cancel(block);
+    cancel_later(block);
     if (callback)
         post_interrupt([block, callback](Context& ctx) {
             ctx.r[3] = 0;
@@ -227,7 +251,7 @@ QILIN_NATIVE(DVDCancelAsync) {
 }
 QILIN_NATIVE(DVDCancelAllAsync) {
     const uint32_t callback = c.r[3];
-    for (uint32_t block : g_pending) g_cancelled.insert(block);
+    for (const auto& pending : g_pending) g_cancelled.insert(pending.first);
     if (callback)
         post_interrupt([callback](Context& ctx) {
             ctx.r[3] = 0;

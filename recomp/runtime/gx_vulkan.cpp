@@ -8,11 +8,15 @@
 // (EFB) is an offscreen 640x528 image; a display copy blits its source
 // rectangle to the window, keeping the console's aspect, and presents.
 //
-// Not supported yet, each stopping with a message when a draw needs it: lines
-// and points, fog, indirect textures, bump-map and specular lighting, NBT
-// normals, logic ops other than copy, copies to textures. APPROX (marked
-// where they are): the TEV's rounding, mipmaps (level 0 only), destination
-// alpha with blending, the EFB's pixel format (always RGBA8 here).
+// Not supported yet, each stopping with a message when a draw needs it:
+// indirect texturing, bump-map texture coordinates, specular lighting, NBT
+// normals, logic ops other than copy, Z textures, depth or YUV copies to
+// textures, a scissor box offset. Values GX doesn't define stop too. APPROX
+// (marked where they are): the TEV's rounding and konst fractions, CMPR's
+// in-between colours, edge LOD and anisotropy, line and point texture
+// offsets, fog's fixed-point steps, destination alpha with blending, the
+// EFB's pixel format (always RGBA8), and Z compared before texturing: GX
+// then writes depth for pixels the alpha test rejects; here they write none.
 // Runtime code: no std::format.
 #include "gx_vulkan.hpp"
 
@@ -68,6 +72,7 @@ namespace {
     X(vkCmdBindVertexBuffers) X(vkCmdDraw) X(vkCmdSetViewport) X(vkCmdSetScissor) X(vkCmdSetCullMode)               \
     X(vkCmdSetFrontFace) X(vkCmdSetDepthTestEnable) X(vkCmdSetDepthWriteEnable) X(vkCmdSetDepthCompareOp)           \
     X(vkCmdBlitImage) X(vkCmdCopyBufferToImage) X(vkCmdClearAttachments) X(vkCmdClearColorImage) X(vkCmdPushConstants)    \
+    X(vkCmdClearDepthStencilImage)                                                                                   \
     X(vkCmdCopyImageToBuffer)
 
 PFN_vkGetInstanceProcAddr vkGetInstanceProcAddr = nullptr;
@@ -147,10 +152,13 @@ struct Frame {
     VkDeviceSize vtx_used = 0, ubo_used = 0, upload_used = 0;
     uint32_t sets = 0;
 };
+// A decoded texture: re-checked (hashed) at most once per frame and per
+// texture load (State::tex_loads), and evicted when unused for a while.
 struct Texture {
     Image image;
-    uint64_t hash = 0, frame_checked = ~0ull;
+    uint64_t hash = 0, frame_checked = ~0ull, loads_checked = ~0ull, last_used = 0;
 };
+constexpr uint64_t kTextureIdleFrames = 600;  // 10 s at 60 Hz: a texture unused this long is freed
 
 struct Vk {
     VkInstance instance = VK_NULL_HANDLE;
@@ -287,11 +295,21 @@ bool make_swapchain() {
     vkGetPhysicalDeviceSurfaceFormatsKHR(g.gpu, g.surface, &n, nullptr);
     std::vector<VkSurfaceFormatKHR> formats(n);
     vkGetPhysicalDeviceSurfaceFormatsKHR(g.gpu, g.surface, &n, formats.data());
-    VkSurfaceFormatKHR format = formats[0];
-    for (const auto& f : formats)
-        if ((f.format == VK_FORMAT_B8G8R8A8_UNORM || f.format == VK_FORMAT_R8G8B8A8_UNORM) &&
-            f.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR)
-            format = f;
+    // An 8-bit UNORM format: GX's output is already gamma-encoded, so an
+    // sRGB format would encode it twice. It must take blits.
+    VkSurfaceFormatKHR format{VK_FORMAT_UNDEFINED, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR};
+    for (const auto& f : formats) {
+        if ((f.format != VK_FORMAT_B8G8R8A8_UNORM && f.format != VK_FORMAT_R8G8B8A8_UNORM) ||
+            f.colorSpace != VK_COLOR_SPACE_SRGB_NONLINEAR_KHR)
+            continue;
+        VkFormatProperties fp;
+        vkGetPhysicalDeviceFormatProperties(g.gpu, f.format, &fp);
+        if (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_DST_BIT) format = f;
+    }
+    if (format.format == VK_FORMAT_UNDEFINED) {
+        std::fprintf(stderr, "qilin_run: Vulkan: the window has no 8-bit UNORM format that blits can write\n");
+        throw Stop{Stop::Unsupported, 0, 0};
+    }
     vkGetPhysicalDeviceSurfacePresentModesKHR(g.gpu, g.surface, &n, nullptr);
     std::vector<VkPresentModeKHR> modes(n);
     vkGetPhysicalDeviceSurfacePresentModesKHR(g.gpu, g.surface, &n, modes.data());
@@ -451,8 +469,8 @@ VkSampler sampler(uint32_t mode0, uint32_t mode1 = 0, uint32_t levels = 1) {
     si.addressModeU = wrap(mode0 & 3), si.addressModeV = wrap((mode0 >> 2) & 3);
     si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     if ((min_code & 3) && levels > 1) {
-        si.minLod = float(mode1 & 0xFF) / 16.0f;
         si.maxLod = std::min(float((mode1 >> 8) & 0xFF) / 16.0f, float(levels - 1));
+        si.minLod = std::min(float(mode1 & 0xFF) / 16.0f, si.maxLod);  // Vulkan needs minLod <= maxLod
         si.mipLodBias = float(static_cast<int8_t>((mode0 >> 9) & 0xFF)) / 32.0f;
     }
     VkSampler s;
@@ -554,6 +572,14 @@ void begin_frame() {
         free_image(e.second);
         return true;
     });
+    // Textures unused for a while go (scenes load into new places; keeping
+    // them all would grow without bound): retired like any other image.
+    if (g.frame_number % 60 == 0)
+        std::erase_if(g.textures, [](auto& e) {
+            if (e.second.last_used + kTextureIdleFrames > g.frame_number) return false;
+            if (e.second.image.img) g.garbage.emplace_back(g.frame_number, e.second.image);
+            return true;
+        });
     VkCommandBufferBeginInfo bi = vk_struct<VkCommandBufferBeginInfo>(VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO);
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vk_check(vkResetCommandBuffer(f.cb, 0), "vkResetCommandBuffer");
@@ -628,11 +654,16 @@ struct EfbCopy {
     uint32_t width = 0, height = 0, format = 0;
     uint32_t guest_bytes = 0;  // the copy's size in guest memory, which guest_hash covers
     uint64_t guest_hash = 0;
+    uint64_t frame_checked = ~0ull, loads_checked = ~0ull;  // as Texture's
 };
 std::unordered_map<uint32_t, EfbCopy> g_copies;
 
+void require_texture_memory(uint32_t addr, uint32_t bytes, const char* what) {
+    if (!guest_range_ok(addr, bytes)) unsupported(what, addr);
+}
+
 // The texture a map holds, decoded and uploaded when it's new or its bytes
-// (or its TLUT's) changed since it was last seen; or an EFB copy there.
+// (or its TLUT's) changed since it was last checked; or an EFB copy there.
 const Image& texture(const State& s, const TexMap& t) {
     const uint32_t levels = texture_levels(t);
     uint32_t bytes = 0;
@@ -640,8 +671,14 @@ const Image& texture(const State& s, const TexMap& t) {
     if (!bytes) unsupported("texture format", t.format);
     if (auto it = g_copies.find(norm_addr(t.image)); it != g_copies.end()) {
         EfbCopy& c = it->second;
-        if (c.width == t.width && c.height == t.height && hash_bytes(g_mem + t.image, c.guest_bytes, 0) == c.guest_hash)
-            return c.image;
+        if (c.width == t.width && c.height == t.height) {
+            if (c.frame_checked == g.frame_number && c.loads_checked == s.tex_loads) return c.image;
+            require_texture_memory(t.image, c.guest_bytes, "a texture copy's memory outside MEM1 and MEM2");
+            if (hash_bytes(g_mem + t.image, c.guest_bytes, 0) == c.guest_hash) {
+                c.frame_checked = g.frame_number, c.loads_checked = s.tex_loads;
+                return c.image;
+            }
+        }
         g.garbage.emplace_back(g.frame_number, c.image);  // the CPU rewrote it, or it's read as something else
         g_copies.erase(it);
     }
@@ -650,13 +687,17 @@ const Image& texture(const State& s, const TexMap& t) {
     if (indexed) {
         if (t.tlut >= s.tlut.size()) unsupported("a TLUT name", t.tlut);
         tlut = &s.tlut[t.tlut];
+        if (!tlut->loaded) unsupported("a colour-indexed texture whose TLUT isn't loaded", t.tlut);
+        require_texture_memory(tlut->data, 2u * tlut->entries, "a TLUT outside MEM1 and MEM2");
     }
+    require_texture_memory(t.image, bytes, "a texture outside MEM1 and MEM2");
     uint64_t key = hash_bytes(nullptr, 0, 0x51C0FFEEull);
     const uint32_t id[7] = {t.image, t.format, t.width, t.height, tlut ? tlut->data : 0u, tlut ? tlut->format : 0u, levels};
     key = hash_bytes(reinterpret_cast<const uint8_t*>(id), sizeof id, key);
     Texture& tex = g.textures[key];
-    if (tex.frame_checked == g.frame_number && tex.image.img) return tex.image;
-    tex.frame_checked = g.frame_number;
+    tex.last_used = g.frame_number;
+    if (tex.image.img && tex.frame_checked == g.frame_number && tex.loads_checked == s.tex_loads) return tex.image;
+    tex.frame_checked = g.frame_number, tex.loads_checked = s.tex_loads;
     uint64_t h = hash_bytes(g_mem + t.image, bytes, 0);
     if (tlut) h = hash_bytes(g_mem + tlut->data, 2u * tlut->entries, h);
     if (tex.image.img && tex.hash == h) return tex.image;
@@ -752,7 +793,7 @@ void read_vertex(const State& s, const Draw& d, const uint8_t* v, InVertex& out)
     for (uint32_t a = kPos; a < kPosMtxArray; ++a) {
         const uint8_t desc = s.desc[a];
         if (desc == kNone) continue;
-        if (a == kNrm && s.nbt) unsupported("normals with binormals and tangents", a);
+        if (a == kNrm && f[a].cnt != 0) unsupported("normals with binormals and tangents", a);  // sized as three by vertex_size
         const uint8_t* src;
         if (desc == kDirect) {
             src = v + off;
@@ -933,7 +974,8 @@ void pack_draw(const State& s, DrawBlock& b) {
     // (end - start)) and A * zs - C orthographic (A = (far - near) / (end -
     // start), C = (start - near) / (end - start)).
     if (s.fog_type != 0) {
-        if (s.fog_type == 1 || s.fog_type == 3 || s.fog_type == 9 || s.fog_type == 11 || s.fog_type > 15)
+        // GXFogType: 2, 4-7 perspective, 10, 12-15 orthographic.
+        if (s.fog_type == 1 || s.fog_type == 3 || s.fog_type == 8 || s.fog_type == 9 || s.fog_type == 11 || s.fog_type > 15)
             unsupported("a fog type", s.fog_type);
         const float n = s.fog_near, fr = s.fog_far, range = s.fog_end - s.fog_start;
         if (range == 0.0f || fr == n) unsupported("fog with an empty range", 0);
@@ -958,6 +1000,16 @@ void pack_draw(const State& s, DrawBlock& b) {
                          t.ind_stage, t.ind_format, t.ind_bias, t.ind_mtx, t.ind_wrap_s, t.ind_wrap_t, t.ind_add_prev);
             unsupported("an indirect texture stage", i);
         }
+        // Values the shader would misread are stopped here: GXTevKColorSel
+        // 0-7 and 12-31, GXTevKAlphaSel 0-7 and 16-31, ops 0-1 and 8-15, the
+        // raster channels COLOR0A0, COLOR1A1, COLOR_ZERO and COLOR_NULL.
+        if (t.kcolor_sel > 31 || (t.kcolor_sel >= 8 && t.kcolor_sel < 12)) unsupported("a TEV konst colour selection", t.kcolor_sel);
+        if (t.kalpha_sel > 31 || (t.kalpha_sel >= 8 && t.kalpha_sel < 16)) unsupported("a TEV konst alpha selection", t.kalpha_sel);
+        if (t.color_op > 15 || (t.color_op >= 2 && t.color_op < 8)) unsupported("a TEV colour op", t.color_op);
+        if (t.alpha_op > 15 || (t.alpha_op >= 2 && t.alpha_op < 8)) unsupported("a TEV alpha op", t.alpha_op);
+        if (t.channel != 4 && t.channel != 5 && t.channel != 6 && t.channel != 0xFF) unsupported("a TEV raster channel", t.channel);
+        if ((t.coord != 0xFF && t.coord >= 8) || (t.map != 0xFF && t.map >= 8)) unsupported("a TEV coordinate or map", t.coord);
+        if (t.color_out > 3 || t.alpha_out > 3) unsupported("a TEV output register", t.color_out);
         uint32_t* c = b.stages[i * 3];
         uint32_t* a = b.stages[i * 3 + 1];
         uint32_t* o = b.stages[i * 3 + 2];
@@ -968,7 +1020,7 @@ void pack_draw(const State& s, DrawBlock& b) {
         a[0] = uint32_t(t.alpha_in[0]) | uint32_t(t.alpha_in[1]) << 4 | uint32_t(t.alpha_in[2]) << 8 | uint32_t(t.alpha_in[3]) << 12;
         a[1] = uint32_t(t.alpha_op) | uint32_t(t.alpha_bias) << 4 | uint32_t(t.alpha_scale) << 6 |
                uint32_t(t.alpha_clamp) << 8 | uint32_t(t.alpha_out) << 9;
-        const bool textured = t.map != 0xFF && t.coord != 0xFF;
+        const bool textured = t.map != 0xFF && t.coord != 0xFF && !t.tex_disabled;
         o[0] = textured ? (t.map & 7u) : 255u, o[1] = textured ? (t.coord & 7u) : 0u;
         o[2] = t.channel, o[3] = t.kalpha_sel;
         if (t.channel == 7 || t.channel == 8) unsupported("a bump alpha channel", t.channel);
@@ -1006,6 +1058,10 @@ void Renderer::copy_texture(const State& s, uint32_t dest, bool clear) {
     const CopyFormat cf = copy_format(s.tex_dst_format);
     const uint32_t w = s.tex_dst_width, h = s.tex_dst_height;
     if (w == 0 || h == 0 || w > 1024 || h > 1024) unsupported("a texture copy's size", w);
+    // The source inside the EFB, and a halving box's whole 2x2 blocks with it.
+    if (uint32_t(s.tex_src[0]) + s.tex_src[2] > kEfbWidth || uint32_t(s.tex_src[1]) + s.tex_src[3] > kEfbHeight)
+        unsupported("a texture copy from outside the EFB", s.tex_src[0]);
+    if (s.tex_dst_mipmap && (2 * w > s.tex_src[2] || 2 * h > s.tex_src[3])) unsupported("a halving copy larger than its source", w);
     begin_frame();
     end_rendering();
     Frame& f = cur();
@@ -1060,6 +1116,7 @@ void Renderer::draw(const State& s, const Draw& d) {
     if (s.ztex_op != 0) unsupported("a Z texture", s.ztex_op);
     if (d.count == 0 || (s.cull == 3 && !lines && !points)) return;  // GX_CULL_ALL draws no triangles
     if (s.scissor_offset[0] != 0 || s.scissor_offset[1] != 0) unsupported("a scissor box offset", s.scissor_offset[0]);
+    if (!(s.viewport[2] > 0) || !(s.viewport[3] > 0)) unsupported("a viewport without a positive size", 0);
 
     // vertices, transformed
     std::vector<GpuVertex> v(d.count);
@@ -1138,7 +1195,7 @@ void Renderer::draw(const State& s, const Draw& d) {
     for (unsigned m = 0; m < 8; ++m) views[m] = g.blank.view, samps[m] = sampler(0);
     for (unsigned i = 0; i < s.num_tev_stages; ++i) {
         const TevStage& t = s.tev[i];
-        if (t.map == 0xFF || t.coord == 0xFF) continue;
+        if (t.map == 0xFF || t.coord == 0xFF || t.tex_disabled) continue;
         const TexMap& tm = s.tex[t.map & 7];
         if (!tm.loaded) unsupported("a TEV stage reading a texture map with nothing loaded", t.map);
         begin_frame();
@@ -1178,7 +1235,6 @@ void Renderer::draw(const State& s, const Draw& d) {
     vkCmdBindVertexBuffers(cb, 0, 1, &f.vtx.buf, &vat);
     VkViewport vp{s.viewport[0], s.viewport[1], s.viewport[2], s.viewport[3], s.viewport[4], s.viewport[5]};
     vp.minDepth = std::clamp(vp.minDepth, 0.0f, 1.0f), vp.maxDepth = std::clamp(vp.maxDepth, 0.0f, 1.0f);
-    if (vp.width <= 0 || vp.height <= 0) return;
     vkCmdSetViewport(cb, 0, 1, &vp);
     const int32_t sx = static_cast<int32_t>(std::min(s.scissor[0], kEfbWidth)), sy = static_cast<int32_t>(std::min(s.scissor[1], kEfbHeight));
     VkRect2D sc{{sx, sy},
@@ -1202,6 +1258,9 @@ void Renderer::draw(const State& s, const Draw& d) {
 // EFB is cleared there if asked.
 void Renderer::copy_display(const State& s, uint32_t, bool clear) {
     ++stats().display_copies;
+    if (s.disp_src[2] == 0 || s.disp_src[3] == 0 || uint32_t(s.disp_src[0]) + s.disp_src[2] > kEfbWidth ||
+        uint32_t(s.disp_src[1]) + s.disp_src[3] > kEfbHeight)
+        unsupported("a display copy from outside the EFB", s.disp_src[0]);
     begin_frame();
     end_rendering();
     Frame& f = cur();
@@ -1399,7 +1458,8 @@ bool create_resources() {
                              VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
                                  VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
                              VK_IMAGE_ASPECT_COLOR_BIT);
-    g.efb_depth = make_image(kEfbWidth, kEfbHeight, kEfbDepth, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, VK_IMAGE_ASPECT_DEPTH_BIT);
+    g.efb_depth = make_image(kEfbWidth, kEfbHeight, kEfbDepth,
+                             VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_DEPTH_BIT);
     g.blank = make_image(1, 1, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                          VK_IMAGE_ASPECT_COLOR_BIT);
 
@@ -1427,6 +1487,11 @@ bool create_resources() {
     const VkClearColorValue black{};
     const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
     vkCmdClearColorImage(f.cb, g.efb_color.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &range);
+    // Depth starts at the far plane (GX's clear Z default), not undefined.
+    transition(f.cb, g.efb_depth, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT);
+    const VkClearDepthStencilValue far{1.0f, 0};
+    const VkImageSubresourceRange depth_range{VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
+    vkCmdClearDepthStencilImage(f.cb, g.efb_depth.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &far, 1, &depth_range);
     transition(f.cb, g.blank, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
     vkCmdClearColorImage(f.cb, g.blank.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &range);
     transition(f.cb, g.blank, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);

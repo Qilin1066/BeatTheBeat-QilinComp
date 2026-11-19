@@ -11,6 +11,21 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+### Fixed
+From a full review of the runtime (three independent reads, each finding checked against the code before fixing):
+- **DVD:** `DVDCancel` and `DVDClose` finish a pending request before returning, its callback run with "cancelled", as the SDK's synchronous cancel does; before, the completion still wrote the file info 1 ms later, after the game may have freed it. Requests are numbered, so a completion for a reused command block does nothing.
+- **Threads:** whether a thread is ending is read before the run token goes (the next thread may rewrite its OSThread); a retired host thread no longer leaves a pointer to its destroyed context for reports. `OSLoadContext` unwinds only from the decrementer's handler, and stops, naming itself, anywhere else, instead of escaping uncaught.
+- **The time limit** reports at the game's next safe point (an interrupt), not from its own thread while the game runs; a game stuck without safe points still ends 5 s later.
+- **GX:** `GX_TEX_DISABLE` on a TEV stage's map is kept (it was truncated into a lookup of map 0); one or three normals follow the vertex format's element count alone, as the command processor parses, and NBT normals stop in the renderer instead of misreading the rest of the vertex; display lists, textures, TLUTs and copies are checked against guest memory; TEV selectors, ops and channels GX doesn't define, fog type 8, copy and display rectangles outside the EFB, a halving copy larger than its source, and a non-positive viewport stop instead of drawing wrong.
+- **Renderer:** the depth buffer starts at the far plane (it was undefined); a texture is re-checked after each texture or TLUT load as well as each frame, so a buffer rewritten between draws isn't drawn stale; textures unused for 10 s are freed (the cache grew without bound); an EFB copy's guest bytes are hashed once a frame, not per draw; the sampler's minimum LOD never exceeds its maximum; the window must offer an 8-bit UNORM format that blits can write (no sRGB fallback that would wash the picture out).
+- **Audio:** a zero or out-of-memory address in AX's command list stops, instead of becoming a write into low memory.
+- **NAND:** a path component with `\` or `:` is refused (on Windows it could leave the flash's folder); paths longer than the flash's 63 characters stop instead of being cut short; read and write buffers are checked against guest memory; a seek outside the file stops (the console's answer isn't pinned down).
+- **WPAD:** `WPADDisconnect` disconnects (the connect callback hears it, reports stop) and a button press reconnects, as on a console.
+- **OS:** the UART, `__write_file`, `OSPanic` and `OSRegisterVersion` check their guest text.
+- **Input script:** `A@:0.3`, `A@nan` and `A@1:` are refused (tested).
+- **Interrupts, efficiency:** lifted loops take the slow path only when something is due now, not whenever an I/O completion is queued 1 ms ahead.
+- **VI:** `VIWaitForRetrace` delivers what came due while it slept when it turns interrupts back on.
+
 ## [0.16.0] - 2026-11-19
 The game is seen, heard and controlled: `qilin_run` opens a window, draws with Vulkan 1.3, mixes the game's sound and plays it, and takes the keyboard (or a script) as a Wii Remote. It boots to the title and past the first A. Not yet checked by eye, and not playable end to end.
 

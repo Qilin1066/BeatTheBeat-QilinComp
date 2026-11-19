@@ -19,6 +19,7 @@
 #include "dol.hpp"
 #include "dvd.hpp"
 #include "host.hpp"
+#include "interrupts.hpp"
 #include "machine.hpp"
 #include "nand.hpp"
 #include "native.hpp"
@@ -56,9 +57,20 @@ void start_time_limit() {
     if (seconds <= 0) return;
     std::thread([seconds] {
         std::this_thread::sleep_for(std::chrono::seconds(seconds));
-        std::fprintf(stderr, "qilin_run: time limit (%ld s) reached\n", seconds);
+        // The report runs in the game, at its next safe point (as an
+        // interrupt), so it reads the threads and counters while nothing
+        // changes them.
+        rt::post_interrupt([seconds](rt::Context&) {
+            std::fprintf(stderr, "qilin_run: time limit (%ld s) reached\n", seconds);
+            rt::report_stats();
+            rt::report_threads();
+            end(3);
+        });
+        // A game stuck where interrupts can't reach it still ends; its
+        // counters may be a moment stale then.
+        std::this_thread::sleep_for(std::chrono::seconds(5));
+        std::fprintf(stderr, "qilin_run: time limit (%ld s) reached, and the game reached no safe point for 5 s\n", seconds);
         rt::report_stats();
-        rt::report_threads();
         end(3);
     }).detach();
 }

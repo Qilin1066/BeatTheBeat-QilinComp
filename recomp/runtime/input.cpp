@@ -10,6 +10,7 @@
 // at start. Runtime code: no std::format.
 #include "input.hpp"
 
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 
@@ -82,12 +83,19 @@ bool parse_input_script(std::string_view script, std::vector<ScriptedPress>& out
                 buttons = b && buttons != 0xFFFF ? uint16_t(buttons | b) : 0xFFFF;  // 0xFFFF: a name that isn't a button
             });
         const std::string when(at == std::string_view::npos ? std::string_view{} : part.substr(at + 1));
+        // Each number must be there (strtod consuming something) and finite.
+        bool numbers = !when.empty();
         char* end = nullptr;
-        const double seconds = when.empty() ? -1 : std::strtod(when.c_str(), &end);
+        const double seconds = numbers ? std::strtod(when.c_str(), &end) : -1;
+        numbers = numbers && end != when.c_str();
         double duration = 0.1;
-        if (end && *end == ':') duration = std::strtod(end + 1, &end);
-        if (at == std::string_view::npos || buttons == 0 || buttons == 0xFFFF || when.empty() || *end || seconds < 0 ||
-            duration <= 0) {
+        if (numbers && *end == ':') {
+            const char* d = end + 1;
+            duration = std::strtod(d, &end);
+            numbers = end != d;
+        }
+        if (at == std::string_view::npos || buttons == 0 || buttons == 0xFFFF || !numbers || *end || !std::isfinite(seconds) ||
+            !std::isfinite(duration) || seconds < 0 || duration <= 0) {
             ok = false;
             bad = part;
             return;

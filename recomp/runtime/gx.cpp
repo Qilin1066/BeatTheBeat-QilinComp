@@ -132,7 +132,7 @@ QILIN_NATIVE(GXSetTlutRegionCallback) {
 
 // ---- caches and synchronisation: no caches; the sink draws as it's called ----
 QILIN_NATIVE(GXInvalidateVtxCache) {}
-QILIN_NATIVE(GXInvalidateTexAll) {}
+QILIN_NATIVE(GXInvalidateTexAll) { ++g_state.tex_loads; }  // texture memory may have new contents
 QILIN_NATIVE(GXDrawDone) {}
 QILIN_NATIVE(GXPixModeSync) {}
 
@@ -312,6 +312,7 @@ QILIN_NATIVE(GXLoadTexObj) {
     TexMap& t = g_state.tex[check(c, c.r[4], 8, "texture map")];
     const uint32_t w0 = peek32(o), w2 = peek32(o + 8);
     t.loaded = true;
+    ++g_state.tex_loads;
     t.mode0 = w0, t.mode1 = peek32(o + 4);
     t.wrap_s = w0 & 3, t.wrap_t = (w0 >> 2) & 3;
     t.width = static_cast<uint16_t>((w2 & 0x3FF) + 1), t.height = static_cast<uint16_t>(((w2 >> 10) & 0x3FF) + 1);
@@ -325,6 +326,7 @@ QILIN_NATIVE(GXLoadTlut) {
     const uint32_t o = c.r[3];
     Tlut& t = g_state.tlut[check(c, c.r[4], 20, "TLUT")];
     t.loaded = true;
+    ++g_state.tex_loads;
     t.format = (peek32(o) >> 10) & 3;
     t.data = virt((peek32(o + 4) & 0xFFFFFF) << 5);
     t.entries = peek16(o + 8);
@@ -332,9 +334,14 @@ QILIN_NATIVE(GXLoadTlut) {
 
 // ---- TEV ----
 QILIN_NATIVE(GXSetNumTevStages) { g_state.num_tev_stages = static_cast<uint8_t>(check(c, c.r[3] & 0xFF, 17, "TEV stages")); }
+// (stage, coord, map, channel): the map may carry GX_TEX_DISABLE (0x100),
+// which keeps the coordinate (for indirect texturing) without a lookup.
 QILIN_NATIVE(GXSetTevOrder) {
     TevStage& t = stage(c, c.r[3]);
-    t.coord = static_cast<uint8_t>(c.r[4]), t.map = static_cast<uint8_t>(c.r[5]), t.channel = static_cast<uint8_t>(c.r[6]);
+    const uint32_t map = c.r[5];
+    if (map != 0xFF && (map & ~0x1FFu || (map & 0xFF) >= 8)) bad_arg(c, "TEV texture map", map);
+    t.coord = static_cast<uint8_t>(c.r[4]), t.channel = static_cast<uint8_t>(c.r[6]);
+    t.map = static_cast<uint8_t>(map & 0xFF), t.tex_disabled = (map & 0x100) != 0;
 }
 QILIN_NATIVE(GXSetTevColorIn) {
     TevStage& t = stage(c, c.r[3]);
