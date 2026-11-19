@@ -56,7 +56,9 @@ void start_time_limit() {
     const long seconds = std::strtol(v, nullptr, 10);
     if (seconds <= 0) return;
     std::thread([seconds] {
-        std::this_thread::sleep_for(std::chrono::seconds(seconds));
+        // The game's time: a pause for the settings menu doesn't count.
+        const uint64_t until = rt::time_base() + uint64_t(seconds) * rt::kTimeBaseHz;
+        while (rt::time_base() < until) std::this_thread::sleep_for(std::chrono::milliseconds(100));
         // The report runs in the game, at its next safe point (as an
         // interrupt), so it reads the threads and counters while nothing
         // changes them.

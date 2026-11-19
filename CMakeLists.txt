@@ -272,9 +272,31 @@ if(QILIN_RUNTIME_GEN_DIR)
             endif()
         endif()
 
-        target_sources(qilin_run PRIVATE recomp/runtime/host.cpp recomp/runtime/gx_vulkan.cpp recomp/runtime/gx_texture.cpp)
+        # Dear ImGui (MIT) for the settings menu, as the other Qilin recomps
+        # draw theirs: the same release (v1.93.0), its core and its SDL3 and
+        # Vulkan backends, fetched and pinned like SDL3. Its Vulkan backend
+        # loads the functions through the renderer's loader (no prototypes).
+        FetchContent_Declare(imgui
+            URL https://github.com/ocornut/imgui/archive/c1aaac65e896a45f81f47a4d68f9959e0f86c859.tar.gz
+            URL_HASH SHA256=b3d8f99838bb3ff05e14185562345f85e00c032da4d8fc277608d7898d847114)
+        FetchContent_MakeAvailable(imgui)
+        add_library(qilin_imgui STATIC
+            ${imgui_SOURCE_DIR}/imgui.cpp ${imgui_SOURCE_DIR}/imgui_draw.cpp ${imgui_SOURCE_DIR}/imgui_tables.cpp
+            ${imgui_SOURCE_DIR}/imgui_widgets.cpp ${imgui_SOURCE_DIR}/backends/imgui_impl_sdl3.cpp
+            ${imgui_SOURCE_DIR}/backends/imgui_impl_vulkan.cpp)
+        target_include_directories(qilin_imgui PUBLIC ${imgui_SOURCE_DIR} ${imgui_SOURCE_DIR}/backends)
+        target_compile_definitions(qilin_imgui PUBLIC IMGUI_IMPL_VULKAN_NO_PROTOTYPES VK_NO_PROTOTYPES IMGUI_DISABLE_OBSOLETE_FUNCTIONS)
+        target_link_libraries(qilin_imgui PUBLIC SDL3::SDL3 Vulkan::Headers)
+        if(MSVC)
+            target_compile_options(qilin_imgui PRIVATE /W0)  # third-party code: its warnings aren't ours
+        else()
+            target_compile_options(qilin_imgui PRIVATE -w)
+        endif()
+
+        target_sources(qilin_run PRIVATE recomp/runtime/host.cpp recomp/runtime/gx_vulkan.cpp recomp/runtime/gx_texture.cpp
+                                         recomp/runtime/menu.cpp recomp/runtime/pause.cpp)
         target_include_directories(qilin_run PRIVATE "${QILIN_SHADER_DIR}")
-        target_link_libraries(qilin_run PRIVATE SDL3::SDL3 Vulkan::Headers)
+        target_link_libraries(qilin_run PRIVATE SDL3::SDL3 Vulkan::Headers qilin_imgui)
     endif()
 endif()
 

@@ -23,7 +23,9 @@
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
 
+#ifndef VK_NO_PROTOTYPES  // (the menu's ImGui library defines it for everything that links it)
 #define VK_NO_PROTOTYPES
+#endif
 #include <vulkan/vulkan.h>
 
 #include <algorithm>
@@ -35,8 +37,10 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <functional>
 #include <fstream>
 #include <iterator>
+#include <mutex>
 #include <unordered_map>
 #include <vector>
 
@@ -45,6 +49,7 @@
 #include "gx.hpp"
 #include "machine.hpp"
 #include "native.hpp"
+#include "pause.hpp"
 #include "profile.hpp"
 #include "settings.hpp"
 
@@ -79,7 +84,7 @@ namespace {
     X(vkCmdBindVertexBuffers) X(vkCmdDraw) X(vkCmdSetViewport) X(vkCmdSetScissor) X(vkCmdSetCullMode)               \
     X(vkCmdSetFrontFace) X(vkCmdSetDepthTestEnable) X(vkCmdSetDepthWriteEnable) X(vkCmdSetDepthCompareOp)           \
     X(vkCmdBlitImage) X(vkCmdCopyBufferToImage) X(vkCmdClearAttachments) X(vkCmdClearColorImage) X(vkCmdPushConstants)    \
-    X(vkCmdClearDepthStencilImage) X(vkDestroyBuffer) X(vkCreateQueryPool) X(vkCmdResetQueryPool)                    \
+    X(vkCmdClearDepthStencilImage) X(vkDestroyBuffer) X(vkCmdCopyImage) X(vkDestroySampler) X(vkCreateQueryPool) X(vkCmdResetQueryPool)                    \
     X(vkCmdWriteTimestamp2) X(vkGetQueryPoolResults) X(vkCreatePipelineCache) X(vkGetPipelineCacheData)              \
     X(vkCmdCopyImageToBuffer)
 
@@ -226,6 +231,18 @@ struct Vk {
     VkFormat swap_format = VK_FORMAT_UNDEFINED;
     VkExtent2D extent{};
     std::vector<VkImage> swap_images;
+    std::vector<VkImageView> swap_views;  // for drawing the menu into them
+    bool swap_drawable = false;           // they can be drawn into (colour attachments)
+    // The picture last shown (the EFB's display copy), kept so a paused
+    // game's frames can show it under the menu; its size in pixels.
+    Image last_frame;
+    uint32_t last_w = 0, last_h = 0;
+    // What the menu draws over the picture (gx_vulkan.hpp's set_overlay).
+    std::function<void(VkCommandBuffer)> overlay;
+    std::mutex overlay_lock;
+    bool efb_fresh = false;        // new EFB images, to clear at the next frame
+    float anisotropy_limit = 1;    // the GPU's (1 without anisotropic filtering)
+    std::vector<std::string> gpu_names;  // the GPUs that can draw to the window, for the menu
     std::vector<VkSemaphore> rendered;  // one per swapchain image
     std::atomic<bool> resized{false};
     // rendering
@@ -384,7 +401,10 @@ bool make_swapchain() {
     si.minImageCount = std::max(caps.minImageCount, 3u);
     if (caps.maxImageCount) si.minImageCount = std::min(si.minImageCount, caps.maxImageCount);
     si.imageFormat = format.format, si.imageColorSpace = format.colorSpace, si.imageExtent = extent;
-    si.imageArrayLayers = 1, si.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    // Drawn into too where it can be (the settings menu over the picture).
+    g.swap_drawable = (caps.supportedUsageFlags & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) != 0;
+    si.imageArrayLayers = 1;
+    si.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | (g.swap_drawable ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT : 0u);
     si.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE, si.preTransform = caps.currentTransform;
     si.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR, si.presentMode = mode, si.clipped = VK_TRUE;
     si.oldSwapchain = g.swapchain;
@@ -392,6 +412,7 @@ bool make_swapchain() {
     vk_check(vkCreateSwapchainKHR(g.device, &si, nullptr, &sc), "vkCreateSwapchainKHR");
     if (g.swapchain) {
         vk_check(vkDeviceWaitIdle(g.device), "vkDeviceWaitIdle");
+        for (VkImageView v : g.swap_views) vkDestroyImageView(g.device, v, nullptr);
         vkDestroySwapchainKHR(g.device, g.swapchain, nullptr);
         for (VkSemaphore s : g.rendered) vkDestroySemaphore(g.device, s, nullptr);
     }
@@ -399,6 +420,14 @@ bool make_swapchain() {
     vkGetSwapchainImagesKHR(g.device, sc, &n, nullptr);
     g.swap_images.resize(n);
     vkGetSwapchainImagesKHR(g.device, sc, &n, g.swap_images.data());
+    g.swap_views.assign(n, VK_NULL_HANDLE);
+    if (g.swap_drawable)
+        for (uint32_t i = 0; i < n; ++i) {
+            VkImageViewCreateInfo vi = vk_struct<VkImageViewCreateInfo>(VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO);
+            vi.image = g.swap_images[i], vi.viewType = VK_IMAGE_VIEW_TYPE_2D, vi.format = format.format;
+            vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            vk_check(vkCreateImageView(g.device, &vi, nullptr, &g.swap_views[i]), "vkCreateImageView");
+        }
     g.rendered.resize(n);
     for (auto& s : g.rendered) {
         VkSemaphoreCreateInfo ci = vk_struct<VkSemaphoreCreateInfo>(VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO);
@@ -720,6 +749,19 @@ void begin_frame() {
         vkCmdResetQueryPool(f.cb, g.timestamps, g.frame * 2, 2);
         vkCmdWriteTimestamp2(f.cb, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, g.timestamps, g.frame * 2);
     }
+    if (g.efb_fresh) {  // new EFB images: black, depth at the far plane (GX's clear Z default)
+        g.efb_fresh = false;
+        const VkClearColorValue black{};
+        const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        transition(f.cb, g.efb_color, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
+        vkCmdClearColorImage(f.cb, g.efb_color.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &range);
+        transition(f.cb, g.last_frame, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
+        vkCmdClearColorImage(f.cb, g.last_frame.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &range);
+        transition(f.cb, g.efb_depth, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT);
+        const VkClearDepthStencilValue far{1.0f, 0};
+        const VkImageSubresourceRange depth_range{VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
+        vkCmdClearDepthStencilImage(f.cb, g.efb_depth.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &far, 1, &depth_range);
+    }
 }
 
 void end_rendering() {
@@ -843,6 +885,7 @@ uint32_t norm_addr(uint32_t a) { return (a & 0x1FFFFFFFu) | 0x80000000u; }
 struct EfbCopy {
     Image image;
     uint32_t width = 0, height = 0, format = 0;
+    uint32_t scale = 1;        // the internal resolution it was made at
     uint32_t guest_bytes = 0;  // the copy's size in guest memory
     uint64_t made = 0;         // the write generation when it was made: a newer write there replaces it
 };
@@ -1258,7 +1301,9 @@ void Renderer::copy_texture(const State& s, uint32_t dest, bool clear) {
     end_rendering();
     Frame& f = cur();
     EfbCopy& c = g_copies[norm_addr(dest)];
-    if (c.image.img && (c.width != w || c.height != h)) g.garbage.emplace_back(g.frame_number, c.image), c.image = Image{};
+    if (c.image.img && (c.width != w || c.height != h || c.scale != g.scale))  // (the menu can change the scale)
+        g.garbage.emplace_back(g.frame_number, c.image), c.image = Image{};
+    c.scale = g.scale;
     if (!c.image.img)
         c.image = make_image(w * g.scale, h * g.scale, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
                              VK_IMAGE_ASPECT_COLOR_BIT);
@@ -1442,18 +1487,30 @@ void Renderer::draw(const State& s, const Draw& d) {
     vkCmdDraw(cb, static_cast<uint32_t>(order.size()), 1, 0, 0);
 }
 
-// GXCopyDisp: the frame. The EFB's source rectangle goes to the window
-// (keeping the console's aspect: 16:9 with its widescreen setting), then the
-// EFB is cleared there if asked.
-void Renderer::copy_display(const State& s, uint32_t, bool clear) {
-    const Timed timed(Section::Present);
-    ++stats().display_copies;
-    if (s.disp_src[2] == 0 || s.disp_src[3] == 0 || uint32_t(s.disp_src[0]) + s.disp_src[2] > kEfbWidth ||
-        uint32_t(s.disp_src[1]) + s.disp_src[3] > kEfbHeight)
-        unsupported("a display copy from outside the EFB", s.disp_src[0]);
-    begin_frame();
-    end_rendering();
-    Frame& f = cur();
+// The picture's place in the window, as the settings say: whole multiples
+// of the console's picture (854x480 at 16:9, 640x480 at 4:3; the sharpest),
+// the largest that keeps its shape, or the whole window.
+VkRect2D picture_rect() {
+    const float W = float(g.extent.width), H = float(g.extent.height);
+    const bool wide = console().widescreen;
+    const Scaling mode = settings().scaling;
+    if (mode == Scaling::stretch) return {{0, 0}, g.extent};
+    if (mode == Scaling::integer) {
+        const uint32_t bw = wide ? 854 : 640, bh = 480;
+        const uint32_t k = std::min(g.extent.width / bw, g.extent.height / bh);
+        if (k >= 1)
+            return {{int32_t((g.extent.width - bw * k) / 2), int32_t((g.extent.height - bh * k) / 2)}, {bw * k, bh * k}};
+    }
+    const float aspect = wide ? 16.0f / 9.0f : 4.0f / 3.0f;
+    float w = W, h = H;
+    if (w / h > aspect) w = h * aspect;
+    else h = w / aspect;
+    return {{int32_t((W - w) / 2), int32_t((H - h) / 2)}, {uint32_t(w), uint32_t(h)}};
+}
+
+// The end of a frame: a window image gets the last picture (and the menu
+// over it, if one is open), then the frame is submitted and presented.
+void finish_frame(Frame& f) {
     VkCommandBuffer cb = f.cb;
     if (g.resized.exchange(false) || !g.swapchain) {
         vk_check(vkDeviceWaitIdle(g.device), "vkDeviceWaitIdle");
@@ -1467,46 +1524,41 @@ void Renderer::copy_display(const State& s, uint32_t, bool clear) {
     }
     if (image != UINT32_MAX) {
         const VkImage dst = g.swap_images[image];
-        transition(cb, g.efb_color, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
         transition(cb, dst, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
         const VkClearColorValue black{};
         const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
         vkCmdClearColorImage(cb, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &range);
-        const float aspect = console().widescreen ? 16.0f / 9.0f : 4.0f / 3.0f;
-        float w = float(g.extent.width), h = float(g.extent.height);
-        if (w / h > aspect) w = h * aspect;
-        else h = w / aspect;
-        const int32_t x0 = int32_t((float(g.extent.width) - w) / 2), y0 = int32_t((float(g.extent.height) - h) / 2);
-        VkImageBlit blit{};
-        blit.srcSubresource = blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-        const int32_t k = int32_t(g.scale), sx = s.disp_src[0], sy = s.disp_src[1];
-        blit.srcOffsets[0] = {sx * k, sy * k, 0};
-        blit.srcOffsets[1] = {std::min<int32_t>(sx + s.disp_src[2], kEfbWidth) * k, std::min<int32_t>(sy + s.disp_src[3], kEfbHeight) * k, 1};
-        blit.dstOffsets[0] = {x0, y0, 0};
-        blit.dstOffsets[1] = {x0 + int32_t(w), y0 + int32_t(h), 1};
-        vkCmdBlitImage(cb, g.efb_color.img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
-                       &blit, VK_FILTER_LINEAR);
-        transition(cb, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_IMAGE_ASPECT_COLOR_BIT);
+        if (g.last_w && g.last_h) {
+            transition(cb, g.last_frame, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
+            const VkRect2D r = picture_rect();
+            VkImageBlit blit{};
+            blit.srcSubresource = blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            blit.srcOffsets[1] = {int32_t(g.last_w), int32_t(g.last_h), 1};
+            blit.dstOffsets[0] = {r.offset.x, r.offset.y, 0};
+            blit.dstOffsets[1] = {r.offset.x + int32_t(r.extent.width), r.offset.y + int32_t(r.extent.height), 1};
+            vkCmdBlitImage(cb, g.last_frame.img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
+                           &blit, settings().smooth ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
+        }
+        std::function<void(VkCommandBuffer)> overlay;
+        {
+            std::lock_guard l(g.overlay_lock);  // the menu sets it from the main thread
+            overlay = g.overlay;
+        }
+        if (overlay && g.swap_drawable) {  // the menu, over the picture
+            transition(cb, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
+            VkRenderingAttachmentInfo color = vk_struct<VkRenderingAttachmentInfo>(VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO);
+            color.imageView = g.swap_views[image], color.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+            color.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD, color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+            VkRenderingInfo ri = vk_struct<VkRenderingInfo>(VK_STRUCTURE_TYPE_RENDERING_INFO);
+            ri.renderArea = {{0, 0}, g.extent}, ri.layerCount = 1, ri.colorAttachmentCount = 1, ri.pColorAttachments = &color;
+            vkCmdBeginRendering(cb, &ri);
+            overlay(cb);
+            vkCmdEndRendering(cb);
+            transition(cb, dst, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_IMAGE_ASPECT_COLOR_BIT);
+        } else {
+            transition(cb, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_IMAGE_ASPECT_COLOR_BIT);
+        }
     }
-    // QILIN_FRAME_STATS=N: every Nth frame's EFB rectangle read back and
-    // summed up (numbers only), to tell a drawn frame from an empty one
-    // without looking at it.
-    static const uint32_t stats_every = [] {
-        const char* v = std::getenv("QILIN_FRAME_STATS");
-        return v ? static_cast<uint32_t>(std::strtoul(v, nullptr, 10)) : 0u;
-    }();
-    const uint32_t rw = std::min<uint32_t>(s.disp_src[2], kEfbWidth - std::min<uint32_t>(s.disp_src[0], kEfbWidth)) * g.scale;
-    const uint32_t rh = std::min<uint32_t>(s.disp_src[3], kEfbHeight - std::min<uint32_t>(s.disp_src[1], kEfbHeight)) * g.scale;
-    const bool sample = stats_every && g.frame_number % stats_every == 0 && rw && rh;
-    if (sample) {
-        transition(cb, g.efb_color, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
-        VkBufferImageCopy region{};
-        region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-        region.imageOffset = {int32_t(s.disp_src[0] * g.scale), int32_t(s.disp_src[1] * g.scale), 0};
-        region.imageExtent = {rw, rh, 1};
-        vkCmdCopyImageToBuffer(cb, g.efb_color.img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, f.readback.buf, 1, &region);
-    }
-    if (clear) clear_efb(s, s.disp_src);
     if (g.timestamps) {
         vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, g.timestamps, g.frame * 2 + 1);
         f.timed = true;
@@ -1535,28 +1587,72 @@ void Renderer::copy_display(const State& s, uint32_t, bool clear) {
         else vk_check(r, "vkQueuePresentKHR");
         ++stats().frames_presented;
     }
-    if (sample) {
-        vk_check(vkWaitForFences(g.device, 1, &f.fence, VK_TRUE, UINT64_MAX), "vkWaitForFences");
-        uint64_t lit = 0, sum[3] = {};
-        uint8_t seen[4096] = {};
-        uint32_t colours = 0;
-        for (uint32_t i = 0; i < rw * rh; ++i) {
-            const uint8_t* p = f.readback.map + 4 * size_t(i);
-            if (p[0] | p[1] | p[2]) ++lit;
-            for (unsigned k = 0; k < 3; ++k) sum[k] += p[k];
-            const uint32_t bucket = uint32_t(p[0] >> 4) << 8 | uint32_t(p[1] >> 4) << 4 | uint32_t(p[2] >> 4);
-            if (!seen[bucket]) seen[bucket] = 1, ++colours;
-        }
-        const double n = double(rw) * rh;
-        std::fprintf(stderr, "qilin_run: frame %llu: %ux%u, %.1f%% not black, mean colour %.0f %.0f %.0f, %u colour buckets\n",
-                     static_cast<unsigned long long>(g.frame_number), rw, rh, 100.0 * double(lit) / n, double(sum[0]) / n,
-                     double(sum[1]) / n, double(sum[2]) / n, colours);
-    }
-    g.frame = (g.frame + 1) % kFrames;
-    ++g.frame_number;
-    if (g.frame_number % 300 == 0) save_pipeline_cache();  // every 5 s, when there are new pipelines
 }
 
+// GXCopyDisp: the frame. The EFB's source rectangle becomes the picture
+// shown (kept in last_frame), the EFB is cleared there if asked, and the
+// frame goes to the window. Then the game parks here if the menu asked.
+void Renderer::copy_display(const State& s, uint32_t, bool clear) {
+    {
+        const Timed timed(Section::Present);
+        ++stats().display_copies;
+        if (s.disp_src[2] == 0 || s.disp_src[3] == 0 || uint32_t(s.disp_src[0]) + s.disp_src[2] > kEfbWidth ||
+            uint32_t(s.disp_src[1]) + s.disp_src[3] > kEfbHeight)
+            unsupported("a display copy from outside the EFB", s.disp_src[0]);
+        begin_frame();
+        end_rendering();
+        Frame& f = cur();
+        VkCommandBuffer cb = f.cb;
+        const uint32_t rw = s.disp_src[2] * g.scale, rh = s.disp_src[3] * g.scale;
+        transition(cb, g.efb_color, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
+        transition(cb, g.last_frame, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
+        VkImageCopy region{};
+        region.srcSubresource = region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        region.srcOffset = {int32_t(s.disp_src[0] * g.scale), int32_t(s.disp_src[1] * g.scale), 0};
+        region.extent = {rw, rh, 1};
+        vkCmdCopyImage(cb, g.efb_color.img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g.last_frame.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                       1, &region);
+        g.last_w = rw, g.last_h = rh;
+        // QILIN_FRAME_STATS=N: every Nth frame's picture read back and summed
+        // up (numbers only), to tell a drawn frame from an empty one without
+        // looking at it.
+        static const uint32_t stats_every = [] {
+            const char* v = std::getenv("QILIN_FRAME_STATS");
+            return v ? static_cast<uint32_t>(std::strtoul(v, nullptr, 10)) : 0u;
+        }();
+        const bool sample = stats_every && g.frame_number % stats_every == 0;
+        if (sample) {
+            VkBufferImageCopy back{};
+            back.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            back.imageOffset = region.srcOffset;
+            back.imageExtent = {rw, rh, 1};
+            vkCmdCopyImageToBuffer(cb, g.efb_color.img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, f.readback.buf, 1, &back);
+        }
+        if (clear) clear_efb(s, s.disp_src);
+        finish_frame(f);
+        if (sample) {
+            vk_check(vkWaitForFences(g.device, 1, &f.fence, VK_TRUE, UINT64_MAX), "vkWaitForFences");
+            uint64_t lit = 0, sum[3] = {};
+            uint8_t seen[4096] = {};
+            uint32_t colours = 0;
+            for (uint32_t i = 0; i < rw * rh; ++i) {
+                const uint8_t* p = f.readback.map + 4 * size_t(i);
+                if (p[0] | p[1] | p[2]) ++lit;
+                for (unsigned k = 0; k < 3; ++k) sum[k] += p[k];
+                const uint32_t bucket = uint32_t(p[0] >> 4) << 8 | uint32_t(p[1] >> 4) << 4 | uint32_t(p[2] >> 4);
+                if (!seen[bucket]) seen[bucket] = 1, ++colours;
+            }
+            const double n = double(rw) * rh;
+            std::fprintf(stderr, "qilin_run: frame %llu: %ux%u, %.1f%% not black, mean colour %.0f %.0f %.0f, %u colour buckets\n",
+                         static_cast<unsigned long long>(g.frame_number), rw, rh, 100.0 * double(lit) / n, double(sum[0]) / n,
+                         double(sum[1]) / n, double(sum[2]) / n, colours);
+        }
+        g.frame = (g.frame + 1) % kFrames;
+        ++g.frame_number;
+        if (g.frame_number % 300 == 0) save_pipeline_cache();  // every 5 s, when there are new pipelines
+    }
+    park_if_requested();  // the settings menu: nothing is being recorded now
+}
 // ---- start-up ----
 bool fail(const char* what) {
     std::fprintf(stderr, "qilin_run: Vulkan: %s\n", what);
@@ -1581,12 +1677,16 @@ bool create_device() {
             VkBool32 present = VK_FALSE;
             vkGetPhysicalDeviceSurfaceSupportKHR(gpu, q, g.surface, &present);
             if (!(qs[q].queueFlags & VK_QUEUE_GRAPHICS_BIT) || !present) continue;
-            const int score = p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? 2 : 1;
+            // The settings' GPU by name, else a discrete one, else any.
+            g.gpu_names.emplace_back(p.deviceName);
+            const int score = settings().gpu == p.deviceName ? 3 : p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? 2 : 1;
             if (score > best) best = score, g.gpu = gpu, g.family = q;
             break;
         }
     }
     if (!g.gpu) return fail("no GPU with Vulkan 1.3 can draw to this window");
+    if (!settings().gpu.empty() && best < 3)
+        std::fprintf(stderr, "qilin_run: the settings' GPU \"%s\" isn't here; using the best one\n", settings().gpu.c_str());
     VkPhysicalDeviceProperties props;
     vkGetPhysicalDeviceProperties(g.gpu, &props);
     g.ubo_align = std::max<VkDeviceSize>(props.limits.minUniformBufferOffsetAlignment, 16);
@@ -1599,17 +1699,17 @@ bool create_device() {
     if (!f13.dynamicRendering || !f13.synchronization2) return fail("the GPU lacks dynamic rendering or synchronization2");
     VkPhysicalDeviceVulkan13Features want13 = vk_struct<VkPhysicalDeviceVulkan13Features>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES);
     want13.dynamicRendering = VK_TRUE, want13.synchronization2 = VK_TRUE;
-    // Anisotropic filtering, if the settings ask for it and the GPU has it.
+    // Anisotropic filtering, wherever the GPU has it (the settings menu can
+    // turn it on while the game runs).
     VkPhysicalDeviceFeatures2 want = vk_struct<VkPhysicalDeviceFeatures2>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2);
     want.pNext = &want13;
-    if (settings().anisotropy > 1) {
-        if (f2.features.samplerAnisotropy) {
-            want.features.samplerAnisotropy = VK_TRUE;
-            g.max_anisotropy = std::min(float(settings().anisotropy), props.limits.maxSamplerAnisotropy);
-        } else {
-            std::fprintf(stderr, "qilin_run: this GPU has no anisotropic filtering: textures are filtered as the console does\n");
-        }
+    if (f2.features.samplerAnisotropy) {
+        want.features.samplerAnisotropy = VK_TRUE;
+        g.anisotropy_limit = props.limits.maxSamplerAnisotropy;
+    } else if (settings().anisotropy > 1) {
+        std::fprintf(stderr, "qilin_run: this GPU has no anisotropic filtering: textures are filtered as the console does\n");
     }
+    g.max_anisotropy = std::min(float(settings().anisotropy), g.anisotropy_limit);
 
     std::vector<const char*> exts = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
     vkEnumerateDeviceExtensionProperties(g.gpu, nullptr, &n, nullptr);
@@ -1637,6 +1737,28 @@ bool create_device() {
     return true;
 }
 
+// The images at the internal resolution: the EFB (colour and depth), the
+// picture last shown, and each frame's statistics readback. Made at start
+// and again when the menu changes the resolution (the game parked, the GPU
+// idle); begin_frame clears them before they're first used.
+void create_efb_images() {
+    for (Frame& f : g.frames) {
+        free_buffer(f.readback);
+        f.readback = make_buffer(VkDeviceSize(kEfbWidth) * kEfbHeight * 4 * g.scale * g.scale, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    }
+    free_image(g.efb_color), free_image(g.efb_depth), free_image(g.last_frame);
+    g.efb_color = make_image(kEfbWidth * g.scale, kEfbHeight * g.scale, kEfbColor,
+                             VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                                 VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                             VK_IMAGE_ASPECT_COLOR_BIT);
+    g.efb_depth = make_image(kEfbWidth * g.scale, kEfbHeight * g.scale, kEfbDepth,
+                             VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_DEPTH_BIT);
+    g.last_frame = make_image(kEfbWidth * g.scale, kEfbHeight * g.scale, kEfbColor,
+                              VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_COLOR_BIT);
+    g.last_w = g.last_h = 0;
+    g.efb_fresh = true;
+}
+
 bool create_resources() {
     VkCommandPoolCreateInfo pi = vk_struct<VkCommandPoolCreateInfo>(VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO);
     pi.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, pi.queueFamilyIndex = g.family;
@@ -1654,14 +1776,8 @@ bool create_resources() {
         f.vtx = make_ring(kVertexBytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
         f.ubo = make_ring(kUniformBytes, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
         f.upload = make_ring(kUploadBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
-        f.readback = make_buffer(VkDeviceSize(kEfbWidth) * kEfbHeight * 4 * g.scale * g.scale, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
     }
-    g.efb_color = make_image(kEfbWidth * g.scale, kEfbHeight * g.scale, kEfbColor,
-                             VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
-                                 VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
-                             VK_IMAGE_ASPECT_COLOR_BIT);
-    g.efb_depth = make_image(kEfbWidth * g.scale, kEfbHeight * g.scale, kEfbDepth,
-                             VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_DEPTH_BIT);
+    create_efb_images();
     g.blank = make_image(1, 1, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                          VK_IMAGE_ASPECT_COLOR_BIT);
 
@@ -1695,20 +1811,12 @@ bool create_resources() {
         }
     }
 
-    // The first frame: the EFB starts black (what GX's memory holds after
-    // the SDK's start-up clears is the game's business), the blank texture
-    // transparent black.
+    // The first frame clears the EFB (begin_frame), and the blank texture
+    // is transparent black.
     begin_frame();
     Frame& f = cur();
-    transition(f.cb, g.efb_color, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
     const VkClearColorValue black{};
     const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    vkCmdClearColorImage(f.cb, g.efb_color.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &range);
-    // Depth starts at the far plane (GX's clear Z default), not undefined.
-    transition(f.cb, g.efb_depth, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT);
-    const VkClearDepthStencilValue far{1.0f, 0};
-    const VkImageSubresourceRange depth_range{VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
-    vkCmdClearDepthStencilImage(f.cb, g.efb_depth.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &far, 1, &depth_range);
     transition(f.cb, g.blank, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
     vkCmdClearColorImage(f.cb, g.blank.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &range);
     transition(f.cb, g.blank, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
@@ -1718,6 +1826,54 @@ bool create_resources() {
 }  // namespace
 
 void window_resized() { g.resized = true; }
+
+// ---- for the settings menu (on the main thread, while the game is parked) ----
+bool overlay_target(OverlayTarget& t) {
+    if (!g.device || !g.swap_drawable || g.swap_images.empty()) return false;
+    t.instance = g.instance, t.physical_device = g.gpu, t.device = g.device, t.queue = g.queue;
+    t.queue_family = g.family, t.images = static_cast<uint32_t>(g.swap_images.size());
+    t.format = static_cast<uint32_t>(g.swap_format);
+    t.get_instance_proc_addr = reinterpret_cast<void (*)()>(vkGetInstanceProcAddr);
+    return true;
+}
+
+void set_overlay(std::function<void(void* command_buffer)> draw) {
+    std::lock_guard l(g.overlay_lock);
+    if (!draw) g.overlay = nullptr;
+    else g.overlay = [draw = std::move(draw)](VkCommandBuffer cb) { draw(cb); };
+}
+
+void present_paused() {
+    begin_frame();
+    end_rendering();
+    finish_frame(cur());
+    g.frame = (g.frame + 1) % kFrames;
+    ++g.frame_number;
+}
+
+void apply_display_settings() {
+    const Settings& s = settings();
+    vk_check(vkDeviceWaitIdle(g.device), "vkDeviceWaitIdle");
+    if (s.internal_scale != g.scale) {  // new EFB images (copies already made stay: they're textures at any size)
+        g.scale = s.internal_scale;
+        create_efb_images();
+    }
+    const float aniso = std::min(float(s.anisotropy), g.anisotropy_limit);
+    if (aniso != g.max_anisotropy) {  // samplers are made again as draws ask for them
+        g.max_anisotropy = aniso;
+        for (auto& [key, sampler] : g.samplers) vkDestroySampler(g.device, sampler, nullptr);
+        g.samplers.clear();
+    }
+    g.resized = true;  // vsync (the present mode) is the swapchain's: made again at the next frame
+}
+
+const std::vector<std::string>& gpu_names() { return g.gpu_names; }
+std::string gpu_in_use() {
+    VkPhysicalDeviceProperties p;
+    vkGetPhysicalDeviceProperties(g.gpu, &p);
+    return p.deviceName;
+}
+float anisotropy_limit() { return g.anisotropy_limit; }
 
 bool init_vulkan(SDL_Window* window) {
     g.window = window;

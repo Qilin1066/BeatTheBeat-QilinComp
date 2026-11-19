@@ -137,7 +137,13 @@ As in the other Qilin recomps (`docs/naming.md`): the window is named after the 
 - **Internal resolution** (`internal_scale`): GX's coordinates stay in EFB pixels; the renderer multiplies them where they meet the images (the EFB, viewports, scissors, clears, the display blit, texture copies, which keep the resolution, and the statistics' readback). Line and point widths follow, being computed relative to the viewport.
 - **Anisotropic filtering** (`anisotropy`): on samplers that filter linearly, within the GPU's limit; a GPU without it says so and filters as the console does.
 - **vsync**: on, mailbox (no tearing, presenting never waits) or FIFO; off, immediate where there is one.
-- Not done yet: MSAA, widescreen beyond 16:9, high refresh rates, a settings menu in the window.
+- **The picture in the window:** each display copy goes to a kept image (`last_frame`), and every presented frame scales it into the window: whole multiples of 854×480 or 640×480 (the sharpest; fit where the window is smaller), the largest that keeps the aspect, or the whole window; filtered or nearest (`smooth`).
+- **The settings menu** (`menu.*`, Dear ImGui with its SDL3 and Vulkan backends, dynamic rendering into the window's images after the picture):
+  - **Pausing** (`pause.*`): the main thread asks; the game's thread parks at the end of `copy_display`, the one place where the renderer holds nothing half-recorded. It parks holding the run token, so no guest thread runs. The time base skips the paused span (`skip_time_base`), so the game's clock, its alarms and the audio clock carry on where they left off; `QILIN_RUN_SECONDS` counts game time.
+  - **While parked** the main thread owns the renderer: `present_paused` shows the last picture with the menu over it (vsync paces it). On closing, `apply_display_settings` waits for the GPU and remakes what changed: the EFB images at a new internal resolution (texture copies made at the old one are remade when next copied), the samplers for anisotropy, and the swapchain for vsync.
+  - **ImGui's frames** are built on the main thread and drawn by whichever thread owns the renderer, under one lock (the start-up hint is drawn by the game's own frames).
+  - **Verified** by driving the real window with mouse clicks (Windows, GTX 1080 Ti): changing the picture size, vsync and 3× resolution, then closing, saved the file and the game carried on at 1920×1368 with the same picture.
+- Not done yet: MSAA, widescreen beyond 16:9, high refresh rates, rebinding keys in the menu.
 
 ## Efficiency (after v0.16.0)
 

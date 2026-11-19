@@ -52,7 +52,7 @@ The whole project (recompiler, runtime and generated code) is **C++23**. You nee
 | Apple Clang | Xcode 16 | |
 | MSVC | Visual Studio 2022 17.10 | |
 
-CMake stops with a clear message if the compiler is older, or if the target is 32-bit. The recompiler and its tests have no other dependencies. The game's runtime (`qilin_run`) needs two, which CMake fetches at configure time and checks against pinned SHA-256 hashes (neither is in the repository): **SDL3** (zlib licence; a system SDL3 is used if there is one) for the window, audio and keyboard, and **Khronos' Vulkan headers** (Apache-2.0). No Vulkan SDK is needed: the loader comes through SDL. `-DQILIN_HEADLESS_ONLY=ON` builds it with neither.
+CMake stops with a clear message if the compiler is older, or if the target is 32-bit. The recompiler and its tests have no other dependencies. The game's runtime (`qilin_run`) needs three, which CMake fetches at configure time and checks against pinned SHA-256 hashes (none is in the repository): **SDL3** (zlib licence; a system SDL3 is used if there is one) for the window, audio and input, **Khronos' Vulkan headers** (Apache-2.0), and **Dear ImGui** (MIT) for the settings menu (F1 or Esc in the game), as the other Qilin recomps have it. No Vulkan SDK is needed: the loader comes through SDL. `-DQILIN_HEADLESS_ONLY=ON` builds it with none of them.
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release

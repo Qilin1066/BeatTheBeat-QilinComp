@@ -13,10 +13,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <thread>
+#include <vector>
 
 #include "console.hpp"
 #include "gx_vulkan.hpp"
 #include "input.hpp"
+#include "menu.hpp"
 #include "native.hpp"
 #include "settings.hpp"
 
@@ -106,7 +108,8 @@ void detach_pad(SDL_JoystickID id) {
 }
 
 void apply_rumble() {
-    if (g_pad) SDL_RumbleGamepad(g_pad, g_rumble ? 0xA000 : 0, g_rumble ? 0xA000 : 0, g_rumble ? 60000 : 0);
+    const bool on = g_rumble && settings().rumble;
+    if (g_pad) SDL_RumbleGamepad(g_pad, on ? 0xA000 : 0, on ? 0xA000 : 0, on ? 60000 : 0);
 }
 
 bool open_audio() {
@@ -121,17 +124,23 @@ bool open_audio() {
 }
 
 // The window: the largest whole multiple of the picture (640x480 at 4:3,
-// 854x480 at 16:9) that fits nine tenths of the main display's usable area.
+// 854x480 at 16:9) that fits nine tenths of the settings' display's usable
+// area, centred on it.
 SDL_Window* open_window() {
     const uint32_t width = console().widescreen ? 854 : 640, height = 480;
     uint32_t scale = 1;
     SDL_Rect usable{};
-    if (SDL_GetDisplayUsableBounds(SDL_GetPrimaryDisplay(), &usable))
+    const SDL_DisplayID display = chosen_display();
+    if (SDL_GetDisplayUsableBounds(display, &usable))
         while (width * (scale + 1) <= uint32_t(usable.w) * 9 / 10 && height * (scale + 1) <= uint32_t(usable.h) * 9 / 10) ++scale;
     SDL_WindowFlags flags = SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY;
     if (settings().fullscreen) flags |= SDL_WINDOW_FULLSCREEN;  // borderless, at the desktop's mode
     SDL_Window* w = SDL_CreateWindow(kGameName, int(width * scale), int(height * scale), flags);
-    if (w) SDL_SetWindowMinimumSize(w, 160, 120);
+    if (w) {
+        SDL_SetWindowMinimumSize(w, 160, 120);
+        const int at = int(SDL_WINDOWPOS_CENTERED_DISPLAY(display));
+        SDL_SetWindowPosition(w, at, at);
+    }
     return w;
 }
 
@@ -186,18 +195,58 @@ bool run(const std::function<void()>& game) {
                  settings_path().string().c_str(), settings().preset.c_str(), settings().internal_scale, settings().anisotropy);
 
     std::thread(game).detach();
+    Menu menu(g_window);
+    // QILIN_MENU_TOGGLE=<seconds>,...: the menu opened or closed at those
+    // times after start (scripted runs: the pause, the overlay).
+    std::vector<uint64_t> toggles;
+    if (const char* v = std::getenv("QILIN_MENU_TOGGLE"))
+        for (const char* p = v; *p;) {
+            char* end = nullptr;
+            const double s = std::strtod(p, &end);
+            if (end == p) {
+                std::fprintf(stderr, "qilin_run: QILIN_MENU_TOGGLE is seconds, comma-separated\n");
+                return false;
+            }
+            toggles.push_back(SDL_GetTicks() + uint64_t(s * 1000));
+            p = *end == ',' ? end + 1 : end;
+        }
+    auto quit = [] {
+        std::fflush(stderr);
+        std::_Exit(0);
+    };
     for (;;) {
         SDL_Event e;
-        if (!SDL_WaitEventTimeout(&e, 100)) continue;
-        do {
+        // The menu draws a frame each pass while it's up (vsync paces it).
+        bool got = SDL_WaitEventTimeout(&e, menu.busy() ? 10 : 100);
+        const bool was_shown = menu.is_open();
+        while (got) {
+            bool taken = false;
+            try {  // F1 or Esc closing the menu applies the settings
+                taken = menu.handle(e);
+            } catch (const Stop& s) {
+                report_stop(s);
+                std::fflush(stderr);
+                std::_Exit(1);
+            }
+            if (taken) {
+                got = SDL_PollEvent(&e);
+                continue;
+            }
             switch (e.type) {
             case SDL_EVENT_QUIT:
             case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
-                std::fflush(stderr);
-                std::_Exit(0);
+                if (menu.is_open()) save_settings();
+                quit();
+                break;
             case SDL_EVENT_KEY_DOWN:
                 if (!e.key.repeat && (e.key.key == SDLK_F11 || (e.key.key == SDLK_RETURN && (e.key.mod & SDL_KMOD_ALT)))) {
-                    SDL_SetWindowFullscreen(g_window, !(SDL_GetWindowFlags(g_window) & SDL_WINDOW_FULLSCREEN));
+                    const bool full = !(SDL_GetWindowFlags(g_window) & SDL_WINDOW_FULLSCREEN);
+                    SDL_SetWindowFullscreen(g_window, full);
+                    // Kept for the next start. With the game running, only
+                    // the main thread writes settings, and the game doesn't
+                    // read this one; the open menu saves when it closes.
+                    settings().fullscreen = full;
+                    if (!menu.is_open()) save_settings();
                     break;  // Alt+Enter isn't the remote's +
                 }
                 update_keys();
@@ -214,8 +263,25 @@ bool run(const std::function<void()>& game) {
                 if (e.type == g_wake_event) apply_rumble();
                 break;
             }
-        } while (SDL_PollEvent(&e));
+            got = SDL_PollEvent(&e);
+        }
+        try {  // the renderer can stop on this thread too while the menu has it
+            if (!toggles.empty() && SDL_GetTicks() >= toggles.front()) {
+                toggles.erase(toggles.begin());
+                menu.toggle();
+            }
+            menu.tick();
+        } catch (const Stop& s) {
+            report_stop(s);
+            std::fflush(stderr);
+            std::_Exit(1);
+        }
+        if (menu.quit_requested()) quit();
+        if (was_shown != menu.is_open()) {  // opened or closed: what's held now is the game's again
+            update_keys();
+            update_pad();
+            apply_rumble();
+        }
     }
 }
-
 }  // namespace qilin::rt::host

@@ -17,13 +17,22 @@
 
 namespace qilin::rt {
 
+// How the picture fills the window.
+enum class Scaling : uint8_t { integer, fit, stretch };  // whole multiples; the largest that keeps its shape; the whole window
+
 struct Settings {
     // [display]
     std::string preset = "original";  // original, low-end, desktop
     bool fullscreen = false;          // borderless, at the desktop's mode (F11 or Alt+Enter switch it)
+    std::string monitor;              // the display's name (empty: the main one)
+    Scaling scaling = Scaling::fit;   // the picture's size in the window
+    bool smooth = true;               // filtered at sizes that aren't whole multiples
     uint32_t internal_scale = 1;      // the frame buffer at 1-8x the console's 640x528
     uint32_t anisotropy = 1;          // texture filtering: 1 (the console's), 2, 4, 8 or 16
     bool vsync = true;                // present at the display's refresh (no tearing); off: lowest latency
+    std::string gpu;                  // the graphics device's name (empty: the best one)
+    // [controls]
+    bool rumble = true;  // the Wii Remote's rumble on the controller
     // [console]: what the game reads as the Wii's own settings
     uint8_t language = 1;          // 0 Japanese, 1 English, 2 German, 3 French, 4 Spanish, 5 Italian, 6 Dutch
     bool sixty_hz = true;          // EuRGB60 (60 Hz) rather than PAL 50 Hz
@@ -35,8 +44,17 @@ struct Settings {
 };
 
 // The settings, read once (the first call reads the file, or writes the
-// default one); a bad file ends the process with the reason.
-const Settings& settings();
+// default one); a bad file ends the process with the reason. The menu
+// changes them (on the main thread, while the game is paused) and saves.
+Settings& settings();
+// Writes the settings out (the file's comments, the current values); false
+// if it can't.
+bool save_settings();
+// The file's text, with its comments, for these values (what save writes).
+std::string settings_text(const Settings& s);
+const char* scaling_name(Scaling s);
+// Sets a preset's enhancements (and its name); false for an unknown one.
+bool apply_preset(Settings& s, const std::string& name);
 // Where the file is.
 std::filesystem::path settings_path();
 // The game's data folder: saves, the settings file, the pipeline cache.

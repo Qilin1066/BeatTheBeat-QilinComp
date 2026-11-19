@@ -1147,6 +1147,21 @@ void test_settings() {
                          Bad{"[console]\nlanguage = -1\n", 2}, Bad{"[display\n", 1}, Bad{"[console]\nsound_mode = 3\n", 2}}) {
         CHECK(!parse(b.text, s, error, line) && line == b.line && !error.empty());
     }
+    // what the menu saves reads back as the same settings (every key, set
+    // away from its default)
+    rt::Settings w;
+    w.preset = "desktop", w.fullscreen = true, w.monitor = "Second Display", w.scaling = rt::Scaling::integer;
+    w.smooth = false, w.internal_scale = 5, w.anisotropy = 8, w.vsync = false, w.gpu = "Some GPU", w.rumble = false;
+    w.language = 4, w.sixty_hz = false, w.widescreen = false, w.progressive = false, w.sound_mode = 2;
+    w.sensor_bar_above = true, w.dpd_sensitivity = 5;
+    const std::string text = rt::settings_text(w);
+    CHECK(parse(text.c_str(), s, error, line));
+    CHECK(rt::settings_text(s) == text);
+    CHECK(s.monitor == "Second Display" && s.scaling == rt::Scaling::integer && !s.smooth && s.internal_scale == 5 &&
+          s.anisotropy == 8 && s.gpu == "Some GPU" && !s.rumble && s.language == 4 && s.dpd_sensitivity == 5);
+    // the default file is the defaults
+    CHECK(parse(rt::settings_text(rt::Settings{}).c_str(), s, error, line) && rt::settings_text(s) == rt::settings_text(rt::Settings{}));
+    CHECK(!parse("[display]\nscaling = zoom\n", s, error, line) && line == 2);
 }
 
 }  // namespace

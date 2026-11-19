@@ -11,6 +11,7 @@ The same rule as the other Qilin recomps: **Qilin** is the author's name and goe
 | The window's title, SDL's app name | Beat the Beat: Rhythm Paradise | Players launch the game, not a tool |
 | The game's data folder | `<per-user data>/qilin/beatthebeat` | As the other recomps keep theirs (`qilin/<game>`); saves in `nand/`, the pipeline cache |
 | The settings file | `beatthebeat.ini`, in the data folder | After the game |
+| The settings menu | F1 or Esc (controller: Back + Start); Controls, Display and Game pages; pauses the game; saves on close | The other recomps' menu (Dear ImGui), kept in step with them |
 | Lifted functions | `fn_<address>` | By their address in the original DOL |
 
 The game executable is still `qilin_run` while the runtime is brought up, as in the sister projects; it takes the game's name with the first player release.

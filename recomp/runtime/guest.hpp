@@ -538,6 +538,10 @@ uint32_t mftb(Context& c, unsigned tbr);
 // host's steady clock).
 inline constexpr uint64_t kTimeBaseHz = 60'750'000, kNsPerSecond = 1'000'000'000;
 uint64_t time_base();
+// The host clock in the same ticks, the game's pauses included, and adding
+// to the time the game doesn't see pass (the settings menu: pause.cpp).
+uint64_t time_base_unpaused();
+void skip_time_base(uint64_t ticks);
 void syscall(Context& c, uint32_t pc);
 // fifo_st8/16/32 (declared above psq_st): stores to the GX write-gather pipe
 // (0xCC008000). The lifter emits them for the stores hwaccess finds there
