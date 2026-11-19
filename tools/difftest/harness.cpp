@@ -73,6 +73,8 @@ namespace qilin::rt {
 void fifo_st8(uint32_t ea, uint32_t) { throw Stop{Stop::Memory, g_pc, ea}; }
 void fifo_st16(uint32_t ea, uint32_t) { throw Stop{Stop::Memory, g_pc, ea}; }
 void fifo_st32(uint32_t ea, uint32_t) { throw Stop{Stop::Memory, g_pc, ea}; }
+// No interrupts here: a lifted loop's safe point does nothing.
+void poll(Context&) {}
 }  // namespace qilin::rt
 
 int main(int argc, char** argv) {

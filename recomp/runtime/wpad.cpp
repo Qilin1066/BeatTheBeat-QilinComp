@@ -51,6 +51,17 @@ QILIN_NATIVE(WPADiGetMplsStatus) {
     channel(c);
     c.r[3] = 0;
 }
+constexpr int32_t kErrNoController = -1;
+
+// WPADProbe(chan, u32* type): whether a remote is there and what kind. None
+// is, so WPAD_ERR_NO_CONTROLLER, and there is no type to give.
+QILIN_NATIVE(WPADProbe) {
+    channel(c);
+    c.r[3] = static_cast<uint32_t>(kErrNoController);
+}
+
+// No remote is connected, so there is none to disconnect.
+QILIN_NATIVE(WPADDisconnect) { channel(c); }
 // Rumble: nothing to rumble with no remote connected.
 QILIN_NATIVE(WPADControlMotor) { channel(c); }
 QILIN_NATIVE(WPADEnableMotor) { wpad.motor_enabled = c.r[3] & 0xFF; }
@@ -58,5 +69,17 @@ QILIN_NATIVE(WPADIsMotorEnabled) { c.r[3] = wpad.motor_enabled ? 1 : 0; }
 
 // ---- revolution/pad: GameCube controllers. None are plugged in. ----
 QILIN_NATIVE(PADInit) { c.r[3] = 1; }
+// PADRead(PADStatus status[4]): 12 bytes each, the error byte at +10. Every
+// port reports PAD_ERR_NO_CONTROLLER (-1), with no buttons or sticks; the
+// game then calls PADReset for those ports, as games probe empty ports.
+QILIN_NATIVE(PADRead) {
+    for (uint32_t p = 0; p < 4; ++p) {
+        const uint32_t st = c.r[3] + 12 * p;
+        for (uint32_t i = 0; i < 12; ++i) poke8(st + i, 0);
+        poke8(st + 10, 0xFF);  // -1
+    }
+    c.r[3] = 0;
+}
+QILIN_NATIVE(PADReset) { c.r[3] = 1; }  // nothing plugged in: nothing to reset
 
 }  // namespace

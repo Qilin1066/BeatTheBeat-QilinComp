@@ -1,6 +1,7 @@
 // Interrupts at safe points (interrupts.hpp). Runtime code: no std::format.
 #include "interrupts.hpp"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -27,6 +28,8 @@ std::array<uint32_t, 32> g_handlers{};
 // this thread mid-delivery, not the one that runs next.
 thread_local bool t_delivering = false;
 
+constexpr unsigned kMaxCatchUp = 32;  // periods one delivery runs at most (about 100 ms of audio)
+
 struct Periodic {
     uint64_t due, period;
     std::function<void(Context&)> handler;
@@ -39,11 +42,25 @@ bool periodic_due(uint64_t now) {
     return false;
 }
 
-// The queue: any host thread may post.
+// The queue: any host thread may post. Each handler has the time it may run
+// from; g_next_due is the earliest (kNever when the queue is empty), so safe
+// points check it without the lock.
+constexpr uint64_t kNever = ~uint64_t(0);
+struct Queued {
+    uint64_t due;
+    std::function<void(Context&)> handler;
+};
 std::mutex g_mutex;
 std::condition_variable g_wake;
-std::deque<std::function<void(Context&)>> g_queue;
-std::atomic<bool> g_queued{false};
+std::deque<Queued> g_queue;
+std::atomic<uint64_t> g_next_due{kNever};
+
+void update_next_due() {  // under g_mutex
+    uint64_t next = kNever;
+    for (const Queued& q : g_queue) next = q.due < next ? q.due : next;
+    g_next_due.store(next, std::memory_order_release);
+    g_irq_pending.store(!g_queue.empty(), std::memory_order_relaxed);
+}
 
 uint32_t function(const char* name, uint32_t& cache) {
     if (!cache) cache = require_function(name);
@@ -83,25 +100,38 @@ void deliver(Context& c, bool decrementer) {
             ++stats().interrupts, ++stats().decrementer;
             run_decrementer(c);
         }
+        // Each period that has come runs, in turn: on the console every one
+        // arrives on time (the audio DMA, the retrace), so a late wake-up
+        // here catches up rather than losing them. Only a stall longer than
+        // kMaxCatchUp drops the rest, and counts them.
         const uint64_t now = time_base();
         for (size_t i = 0; i < g_periodic.size(); ++i) {
-            if (now < g_periodic[i].due) continue;
-            g_periodic[i].due += g_periodic[i].period;
-            if (g_periodic[i].due <= now) g_periodic[i].due = now + g_periodic[i].period;
-            ++stats().interrupts;
-            const auto handler = g_periodic[i].handler;  // a copy: the handler may add a timer
-            run_posted(c, handler);
+            for (unsigned n = 0; now >= g_periodic[i].due; ++n) {
+                if (n == kMaxCatchUp) {
+                    stats().periods_dropped += (now - g_periodic[i].due) / g_periodic[i].period + 1;
+                    g_periodic[i].due = now + g_periodic[i].period;
+                    break;
+                }
+                g_periodic[i].due += g_periodic[i].period;
+                ++stats().interrupts;
+                const auto handler = g_periodic[i].handler;  // a copy: the handler may add a timer
+                run_posted(c, handler);
+            }
         }
+        // The queued handlers that are due, in the order they were posted.
         for (;;) {
             std::function<void(Context&)> handler;
             {
                 std::lock_guard l(g_mutex);
-                if (g_queue.empty()) {
-                    g_queued.store(false, std::memory_order_relaxed);
+                const uint64_t t = time_base();
+                const auto it = std::find_if(g_queue.begin(), g_queue.end(), [t](const Queued& q) { return q.due <= t; });
+                if (it == g_queue.end()) {
+                    update_next_due();
                     break;
                 }
-                handler = std::move(g_queue.front());
-                g_queue.pop_front();
+                handler = std::move(it->handler);
+                g_queue.erase(it);
+                update_next_due();
             }
             ++stats().interrupts;
             run_posted(c, handler);
@@ -123,14 +153,16 @@ bool interrupts_enabled() { return g_enabled; }
 void set_interrupts_enabled(bool on) { g_enabled = on; }
 bool delivering() { return t_delivering; }
 
-void post_interrupt(std::function<void(Context&)> handler) {
+void post_interrupt(std::function<void(Context&)> handler, uint64_t delay) {
     {
         std::lock_guard l(g_mutex);
-        g_queue.push_back(std::move(handler));
-        g_queued.store(true, std::memory_order_release);
+        g_queue.push_back(Queued{time_base() + delay, std::move(handler)});
+        update_next_due();  // lifted loops start looking
     }
     g_wake.notify_all();
 }
+
+void poll(Context& c) { deliver_due(c); }
 
 void set_decrementer(uint32_t ticks) {
     g_dec_armed = true;
@@ -150,19 +182,23 @@ void add_periodic(uint64_t period, std::function<void(Context&)> handler) {
 
 void deliver_due(Context& c) {
     if (t_delivering || !g_enabled) return;
-    const bool dec = decrementer_due();
-    if (dec || g_queued.load(std::memory_order_acquire) || (!g_periodic.empty() && periodic_due(time_base())))
+    const uint64_t now = time_base();
+    const bool dec = g_dec_armed && now >= g_dec_deadline;
+    if (dec || now >= g_next_due.load(std::memory_order_acquire) || (!g_periodic.empty() && periodic_due(now))) {
+        ++stats().running_deliveries;
         deliver(c, dec);
+    }
 }
 
 bool wait_and_deliver(Context& c) {
     {
         std::unique_lock l(g_mutex);
         for (;;) {
-            if (!g_queue.empty()) break;
-            // The next timer: the decrementer or a periodic interrupt.
-            bool any = g_dec_armed;
-            uint64_t next = g_dec_deadline;
+            // The next event: a queued handler, the decrementer or a
+            // periodic interrupt.
+            bool any = !g_queue.empty();
+            uint64_t next = g_next_due.load(std::memory_order_relaxed);
+            if (g_dec_armed && (!any || g_dec_deadline < next)) next = g_dec_deadline, any = true;
             for (const Periodic& p : g_periodic)
                 if (!any || p.due < next) next = p.due, any = true;
             if (!any) return false;  // nothing queued, no timer, and nothing can queue one yet
@@ -172,6 +208,7 @@ bool wait_and_deliver(Context& c) {
             g_wake.wait_for(l, std::chrono::nanoseconds(ns));
         }
     }
+    ++stats().idle_deliveries;
     deliver(c, decrementer_due());
     return true;
 }

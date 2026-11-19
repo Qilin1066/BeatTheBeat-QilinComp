@@ -40,6 +40,7 @@ struct Entry {
 
 struct Disc {
     bool open = false;
+    uint32_t fst_size = 0;
     std::filesystem::path root;
     std::vector<Entry> entries;
     std::map<uint32_t, uint32_t> by_offset;  // a file's disc offset -> its entry (non-empty files)
@@ -157,7 +158,7 @@ void complete(uint32_t fi, int32_t result, uint32_t callback) {
         c.r[3] = static_cast<uint32_t>(cancelled ? kResultCanceled : result);
         c.r[4] = fi;
         call_guest(c, callback);
-    });
+    }, kIoLatency);
 }
 
 void cancel(uint32_t block) {
@@ -216,7 +217,7 @@ QILIN_NATIVE(DVDCancelAsync) {
             ctx.r[3] = 0;
             ctx.r[4] = block;
             call_guest(ctx, callback);
-        });
+        }, kIoLatency);
     c.r[3] = 1;
 }
 QILIN_NATIVE(DVDCancelAllAsync) {
@@ -227,7 +228,7 @@ QILIN_NATIVE(DVDCancelAllAsync) {
             ctx.r[3] = 0;
             ctx.r[4] = 0;
             call_guest(ctx, callback);
-        });
+        }, kIoLatency);
     c.r[3] = 1;
 }
 
@@ -285,8 +286,11 @@ bool open_disc(const std::filesystem::path& root) {
         }
     }
     disc.root = root;
+    disc.fst_size = static_cast<uint32_t>(b.size());
     disc.open = true;
     return true;
 }
+
+uint32_t disc_fst_size() { return disc.open ? disc.fst_size : 0; }
 
 }  // namespace qilin::rt

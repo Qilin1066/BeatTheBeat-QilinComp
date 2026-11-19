@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <vector>
 
+#include "dvd.hpp"
 #include "interrupts.hpp"
 #include "machine.hpp"
 #include "native.hpp"
@@ -27,7 +28,7 @@ using namespace qilin::rt;
 //    heap at the top of MEM2.
 // TO CONFIRM against the original game in Dolphin (the reference): dump
 // 0x80000000-0x80003400 at the entry point and set these from it.
-constexpr uint32_t kMem1ArenaLo = 0x803E94A0u, kMem1ArenaHi = 0x81730000u;
+constexpr uint32_t kMem1ArenaLo = 0x803E94A0u, kMem1ArenaHi = 0x81730000u, kMem1Top = 0x81800000u;
 constexpr uint32_t kMem2ArenaLo = 0x90000800u, kMem2ArenaHi = 0x933E0000u;
 
 // The clocks the SDK's tick conversions read from low memory: the bus at
@@ -47,10 +48,19 @@ struct Os {
 QILIN_NATIVE(OSInit) {
     if (os.initialised) return;  // as the original: a second call does nothing
     os.initialised = true;
-    // The runtime's guest scratch comes off the top of the MEM1 arena, so the
-    // game's heaps never reach it.
-    os.mem1_lo = kMem1ArenaLo, os.mem1_hi = kMem1ArenaHi - kScratchBytes;
-    set_scratch(os.mem1_hi, kMem1ArenaHi);
+    // MEM1's arena ends where a console's apploader puts the disc's file
+    // table: at the top of MEM1, rounded down to 32 bytes. The runtime's
+    // guest scratch lives in that table's place (the game doesn't read the
+    // table there: DVD is native), so the game's heap is the console's size.
+    // Without a disc, OSInit's own default end, with the scratch below it.
+    if (const uint32_t fst = disc_fst_size(); fst && fst >= kScratchBytes) {
+        os.mem1_hi = (kMem1Top - fst) & ~31u;
+        set_scratch(os.mem1_hi, kMem1Top);
+    } else {
+        os.mem1_hi = kMem1ArenaHi - kScratchBytes;
+        set_scratch(os.mem1_hi, kMem1ArenaHi);
+    }
+    os.mem1_lo = kMem1ArenaLo;
     os.mem2_lo = kMem2ArenaLo, os.mem2_hi = kMem2ArenaHi;
     poke32(kBusClockAddr, kBusClock);
     poke32(kCpuClockAddr, kCpuClock);
@@ -61,6 +71,21 @@ QILIN_NATIVE(OSInit) {
 }
 
 QILIN_NATIVE(OSRegisterShutdownFunction) { os.shutdown_functions.push_back(c.r[3]); }
+
+// The console's power and reset buttons: the game's callbacks, kept for when
+// the host maps a "power" or "reset" action to them. Each setter returns the
+// previous callback.
+uint32_t g_power_cb = 0, g_reset_cb = 0;
+QILIN_NATIVE(OSSetPowerCallback) {
+    const uint32_t old = g_power_cb;
+    g_power_cb = c.r[3];
+    c.r[3] = old;
+}
+QILIN_NATIVE(OSSetResetCallback) {
+    const uint32_t old = g_reset_cb;
+    g_reset_cb = c.r[3];
+    c.r[3] = old;
+}
 
 // base: where exit ends after the static destructors (sync; nop; li r3,0).
 QILIN_NATIVE_CODE(PPCHalt, 0x7C0004ACu, 0x60000000u, 0x38600000u) { throw Exit{0}; }
@@ -112,6 +137,7 @@ QILIN_NATIVE(DCStoreRange) {}
 QILIN_NATIVE(DCFlushRange) {}
 QILIN_NATIVE(DCInvalidateRange) {}
 QILIN_NATIVE(ICInvalidateRange) {}
+QILIN_NATIVE(DCFlushRangeNoSync) {}
 
 // ---- the locked cache ----
 // A 16 KB scratchpad at 0xE0000000 that DMA fills and empties. NW4R turns it
@@ -123,6 +149,31 @@ bool g_lc_enabled = false;
 QILIN_NATIVE(LCEnable) { g_lc_enabled = true; }
 QILIN_NATIVE(LCDisable) { g_lc_enabled = false; }
 QILIN_NATIVE(LCQueueLength) { c.r[3] = 0; }  // no DMA transfers pending
+
+// ---- the console and its debug output ----
+// A retail console (a retail Hollywood revision; the exact value is a boot
+// value lowmem.py confirms). What lifted code tests are the development-kit
+// bits (0x10000000, 0x20000000), clear here, as on retail.
+constexpr uint32_t kConsoleRetail = 0x00000011u;
+QILIN_NATIVE(OSGetConsoleType) { c.r[3] = kConsoleRetail; }
+
+// The debug UART (revolution/euart), which MSL's console writes to. On a
+// retail console InitializeUART fails and the game's reports go nowhere.
+// Here they go to stderr, as a development kit's serial port shows them: a
+// deliberate difference, whose only effect the game could see is printf's
+// return value, which OSReport ignores.
+QILIN_NATIVE(InitializeUART) { c.r[3] = 0; }
+QILIN_NATIVE(WriteUARTN) {
+    const uint32_t buf = c.r[3], n = c.r[4];
+    static bool line_start = true;
+    for (uint32_t i = 0; i < n; ++i) {
+        const char ch = static_cast<char>(peek8(buf + i));
+        if (line_start) std::fputs("[game] ", stderr);
+        std::fputc(ch, stderr);
+        line_start = ch == '\n';
+    }
+    c.r[3] = 0;
+}
 
 // ---- reports ----
 // OSRegisterVersion(const char* id) reports the library's version string.

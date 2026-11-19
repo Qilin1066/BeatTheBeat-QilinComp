@@ -115,6 +115,22 @@ constexpr std::string_view kLiftAnyway[] = {
     "GXGetYScaleFactor",
     "GXAdjustForOverscan",
     "GXSetTevDirect",
+    // The OS's debug reports: they format through MSL's vprintf (lifted) and
+    // write through MSL's console, to the debug UART (native).
+    "OSReport",
+    "OSVReport",
+    // ... after which MSL's console also calls the debugger stub's console
+    // write on every console. On retail it reads the stub's "use serial I/O"
+    // byte, which stays 0 because the stub never starts, and returns. Lifted
+    // as such; if the byte were ever set, its next call isn't lifted and stops.
+    "__TRK_write_console",
+    "GetUseSerialIO",
+    // NAND's save banner: it fills in the banner the game passes (its title
+    // and comment, with MSL's wide-string functions). Writing it is native.
+    "NANDInitBanner",
+    // A NAND command block's user data: a store and a load at its start.
+    "NANDSetUserData",
+    "NANDGetUserData",
     // WPAD's work memory size: a constant of the Bluetooth stack, reached by
     // two tail calls. The game makes a heap of it for WPAD; lifted, its heap
     // layout is the console's.
@@ -144,10 +160,24 @@ constexpr std::string_view kLiftUnits[] = {
     "revolution/os/OSMessage.c",
     // The time base (mftb, which lifted code reads) and conversions of it.
     "revolution/os/OSTime.c",
+    // CRC-32 (the game checksums its save with it): arithmetic.
+    "revolution/os/OSCrc.c",
     // Alarms: the queue, periodic alarms and the decrementer callback that
     // fires them. Under them, native: the decrementer (PPCMtdec), the
     // exception table, and OSLoadContext returning to the interrupted code.
     "revolution/os/OSAlarm.c",
+    // AX, whole: it is CPU code (voices and their priorities, the setters,
+    // PB sync, aux callbacks, each frame's command list) with no hardware
+    // access. Under it, native: AI's DMA and the DSP, which carries out AX's
+    // command lists (audio.cpp).
+    "revolution/ax/AX.c",
+    "revolution/ax/AXAlloc.c",
+    "revolution/ax/AXAux.c",
+    "revolution/ax/AXCL.c",
+    "revolution/ax/AXOut.c",
+    "revolution/ax/AXSPB.c",
+    "revolution/ax/AXVPB.c",
+    "revolution/ax/AXProf.c",
 };
 
 // Native although their unit is lifted. SelectThread switches threads: lifted,

@@ -168,7 +168,14 @@ void transfer(const Insn& in, Regs& r) {
     case Op::bc:
     case Op::bclr:
     case Op::bcctr:
-        if (in.lk()) r.known = 0;  // a call may change any register
+        // A call may change the volatile registers (r0, r3-r12). The EABI
+        // that CodeWarrior follows keeps r1, r2, r13 and r14-r31: lifted
+        // code relies on that (a FIFO address set up in r24, then GXBegin,
+        // then the vertex stores through r24).
+        if (in.lk()) {
+            r.clear(0);
+            for (unsigned x = 3; x <= 12; ++x) r.clear(x);
+        }
         return;
     case Op::cmp: case Op::cmpi: case Op::cmpl: case Op::cmpli: case Op::mtcrf: case Op::mcrf: case Op::mcrxr:
     case Op::mtspr: case Op::mtmsr: case Op::mtsr: case Op::mtsrin: case Op::tw: case Op::twi: case Op::tlbie:

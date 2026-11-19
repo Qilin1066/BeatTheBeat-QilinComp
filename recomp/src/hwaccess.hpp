@@ -8,9 +8,11 @@
 // runtime has to take those over, so this is part of its to-do list.
 //
 // Addresses come from constant propagation over each function's GPRs (lis,
-// addi, ori, mr, through the control flow; a call or anything else that
-// writes a register makes it unknown). Accesses through pointers loaded from
-// memory aren't seen: the runtime's checked memory stops on those instead.
+// addi, ori, mr, through the control flow; anything else that writes a
+// register makes it unknown, and a call the volatile ones, r0 and r3-r12:
+// the EABI keeps r1, r2, r13 and r14-r31 across it). Accesses through
+// pointers loaded from memory aren't seen: the runtime's checked memory
+// stops on those instead.
 #pragma once
 
 #include <cstdint>

@@ -57,7 +57,8 @@ uint32_t ld(uint32_t a) { return peek32(a); }
 
 // ---- the run token ----
 struct Host {
-    uint32_t gen = 0;  // the context generation this host thread runs
+    uint32_t gen = 0;              // the context generation this host thread runs
+    const Context* ctx = nullptr;  // its registers, for report_threads
 };
 std::mutex g_lock;
 std::condition_variable g_cv;
@@ -89,6 +90,11 @@ void host_main(uint32_t t, uint32_t gen) {
     try {
         wait_turn();
         Context c = g_template;
+        set_thread_context(&c);
+        {
+            std::lock_guard l(g_lock);
+            if (auto it = g_hosts.find(t); it != g_hosts.end()) it->second.ctx = &c;
+        }
         for (unsigned i = 0; i < 32; ++i) {
             c.r[i] = ld(t + 4 * i);
             c.f[i] = dbl(uint64_t(ld(t + kCtxFpr + 8 * i)) << 32 | ld(t + kCtxFpr + 8 * i + 4));
@@ -261,12 +267,23 @@ bool init_threads(const Context& boot) {
     return true;
 }
 
-void adopt_boot_thread() {
+void adopt_boot_thread(const Context* c) {
     std::lock_guard l(g_lock);
     t_self = ld(kCurrentThread);
     t_gen = g_gen[t_self];
-    g_hosts[t_self] = Host{t_gen};
+    g_hosts[t_self] = Host{t_gen, c};
     g_running = t_self;
+}
+
+void report_threads() {
+    std::lock_guard l(g_lock);
+    std::fprintf(stderr, "qilin_run: scheduler: current thread %08X, run queue bits %08X, reschedule %d, hint %u\n",
+                 ld(kCurrentThread), ld(g.bits), static_cast<int32_t>(ld(g.reschedule)), ld(g.hint));
+    for (const auto& [t, h] : g_hosts) {
+        std::fprintf(stderr, "qilin_run: guest thread %08X: state %u, priority %u, queue %08X%s\n", t, peek16(t + kState),
+                     ld(t + kPriority), ld(t + kQueue), t == g_running ? " (its host thread has the run token; stack as last synced)" : "");
+        if (h.ctx) report_stack(*h.ctx);
+    }
 }
 
 void wait_forever() {

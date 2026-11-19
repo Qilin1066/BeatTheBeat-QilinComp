@@ -64,8 +64,15 @@ uint32_t require_function(const char* name);
 // caller's point of view).
 void call_guest(Context& c, uint32_t fn);
 
-// What stopped the game, with function names, on stderr.
+// What stopped the game, with function names, on stderr: also the guest call
+// stack (from the stack frames' back chain and saved link registers) and
+// the argument registers, as the running host thread's context last held
+// them (lifted code syncs them at calls, so they are a call or so old).
 void report_stop(const Stop& s);
+// The context each host thread runs its guest thread in, for report_stop.
+void set_thread_context(const Context* c);
+// A guest call stack from a context's stack pointer, on stderr.
+void report_stack(const Context& c);
 
 // What the runtime has done so far, printed with a stop: shows which parts
 // a run has exercised. Each counter is bumped by the running guest thread.
@@ -74,6 +81,12 @@ struct Stats {
     uint64_t interrupts = 0, decrementer = 0;
     uint64_t files_opened = 0, bytes_read = 0;
     uint64_t draws = 0, vertices = 0, display_copies = 0, texture_copies = 0, retraces = 0;
+    uint64_t audio_frames = 0;
+    // Periodic interrupts that were late by a whole period or more and so
+    // never ran (an audio frame lost is music running slow), and where
+    // deliveries happened: in the idle scheduler, or at a safe point in
+    // running code.
+    uint64_t periods_dropped = 0, idle_deliveries = 0, running_deliveries = 0;
 };
 Stats& stats();
 void report_stats();

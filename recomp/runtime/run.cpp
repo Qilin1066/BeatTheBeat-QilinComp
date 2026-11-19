@@ -7,16 +7,19 @@
 // Whatever the runtime doesn't provide yet stops the game with a report: the
 // replaced function, the hardware address or the instruction, and where it
 // was reached from. Exit status: 0 the game ended itself, 1 it stopped,
-// 2 the runtime couldn't start. Runtime code: no std::format.
+// 2 the runtime couldn't start, 3 the time limit (QILIN_RUN_SECONDS) ended
+// it. Runtime code: no std::format.
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-
 #include <filesystem>
+#include <thread>
 
 #include "dol.hpp"
 #include "dvd.hpp"
 #include "machine.hpp"
+#include "nand.hpp"
 #include "native.hpp"
 #include "threads.hpp"
 
@@ -41,6 +44,22 @@ constexpr uint32_t kAfterOSInit = 0x80004170u, kAfterInitUser = 0x800041A8u, kAf
     std::fflush(stdout);
     std::fflush(stderr);
     std::_Exit(code);
+}
+
+// QILIN_RUN_SECONDS: end the run after that long, with the counters (exit
+// status 3), for runs that no longer stop on their own.
+void start_time_limit() {
+    const char* v = std::getenv("QILIN_RUN_SECONDS");
+    if (!v || !*v) return;
+    const long seconds = std::strtol(v, nullptr, 10);
+    if (seconds <= 0) return;
+    std::thread([seconds] {
+        std::this_thread::sleep_for(std::chrono::seconds(seconds));
+        std::fprintf(stderr, "qilin_run: time limit (%ld s) reached\n", seconds);
+        rt::report_stats();
+        rt::report_threads();
+        end(3);
+    }).detach();
 }
 
 // Calls a guest function as a `bl` at return_to - 4 would.
@@ -68,10 +87,13 @@ int main(int argc, char** argv) {
         return 2;
     }
     if (folder && !rt::open_disc(arg)) return 2;
-    if (!known_build(dol->sha256)) {
+    const KnownBuild* build = known_build(dol->sha256);
+    if (!build) {
         std::fprintf(stderr, "qilin_run: %s is not the supported build (SHA-256 %s)\n", argv[1], dol->sha256.c_str());
         return 2;
     }
+    rt::init_nand(build->disc_id);
+    rt::fine_timers();
     if (!rt::map_guest_memory()) {
         std::fprintf(stderr, "qilin_run: cannot map the guest's memory (4 GB of address space, 88 MB of RAM)\n");
         return 2;
@@ -97,10 +119,12 @@ int main(int argc, char** argv) {
     c.r[2] = kSmallData2;
     c.r[13] = kSmallData;
     c.spr[kHid2] = kHid2Lsqe | kHid2Pse;
+    rt::set_thread_context(&c);
     if (!rt::init_threads(c)) return 2;
+    start_time_limit();
     try {
         call_from(c, rt::require_function("OSInit"), kAfterOSInit);
-        rt::adopt_boot_thread();
+        rt::adopt_boot_thread(&c);
         call_from(c, rt::require_function("__init_user"), kAfterInitUser);
         c.r[3] = 0;  // argc, argv: none (the disc's bi2 passes no arguments)
         c.r[4] = 0;

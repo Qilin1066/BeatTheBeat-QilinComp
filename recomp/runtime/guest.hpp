@@ -7,6 +7,7 @@
 // CR field n occupies bits 4n-4n+3 (LT, GT, EQ, SO), so CR0 is the top nibble.
 #pragma once
 
+#include <atomic>
 #include <bit>
 #include <cmath>
 #include <cstdint>
@@ -342,6 +343,28 @@ inline double fctiwz(double b) {
     return dbl(0xFFF8000000000000ull | v);
 }
 
+// The estimates (frsqrte, fres): Broadway reads them from tables no source
+// here pins down, so lifted code stops on any input that needs the table.
+// The architecture defines the rest exactly: a NaN stays a NaN (quietened),
+// a zero gives an infinity of its sign, an infinity gives a zero, and a
+// negative number's square root is the default NaN. Under non-IEEE mode a
+// denormal input counts as a zero of its sign.
+inline double frsqrte(double b, uint32_t pc) {
+    if (std::isnan(b)) return quiet(b);
+    const double x = ni_d(b);
+    if (x == 0.0) return std::copysign(HUGE_VAL, x);
+    if (x < 0.0) return dbl(0x7FF8000000000000ull);
+    if (std::isinf(x)) return 0.0;
+    fp_unknown(pc);
+}
+inline double fres(double b, uint32_t pc) {  // single precision
+    if (std::isnan(b)) return single_nan(quiet(b));
+    const double x = ni_s(b);
+    if (x == 0.0) return std::copysign(HUGE_VAL, x);
+    if (std::isinf(x)) return std::copysign(0.0, x);
+    fp_unknown(pc);
+}
+
 // fcmpu/fcmpo: the CR field (FL, FG, FE, FU). FPSCR's FPCC and VX bits aren't kept.
 inline uint32_t fcmp(double a, double b) {
     if (std::isnan(a) || std::isnan(b)) return 1;
@@ -466,7 +489,22 @@ inline uint64_t g_time_reads = 0;
 inline constexpr uint64_t kTimeStart = 0x0000000100000000ull, kTimeStep = 0x1000;
 #endif
 
+// ---- safe points in lifted loops ----
+// The lifter puts a poll on every backward branch, so a loop that waits for
+// an interrupt (a flag a callback sets) gets it, as on the console: when an
+// interrupt is queued, and every 1024th time round for the timers. Only one
+// guest thread runs at a time, so the counter needs no atomics.
+inline std::atomic<bool> g_irq_pending{false};
+inline uint32_t g_poll_tick = 0;
+inline bool poll_due() {
+    return g_irq_pending.load(std::memory_order_relaxed) || (++g_poll_tick & 1023u) == 0;
+}
+
 // ---- provided by the runtime (dispatch.cpp and the host) ----
+// A safe point in a lifted loop: delivers what is due (the runtime), or
+// nothing (the differential test). The lifter stores the loop's stack
+// pointer first, so handlers build their frames below it.
+void poll(Context& c);
 // Call the lifted function at a guest address (bctrl, bctr, blrl). Unknown
 // targets stop with BadJump.
 void call(Context& c, uint32_t target, uint32_t from);

@@ -1,7 +1,6 @@
 // Indirect calls through the generated function table, and the special
 // registers lifted code may read or write. Runtime code: no std::format.
 #include <algorithm>
-#include <chrono>
 
 #include "guest.hpp"
 
@@ -37,17 +36,7 @@ void mtspr(Context& c, unsigned spr, uint32_t v, uint32_t pc) {
     c.spr[spr] = v;
 }
 
-// The time base runs at a quarter of the bus clock: 243 MHz / 4 on the Wii.
-uint64_t time_base() {
-#ifdef QILIN_DETERMINISTIC_TIME
-    return kTimeStart + g_time_reads++ * kTimeStep;
-#else
-    using namespace std::chrono;
-    const auto ns = static_cast<uint64_t>(duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count());
-    return ns / kNsPerSecond * kTimeBaseHz + ns % kNsPerSecond * kTimeBaseHz / kNsPerSecond;  // no overflow for centuries
-#endif
-}
-
+// The time base itself is timebase.cpp's.
 uint32_t mftb(Context&, unsigned tbr) {
     const uint64_t ticks = time_base();
     return tbr == 269 ? static_cast<uint32_t>(ticks >> 32) : static_cast<uint32_t>(ticks);

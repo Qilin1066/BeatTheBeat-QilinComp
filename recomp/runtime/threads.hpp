@@ -14,8 +14,11 @@ struct ThreadEnd {};
 // False, with the reason on stderr, if they aren't the supported build's.
 bool init_threads(const Context& boot);
 // After OSInit: the host thread running start-up runs the OS's default
-// thread (the current thread __OSThreadInit set).
-void adopt_boot_thread();
+// thread (the current thread __OSThreadInit set), with registers `c`.
+void adopt_boot_thread(const Context* c);
+// Each guest thread with its state and, unless it's the one running, its
+// call stack (blocked threads stored their registers on the way in).
+void report_threads();
 // For a host thread whose guest thread has exited while others go on.
 [[noreturn]] void wait_forever();
 

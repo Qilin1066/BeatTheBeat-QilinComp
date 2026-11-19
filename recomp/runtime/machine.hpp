@@ -16,6 +16,10 @@ inline constexpr uint32_t kMem2 = 0x90000000u, kMem2Bytes = 64u << 20;
 // g_mem; false if the host refuses.
 bool map_guest_memory();
 
+// Host timers fine enough for the audio clock's 3 ms (Windows: 1 ms
+// resolution; elsewhere the default already is).
+void fine_timers();
+
 // Guest memory for the runtime's own objects that the game's code works on
 // (GX's FIFO object, VI's thread queue): a block OSInit keeps back from the
 // top of the MEM1 arena. Zeroed; never freed. Stops when it runs out.

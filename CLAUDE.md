@@ -91,12 +91,15 @@ Before a milestone commit, all of these must hold: tests pass, warnings are clea
 - The extracted disc is the owner's and lives outside the repo (ask for its path; `sys/`, `files/`). `qilin_run` takes the folder. A `.wbfs` can't be read (Wii disc key).
 - GX is replaced at its API (its register writes go through pointers in memory, which can't be caught cheaply). Lifted code's FIFO stores (constant address 0xCC008000, found by `hwaccess`) become `rt::fifo_st*` calls in the lifter. Prefer lifting pure GX functions (object init/get, arithmetic) and decoding their output natively; native `GXInit` runs the lifted `__GXInitGX` for the SDK's defaults. Check a candidate is pure: no `hwaccess` hits, no `lwz rX,-1568(r2)` (GX's state pointer), no hardware-touching calls.
 - Before writing a native, read how the SDK function and its callers use the result (e.g. `WPADGetStatus() == 3` in `KPADInitEx`, `SCCheckStatus() == 1` busy in `OSInit`). Where a value is the console's own (a size, a constant), lift the function that returns it instead of copying the number.
+- Safe points (v0.15.0): native-call entry and every lifted backward branch (`rt::poll_due`/`rt::poll`, with `c.r[1] = r1`), besides enabling interrupts and idle. I/O completions get `kIoLatency` (1 ms): instant ones overtook the game's own bookkeeping (it sets "loading" after issuing a read) and hung it. Periodic interrupts catch up; Windows needs `timeBeginPeriod(1)` or idle waits round up to 15.6 ms and audio frames are lost.
+- AX is lifted whole; the native DSP takes mail `0xBABE0080` + the command list (command 0 studio, 1-3 mix buffers by mode, 4 first PB; PB next at +0, state at +16; VPB.pb at +40) and posts the task's resume callback. `DSPAddTask` must run the init callback before returning (AX spins on it).
+- MEM1's arena ends at `(0x81800000 - fst.bin size) & ~31` (the apploader's place for the file table); the runtime's scratch lives there. The game makes one heap of each arena (`memInitHeap`), so the bounds are its heap sizes.
 - Interrupts reach lifted code only at safe points: `OSEnableInterrupts`/`OSRestoreInterrupts` turning them on, and the idle scheduler. `OSLoadContext` throws `rt::Resume` to unwind an interrupt handler; it stops anywhere else.
 - Library split (`docs/code-analysis.md`): lift game/NW4R/MSL/runtime/etc. (74%); replace OS, DVD, GX, AX, pad, WPAD, NAND… (25%); drop MetroTRK/NdevExi2A (1%).
 
 ## Status (v0.12.0)
 
-- Runtime (v0.14.0): `qilin_run <extracted disc folder>` runs `main`'s start-up (graphics with the SDK's GX defaults, controllers, the Home Button Menu loading its files) and stops at `AICheckInit` (audio). The OS's thread, mutex, message, time and alarm units are lifted (by unit, `kLiftUnits`) over a native `SelectThread` (one host thread per guest thread) and interrupts at safe points; DVD, alarms and retraces have run (5 files, 17 interrupts, 7 retraces). GX is native at its API with a headless sink (`gx.cpp`, `gx_fifo.cpp`); no draw has happened yet, nor a switch between two threads. 178 of 2,052 replaced or dropped functions have native code.
+- Runtime (v0.15.0): `qilin_run <extracted disc folder>` initialises the game, saves on first boot, reaches the title scene and keeps running (a frame per retrace, the audio clock at 333 frames a second, 12 threads). Headless GX (draws counted), silent DSP (stops at the first voice), no remote connected, so it waits at the title. Use `QILIN_RUN_SECONDS=N` and `QILIN_NAND=<dir>` for test runs. 215 of 1,969 replaced or dropped functions have native code; all 6,202 lift-side functions lift (8,108 in the difftest lift).
 
 - 8,171 functions, all 157 jump tables proven, 98.80% of `.text` reached as code (the rest is identified as padding, dead code or data).
 - 8,103 functions lifted (slices 1, 3 and 4: integer, floating point, paired singles). Left: 56 privileged and 7 FPSCR (replaced libraries), 5 `fres`/`frsqrte`.
@@ -109,7 +112,7 @@ Before a milestone commit, all of these must hold: tests pass, warnings are clea
 
 ## Next steps, in order
 
-1. Audio (AI, AX, DSP): the game stops at `AICheckInit`. NW4R snd (lifted) runs from AX's audio-frame callback, so AX is the rhythm clock and must run at the console's rate, sounding or not. Then the GX renderer on Vulkan once the game draws (the CPU side is in `gx.*`; the owner approved CPU side first, then Vulkan).
+1. The GX renderer on Vulkan (the CPU side is in `gx.*`; the game draws every frame). The mixer in `audio.cpp` (ADPCM/PCM, rate conversion, volumes, aux, output modes) from AX's command list and PBs, read from AX's code. Input: a host backend behind WPAD.
 2. The boot information confirmed in Dolphin (`lowmem.py`).
 3. The rest of the runtime, from its to-do list: OS (threads, time, memory, interrupts as the lifted code calls them), then GX on Vulkan (including the FIFO stores), AX, DVD, NAND, input. Exception tables and a timing model as the runtime needs them.
 

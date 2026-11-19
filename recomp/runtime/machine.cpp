@@ -5,11 +5,20 @@
 
 #if defined(_WIN32)
 #include <windows.h>
+#include <timeapi.h>
 #else
 #include <sys/mman.h>
 #endif
 
 namespace qilin::rt {
+
+void fine_timers() {
+#if defined(_WIN32)
+    // Windows rounds short waits up to its 15.6 ms tick by default; the
+    // audio clock needs 3 ms (the setting lasts until the process exits).
+    timeBeginPeriod(1);
+#endif
+}
 
 bool map_guest_memory() {
     constexpr uint64_t kSpace = 1ull << 32;

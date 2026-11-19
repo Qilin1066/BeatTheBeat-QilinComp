@@ -1,6 +1,19 @@
 # The runtime (roadmap step 3)
 
-Last updated 2026-11-19 (v0.14.0: GX's CPU side, VI with its retrace, the first input and SC functions; the game initialises its graphics, controllers and Home Button Menu, loads files and stops at audio. v0.13.0: the OS's threads, mutexes, messages, time and alarms lifted over a native thread switch and interrupt delivery; DVD. v0.12.0: the skeleton).
+Last updated 2026-11-19 (v0.15.0: the game runs: AX lifted over a native DSP and audio DMA, saves on a host folder, safe points in lifted loops; it initialises, reaches its title scene and keeps running a frame per retrace. v0.14.0: GX's CPU side, VI. v0.13.0: the OS's threads and alarms, DVD. v0.12.0: the skeleton).
+
+## Where bring-up stands (v0.15.0)
+
+The game **initialises completely** (`Init Process Took … msecs`, its own report), saves on first boot (`Riq.dat` and its banner), runs its opening scenes, changes to its **title scene**, and **keeps running**: in a 40-second run, 2,383 frames copied out for 2,397 retraces, 45,401 draws, 13,307 audio frames (332.7 a second, the console's 333.3), no periodic interrupt dropped, 12 threads. Nothing is drawn on screen yet (the GX sink is headless) and nothing sounds (no voice has played: the DSP stops when one does), and with no remote connected the game waits at its title. Use `QILIN_RUN_SECONDS` for runs like these.
+
+Next: **the Vulkan renderer** for GX, now that the game draws every frame; **the mixer** (the DSP stops at the first voice); **input** (a host backend for the Wii Remote).
+
+## Diagnostics
+
+- **Counters** with every stop, and with `QILIN_RUN_SECONDS=N` (which ends the run after N seconds, exit status 3): thread switches and threads started, interrupts (decrementer), files and bytes read, draws and vertices, frames copied out, retraces, audio frames, **periodic interrupts dropped** (an audio frame lost is music running slow), and where deliveries happened (idle, running code).
+- **A guest call stack** with every stop: the stack frames' back chain and saved return addresses, from the running thread's registers as last synced.
+- **Every guest thread** at the time limit: its state, priority, queue and call stack, and the scheduler's state (current thread, run-queue bits, reschedule count). This is how the loop-poll problem below was found.
+- **The game's own reports** (`OSReport`, MSL's `printf`): `OSReport` is lifted and formats through MSL; MSL's console writes to the debug UART, which here goes to stderr prefixed `[game]`, as a development kit's serial port shows it. A deliberate difference from retail, where the UART isn't there; the only effect the game could see is `printf`'s return value, which `OSReport` ignores. (MSL also calls the debugger stub's console write on every console: on retail it reads the stub's "serial I/O" byte, 0, and returns; lifted as such.)
 
 ## Building and running
 
@@ -57,7 +70,18 @@ OSThread's layout, from the code: the saved context at +0 (GPRs, CR +128, LR +13
 
 ## Interrupts and alarms (`recomp/runtime/interrupts.*`)
 
-The Wii raises an interrupt between any two instructions; lifted code can't be entered there, so the runtime delivers interrupts at **safe points**: when the game enables interrupts (`OSEnableInterrupts`, or `OSRestoreInterrupts` turning them on), and while the scheduler is idle. Whether a lifted loop that waits for an interrupt without enabling them also needs a safe point is decided when one is found.
+The Wii raises an interrupt between any two instructions; lifted code can't be entered there, so the runtime delivers interrupts at **safe points**, where the guest's stack pointer is known (handlers build their frames below it):
+
+- when the game enables interrupts (`OSEnableInterrupts`, or `OSRestoreInterrupts` turning them on);
+- **at every call into native code** (v0.15.0): the lifted caller has just stored the registers it changed, `r1` among them;
+- **on every backward branch of lifted code** (v0.15.0), so a loop that waits for an interrupt gets it, as on the console. The lifter emits `if (rt::poll_due()) [[unlikely]] { c.r[1] = r1; rt::poll(c); }`: a flag test while an interrupt is queued, and a look at the clock every 1,024th time round for the timers. Found when the Mii library spun in `RFLInitRes` (a loop with no call in it) waiting for a NAND callback. 2,594 polls in the runtime's lift; in the differential test `rt::poll` does nothing;
+- and while the scheduler is idle.
+
+A delivery saves the whole context and puts it back, so the interrupted function's live registers (host locals) and the context agree again afterwards; delivery state is per host thread, so a switch during a delivery's reschedule leaves the next thread free to take interrupts. Interrupts are only delivered while enabled.
+
+**Periodic interrupts catch up** (v0.15.0): when delivery comes late, each period that has passed runs in turn, as the console takes every audio DMA and every retrace; only a stall of more than 32 periods (about 100 ms of audio) drops the rest, counted. **Windows** rounds short waits up to its 15.6 ms tick: `qilin_run` asks for 1 ms timers (`timeBeginPeriod`) so the idle wait wakes for each 3 ms audio frame. Before both fixes, 80% of audio frames were lost (one per retrace instead of one per 3 ms).
+
+**I/O completions take time** (v0.15.0): queued interrupts have a due time, and DVD and NAND completions arrive no sooner than 1 ms after the request. On a console a request takes milliseconds, and the game sets its "loading" flag after issuing one (`loadFile`: `DVDReadAsyncPrio`, then the flag; the callback clears it); a completion delivered at once, at the next safe point, cleared the flag before it was set and left `waitDVD` waiting forever. Disc speed itself isn't modelled: reads finish far sooner than on a console.
 
 - **A queued interrupt** (a DVD completion, later VI and audio) runs as the SDK's dispatcher runs a handler: `OSDisableScheduler` (so a thread woken inside it doesn't switch there), the handler, `OSEnableScheduler`, `__OSReschedule` (which may switch threads). The three are lifted code.
 - **The decrementer** runs the handler the OS installed for it (`__OSSetExceptionHandler`, native: the runtime keeps the table) with the interrupted context. `PPCMtdec` sets the deadline on the time base, as the alarm code's `InsertAlarm` asks. The SDK's decrementer callback then fires the due alarms and ends in `OSLoadContext`, which on the console never returns: natively it unwinds back to the delivery, which puts the interrupted registers back. Anywhere else `OSLoadContext` stops the game: it would be a context switch the runtime doesn't make.
@@ -90,6 +114,27 @@ GX is replaced at its API, as the roadmap says: its own code drives the GPU's re
 
 KPAD, the Wii Remote processing, is lifted; WPAD is native at its API. **Until there is a host input backend, no remote is connected:** a state a console is in whenever remotes are off, which KPAD and the Home Button Menu handle as on hardware. `WPADGetWorkMemorySize` is lifted, with the two tail calls under it, so the heap the game makes for WPAD has the console's size. The pointer's settings (sensitivity, the sensor bar's place) are console settings. GameCube controllers: none plugged in.
 
+## Audio (`recomp/runtime/audio.cpp`; v0.15.0)
+
+**AX is lifted whole** (its eight units: voices and priorities, the setters, PB sync, aux callbacks, each frame's command list): it is CPU code with no hardware access, and NW4R's sound system and the Home Button Menu write AX's voice structures directly, so whatever runs the voices must read the SDK's own structures. Native: **AI** (the audio DMA) and **the DSP**.
+
+- **The protocol is AX's own**, read from its code: AX registers a DSP task (microcode, memory, four callbacks) and spins until the task's init callback has run, so `DSPAddTask` runs it before returning. Each **AI DMA interrupt** (every 96 stereo samples at 32 kHz: 3 ms, a periodic interrupt) calls AX's `__AXOutAiCallback`, which, if the DSP is idle, builds and sends the next frame: mail `0xBABE0080`, then the command list's address (the list built the frame before), and queues the next of three 384-byte output buffers. When the DSP has finished a frame, the task's resume callback runs (an interrupt), and AX either starts the pending frame or marks the DSP idle.
+- **The command list** is 16-bit words, each command followed by its arguments, addresses in two halves: command 0 (the studio parameters), 1, 2 or 3 by output mode (the mix buffers), 4 (the first voice parameter block), then aux and output commands.
+- **For now the DSP** decodes the set-up and walks the voice chain (each PB's next link at +0, its state at +16; in AX's voice structure the PB starts at +40, sync flags at +28), outputs silence while no voice plays, which is what the console outputs then, and **stops when a voice plays**: the mixer (ADPCM and PCM decoding, rate conversion, volumes and ramps, aux sends, output mode) is the next step. Nothing is faked meanwhile; the audio clock, AX's callbacks and NW4R's sound thread all run at the console's rate.
+
+## NAND (`recomp/runtime/nand.*`; v0.15.0)
+
+The game's saves in a host folder laid out as the flash's own paths (`<root>/title/00010000/534f4d50/data/...`; the title's code from the disc ID). The root is `QILIN_NAND`, or the platform's per-user data folder (`%LOCALAPPDATA%\BeatTheBeat-QilinComp\nand`, `~/Library/Application Support/...`, `$XDG_DATA_HOME` or `~/.local/share/...`): never the repository, since saves are the game's data. The title's data directory and `/tmp` exist before the game runs, as a console's system makes them.
+
+- Paths: absolute as given, relative from the title's home directory; `..` is refused (it would leave the folder).
+- Results as the game's backup manager tests them (read from its code): `NANDGetType` -12 for "no save yet", `NANDCheck`'s answer bits (5: no space, 10: too many files; 0 here), `NANDGetStatus` as an existence check (owner and group aren't kept; the permission is owner read/write, as the game creates its files), `NANDMove` failing with EXISTS onto an existing file, as on the console.
+- Files: create, open (by the address of the game's file info), read, write, seek, length, close. The first boot writes `/tmp/Riq.dat` (2,592 bytes, with a CRC-32 from the lifted `OSCalcCRC32`), moves it home, and writes the save banner (`NANDInitBanner` lifted).
+- Asynchronous requests: accepted at once, their result through the callback 1 ms later. A safe open for reading is a plain open; **for writing** (the SDK's copy-and-commit) it isn't modelled yet and stops. The **Mii database** (`/shared2/menu/FaceLib/RFL_DB.dat`) is the console's, not the game's: the folder has it only if the owner copies in their own; without it the Mii library gets NOEXISTS and goes on, as on a console without one.
+
+## Memory: the arenas (v0.15.0)
+
+The game makes one heap of the whole MEM1 arena and one of the MEM2 arena (`memInitHeap`), so the arenas' bounds are its heap sizes. With `OSInit`'s fallback end the MEM1 heap was 480 KB short, and the game said so itself (`Can't Alloc Heap: Required 749120 B, Free 271088 B`). **MEM1's arena now ends where a console's apploader puts the disc's file table**: the top of MEM1 less `sys/fst.bin`'s size, rounded down to 32 bytes (`0x817ED8C0` for this disc), and the runtime's 64 KB guest scratch lives in the table's place (the game doesn't read the table there: DVD is native), so the game's heap is the console's size. Still to confirm with a Dolphin dump (`lowmem.py`).
+
 ## Other native pieces
 
 - **The locked cache** (`LCEnable`, `LCDisable`, `LCQueueLength`): a 16 KB scratchpad filled by DMA. NW4R turns it on and off, but no lifted code addresses it (nothing outside the replaced libraries builds `0xE000xxxx`; only the debugger stub touches the DMA registers), so there is no DMA, and an access would stop under checked memory.
@@ -98,7 +143,7 @@ KPAD, the Wii Remote processing, is lifted; WPAD is native at its API. **Until t
 
 ## Native code so far
 
-178 of the 2,052 replaced and dropped functions (v0.14.0); v0.13.0's 48 were:
+215 of the 1,969 replaced and dropped functions (v0.15.0; 178 of 2,052 at v0.14.0). v0.13.0's 48 were:
 
 - `os.cpp`: `OSInit`, the interrupt enable (`OSDisableInterrupts`, `OSEnableInterrupts`, `OSRestoreInterrupts`), the twelve arena getters and setters, the cache range functions (nothing to do: guest memory has no caches behind it), the exception table (`__OSSetExceptionHandler`, `__OSGetExceptionHandler`), `PPCMtdec`, `OSRegisterShutdownFunction` (kept for when shutdown is native), `OSRegisterVersion` (the version string, to stderr) and `PPCHalt`.
 - `threads.cpp`: `SelectThread`, `OSSetCurrentContext`, `OSInitContext`, `OSLoadContext`.
@@ -129,7 +174,7 @@ python3 tools/analysis/lowmem.py path/to/mem1.raw
 
 It prints every low-memory word `OSInit` and `__start` read (arenas, clocks, console type, IOS version, the boot information) next to the runtime's value, and flags the ones that differ. The dump holds the whole game image, so it stays out of git (`*.raw` is ignored).
 
-## Where bring-up stands
+## Where bring-up stood at v0.14.0
 
 `main` runs its whole start-up: the video mode, the file manager, the graphics manager (`GXInit` with the SDK's defaults, the display copy set up, the first frame copied out, `VIConfigure`, the first retraces), NW4R's 3D and layout libraries, the controller manager (WPAD, KPAD), and the Home Button Menu's manager, which loads its files from the disc. It stops at `AICheckInit`, where the Home Button Menu starts its sound.
 

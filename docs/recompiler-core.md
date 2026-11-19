@@ -183,6 +183,11 @@ The many trials that end in a memory fault come from random pointers; better-sha
 ### `qilin` CLI (`recomp/src/main.cpp`)
 `info` (JSON), `insns` (every word of the text sections: address, word, text), `disasm` (a raw file of big-endian words, for the sweep), `profile` (instruction mix of the text sections, with paired-single, floating-point and privileged counts), `cfg` (summary, `--json` for every function), `coverage` (exit status 3 while any word is unknown), `suspects`, `hwaccess` (constant-address loads and stores outside cached MEM1 per function, `--json`; see `code-analysis.md`) and `lift` (`--out <dir>`, `--range lo-hi`, `--only addr`; writes only files whose content changed; `--runtime --symbols <list>` for the runtime's lift, where the functions of replaced and dropped libraries call native code: `runtime.md`). Exit status is non-zero on any error.
 
+### Lifter changes for the runtime (v0.14.0, v0.15.0)
+- **FIFO stores:** stores `hwaccess` finds on the GX write-gather pipe become `rt::fifo_st8/16/32` (`stfs` through its conversion, `psq_st` as `rt::fifo_psq_st`); others stay memory stores. `hwaccess` keeps callee-saved registers' constants across calls (v0.15.0).
+- **Loop polls:** every backward branch gets `if (rt::poll_due()) [[unlikely]] { c.r[1] = r1; rt::poll(c); }`, a safe point for interrupts (`runtime.md`). In the differential test `rt::poll` does nothing.
+- **Estimates:** `frsqrte` and `fres` lift through `rt::frsqrte`/`rt::fres`: exact for zeros, infinities, NaNs and negative square roots; anything needing Broadway's table stops (`fp_unknown`). `ps_res` and `ps_rsqrte` stay unsupported (no lifted code uses them).
+
 ## Next
-1. The runtime (`runtime.md`): the skeleton runs (v0.12.0); next the OS's threads and scheduler, then the rest of its to-do list (`code-analysis.md`) and the GX FIFO.
+1. The runtime (`runtime.md`): the game runs to its title (v0.15.0); next GX on Vulkan, the mixer, input.
 2. Broadway's open FP questions, from hardware or a clean source: frC rounding in single-precision and paired-single multiplies, the `fres`/`frsqrte`/`ps_res`/`ps_rsqrte` tables, `fctiwz`'s high word for negative inputs, non-IEEE compares and `fsel`.

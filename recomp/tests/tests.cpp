@@ -717,6 +717,48 @@ void test_hwaccess() {
     CHECK(r.code.contains("rt::fifo_st32(ea, rt::stfs(f1))"));
     CHECK(r.code.contains("rt::st32(ea, r5)"));
     CHECK(!r.code.contains("rt::fifo_st32(ea, r5)"));
+
+    // A callee-saved register keeps its constant across a call (the EABI);
+    // a volatile one doesn't.
+    Program k;
+    const uint32_t keep[] = {
+        0x3F00CC01,  // lis r24,0xCC01
+        0x3C60CC01,  // lis r3,0xCC01
+        0x48000099,  // bl 0x80003300
+        0xD0388000,  // stfs f1,-0x8000(r24)  -> still the GX FIFO
+        0xD0438000,  // stfs f2,-0x8000(r3)   -> r3 unknown after the call
+        0x4E800020,  // blr
+    };
+    at = 0x80003260;
+    for (uint32_t w : keep) k.word(at, w), at += 4;
+    k.word(0x80003300, 0x4E800020);
+    k.word(0x80005020, 0x80003260);
+    auto dk = Dol::parse(k.bytes);
+    CHECK(dk.has_value());
+    if (!dk) return;
+    Cfg ck(*dk);
+    ck.run();
+    const std::vector<HwAccess> kept = hardware_accesses(ck, ck.functions().at(0x80003260));
+    CHECK(kept.size() == 1 && kept[0].pc == 0x8000326Cu && kept[0].ea == 0xCC008000u);
+
+    // A loop's backward branch is a safe point, with the loop's stack pointer.
+    Program lp;
+    const uint32_t loop[] = {
+        0x3863FFFF,  // addi r3,r3,-1
+        0x2C030000,  // cmpwi r3,0
+        0x4082FFF8,  // bne 0x80003260
+        0x4E800020,  // blr
+    };
+    at = 0x80003260;
+    for (uint32_t w : loop) lp.word(at, w), at += 4;
+    lp.word(0x80005020, 0x80003260);
+    auto dl = Dol::parse(lp.bytes);
+    CHECK(dl.has_value());
+    if (!dl) return;
+    Cfg cl(*dl);
+    cl.run();
+    const LiftResult lr = Lifter(cl).lift(cl.functions().at(0x80003260));
+    CHECK(lr.ok && lr.code.contains("if (rt::poll_due()) [[unlikely]] { c.r[1] = r1; rt::poll(c); }"));
 }
 
 void test_paired() {
@@ -843,6 +885,35 @@ void test_runtime() {
     rt::g_mem = saved;
 }
 
+// ---------------------------------------------------------------- estimates
+// frsqrte and fres: exact where the architecture defines them, a stop
+// wherever Broadway's table would be needed.
+void test_estimates() {
+    using rt::bits;
+    const double inf = HUGE_VAL;
+    CHECK(rt::frsqrte(0.0, 0) == inf && rt::frsqrte(-0.0, 0) == -inf);
+    CHECK(rt::frsqrte(inf, 0) == 0.0 && !std::signbit(rt::frsqrte(inf, 0)));
+    CHECK(bits(rt::frsqrte(-2.0, 0)) == 0x7FF8000000000000ull && bits(rt::frsqrte(-inf, 0)) == 0x7FF8000000000000ull);
+    CHECK(bits(rt::frsqrte(rt::dbl(0x7FF0000000000001ull), 0)) == 0x7FF8000000000001ull);  // quietened
+    CHECK(rt::frsqrte(rt::dbl(1), 0) == inf);                                             // a denormal is a zero (NI)
+    CHECK(rt::fres(0.0, 0) == inf && rt::fres(-0.0, 0) == -inf);
+    CHECK(rt::fres(-inf, 0) == 0.0 && std::signbit(rt::fres(-inf, 0)));
+    bool stopped = false;
+    try {
+        rt::frsqrte(4.0, 0x80001234u);
+    } catch (const rt::Stop& s) {
+        stopped = s.kind == rt::Stop::Unsupported && s.pc == 0x80001234u;
+    }
+    CHECK(stopped);
+    stopped = false;
+    try {
+        rt::fres(3.0, 0x80001238u);
+    } catch (const rt::Stop& s) {
+        stopped = s.kind == rt::Stop::Unsupported && s.pc == 0x80001238u;
+    }
+    CHECK(stopped);
+}
+
 // ---------------------------------------------------------------- library plan
 
 void test_libraries() {
@@ -943,6 +1014,7 @@ void call(Context&, uint32_t target, uint32_t from) { bad_jump(from, target); }
 }  // namespace qilin::rt
 
 int main() {
+    test_estimates();
     test_libraries();
     test_natives();
     test_sha256();

@@ -11,6 +11,26 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-11-19
+The game runs: it initialises completely, saves on first boot, reaches its title scene and keeps running, a frame copied out on every retrace, with the audio clock at the console's rate. Nothing is shown or heard yet (headless GX; the DSP stops at the first voice), and with no remote connected the game waits at its title.
+
+### Added
+- **Audio** (`recomp/runtime/audio.cpp`): AX lifted whole (eight units: CPU code with no hardware access, whose voice structures NW4R writes directly); AI's DMA interrupt every 3 ms (96 stereo samples at 32 kHz); the DSP takes AX's mail (`0xBABE0080`, the command list), decodes the list's set-up and the voice chain, outputs silence while no voice plays and stops when one does. The protocol is AX's own, read from its code.
+- **NAND** (`recomp/runtime/nand.*`): saves in a per-user host folder laid out as the flash (`QILIN_NAND` to choose it); create, open, read, write, seek, length, close, move, type, status, check, the home directory, and the asynchronous safe open for reading. Results as the game's backup manager reads them. The first boot writes `Riq.dat` and its banner.
+- **Safe points in lifted code:** at every call into native code, and on every backward branch (the lifter emits a poll with the loop's stack pointer: 2,594 in the runtime's lift). A loop waiting for an interrupt gets it, as on the console.
+- **The estimate instructions:** `frsqrte` and `fres` lift, exact where the architecture defines them (zeros, infinities, NaNs, negative square roots) and stopping where Broadway's table would be needed. The last five functions that weren't lifted (`PSMTXInverse`, `PSMTXInvXpose`, `PSVECNormalize`, `PSVECMag`, NW4R's `FrSqrt`) now lift: 8,108 functions in the differential test, all 6,202 in the runtime's lift.
+- **More lifted out of replaced libraries:** `OSReport`, `OSVReport`, `OSCrc.c`, `NANDInitBanner`, `NANDSetUserData`/`NANDGetUserData`, and the debugger stub's console write (`__TRK_write_console`, `GetUseSerialIO`), which MSL calls on every console.
+- **Natives:** the console type (retail), the debug UART (the game's reports to stderr, `[game]`), power and reset callbacks, GameCube pads (none plugged in), `WPADProbe` and `WPADDisconnect` (no remote), `DCFlushRangeNoSync`.
+- **Diagnostics:** a guest call stack with every stop; `QILIN_RUN_SECONDS` (ends a run with the counters, every thread's state and stack, and the scheduler's state; exit status 3); counters for audio frames, dropped periodic interrupts and where deliveries happen.
+- **Tests:** the estimates, a callee-saved register keeping its constant across a call, a loop's poll.
+
+### Changed
+- **Periodic interrupts catch up** when delivered late (each missed audio frame or retrace runs; only a stall beyond 32 periods drops, counted), and `qilin_run` asks Windows for 1 ms timers. Before, four of five audio frames were lost.
+- **I/O completions take 1 ms** (queued interrupts have a due time): an instant completion overtook the game's own bookkeeping (it sets its "loading" flag after issuing a read) and left it waiting forever.
+- **MEM1's arena ends below the disc's file table**, as a console's apploader puts it (from `sys/fst.bin`'s size), and the runtime's guest scratch lives in the table's place: the game's heap is the console's size (it was 480 KB short, and the game said so).
+- **`hwaccess` keeps callee-saved registers across calls** (r1, r2, r13, r14-r31, as the EABI does): 27 more FIFO stores found in lifted code (349 in the runtime's lift), among them the game's sprite drawing (`CCellAnim::draw`).
+- The time base has its own file (`recomp/runtime/timebase.cpp`).
+
 ## [0.14.0] - 2026-11-19
 GX's CPU side: the state the game's GX calls set up, the vertex stream lifted code writes to the FIFO, and VI's retrace. The game initialises its graphics (with the SDK's own GX defaults), controllers and Home Button Menu, loads files from the disc through asynchronous reads, sleeps on alarms, and stops where the Home Button Menu starts its sound. The thread, interrupt, alarm and DVD code from v0.13.0 has now run.
 

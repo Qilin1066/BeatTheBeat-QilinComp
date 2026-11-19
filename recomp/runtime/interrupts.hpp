@@ -21,18 +21,23 @@ namespace qilin::rt {
 bool interrupts_enabled();
 void set_interrupts_enabled(bool on);
 
-// Queues a handler from any host thread; it runs at the next safe point as
-// the SDK's dispatcher runs one: scheduler disabled, then enabled again and
-// a reschedule (which may switch threads).
-void post_interrupt(std::function<void(Context&)> handler);
+// Queues a handler from any host thread; it runs at the first safe point
+// `delay` time-base ticks or more from now, as the SDK's dispatcher runs
+// one: scheduler disabled, then enabled again and a reschedule (which may
+// switch threads). I/O completions take kIoLatency: on a console a request
+// takes milliseconds, and games set their "waiting" flags after issuing
+// one, so a completion must not overtake the caller's next instructions.
+inline constexpr uint64_t kIoLatency = kTimeBaseHz / 1000;  // 1 ms
+void post_interrupt(std::function<void(Context&)> handler, uint64_t delay = 0);
 
 // The decrementer (PPCMtdec): an interrupt `ticks` + 1 time-base ticks from
 // now. Writing it again replaces the deadline, as on the hardware.
 void set_decrementer(uint32_t ticks);
 
-// A periodic interrupt (VI's retrace): `handler` runs every `period` ticks of
-// the time base, as a queued handler runs. A late one runs once and the next
-// is a period after it: the game sees no burst of retraces after a stall.
+// A periodic interrupt (VI's retrace, AI's DMA): `handler` runs every
+// `period` ticks of the time base, as a queued handler runs. When delivery
+// comes late, each period that has passed runs in turn, as the console takes
+// every one; only a stall of more than about 100 ms drops periods (counted).
 void add_periodic(uint64_t period, std::function<void(Context&)> handler);
 
 // The exception handlers the OS installed (__OSSetExceptionHandler), by

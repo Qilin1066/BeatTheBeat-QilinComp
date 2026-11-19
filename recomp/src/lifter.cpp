@@ -466,6 +466,12 @@ void Emitter::instruction(uint32_t pc, const Insn& in) {
             go = std::format("goto {};", label(target));
             targets_.insert(target);
             jumps_.push_back(target);
+            // A backward branch closes a loop: a safe point, with the loop's
+            // stack pointer, so a loop waiting on an interrupt gets it.
+            if (target <= pc) {
+                use(1);
+                line("if (rt::poll_due()) [[unlikely]] { c.r[1] = r1; rt::poll(c); }");
+            }
         } else {
             throw Unsupported{std::format("branch to {:08X}, outside the function and not a tail call", target)};
         }
@@ -610,9 +616,11 @@ void Emitter::floating(uint32_t pc, const Insn& in) {
         line(std::format("if (rt::denormal_d({0})) rt::fp_unknown({1}); {2} = {0} >= 0.0 ? {3} : {4};", x(a), hex(pc), F(d),
                          x(cc), x(b)));
         break;
-    case Op::fres:
-    case Op::frsqrte:
-        throw Unsupported{std::format("floating-point estimate (Broadway's table not known): {}", s.name)};
+    // The estimates: exact where the architecture defines them (zeros,
+    // infinities, NaNs, negative square roots); anything that needs
+    // Broadway's table stops (rt::frsqrte, rt::fres).
+    case Op::frsqrte: set(std::format("rt::frsqrte({}, {})", x(b), hex(pc))); break;
+    case Op::fres: set_s(std::format("rt::fres({}, {})", x(b), hex(pc))); break;
     case Op::mffs:
     case Op::mtfsf:
     case Op::mtfsfi:

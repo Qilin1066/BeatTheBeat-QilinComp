@@ -1,6 +1,8 @@
 // The native-function registry (native.hpp). Runtime code: no std::format.
 #include "native.hpp"
 
+#include "interrupts.hpp"
+
 #include <algorithm>
 #include <cinttypes>
 #include <cstdio>
@@ -84,6 +86,12 @@ size_t natives_bound() { return g_bound; }
 void native(Context& c, uint32_t index) {
     const Fn fn = g_slots[index];
     if (!fn) throw Stop{Stop::Unregistered, g_natives[index].addr, c.lr};
+    // A safe point: the lifted caller has just stored the registers it
+    // changed (r1 among them), so an interrupt can be taken here, before the
+    // call, as the console takes one between two instructions. It keeps
+    // the audio clock (an interrupt every 3 ms) from missing frames while a
+    // thread is busy.
+    deliver_due(c);
     fn(c);
     c.ret = c.lr;  // as the function's blr
 }
@@ -114,8 +122,46 @@ void describe(char* out, size_t n, uint32_t addr) {
 }
 }  // namespace
 
+namespace {
+thread_local const Context* t_context = nullptr;
+
+// Stacks live in MEM1 or MEM2 (threads the game creates often use MEM2).
+bool in_mem1(uint32_t a) {
+    return (a >= 0x80000000u && a < 0x81800000u) || (a >= 0x90000000u && a < 0x94000000u);
+}
+
+void report_context() {
+    if (!t_context) return;
+    const Context& c = *t_context;
+    std::fprintf(stderr, "qilin_run: registers (as last synced): r1 %08" PRIX32 " r3 %08" PRIX32 " r4 %08" PRIX32
+                         " r5 %08" PRIX32 " r6 %08" PRIX32 " r7 %08" PRIX32 " r8 %08" PRIX32 " lr %08" PRIX32 "\n",
+                 c.r[1], c.r[3], c.r[4], c.r[5], c.r[6], c.r[7], c.r[8], c.lr);
+    report_stack(c);
+}
+}  // namespace
+
+void report_stack(const Context& c) {
+    // The back chain: each frame's first word is the caller's stack
+    // pointer, and the caller's frame keeps the return address at +4.
+    std::fprintf(stderr, "qilin_run: guest call stack:\n");
+    uint32_t sp = c.r[1];
+    for (unsigned depth = 0; depth < 24 && in_mem1(sp) && (sp & 7) == 0; ++depth) {
+        const uint32_t back = peek32(sp);
+        if (!in_mem1(back) || back <= sp) break;
+        const uint32_t lr = peek32(back + 4);
+        if (!in_mem1(lr)) break;
+        char where[400];
+        describe(where, sizeof where, lr);
+        std::fprintf(stderr, "    %s\n", where);
+        sp = back;
+    }
+}
+
+void set_thread_context(const Context* c) { t_context = c; }
+
 void report_stop(const Stop& s) {
     report_stats();
+    report_context();
     char pc[400], value[400];
     describe(pc, sizeof pc, s.pc);
     describe(value, sizeof value, s.value);
@@ -162,8 +208,12 @@ void report_stats() {
                  s.switches, s.threads_started, s.interrupts, s.decrementer, s.files_opened, s.bytes_read);
     std::fprintf(stderr,
                  "qilin_run:          %" PRIu64 " draws (%" PRIu64 " vertices), %" PRIu64 " frames copied out, %" PRIu64
-                 " copies to textures, %" PRIu64 " retraces\n",
-                 s.draws, s.vertices, s.display_copies, s.texture_copies, s.retraces);
+                 " copies to textures, %" PRIu64 " retraces, %" PRIu64 " audio frames\n",
+                 s.draws, s.vertices, s.display_copies, s.texture_copies, s.retraces, s.audio_frames);
+    std::fprintf(stderr,
+                 "qilin_run:          %" PRIu64 " periodic interrupts dropped (late by a period); deliveries: %" PRIu64
+                 " when idle, %" PRIu64 " in running code\n",
+                 s.periods_dropped, s.idle_deliveries, s.running_deliveries);
 }
 
 const Symbol* symbol_at(uint32_t addr) {

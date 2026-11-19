@@ -7,7 +7,7 @@ if(APPLE AND NOT CMAKE_OSX_DEPLOYMENT_TARGET)
     set(CMAKE_OSX_DEPLOYMENT_TARGET 10.15 CACHE STRING "oldest macOS the runtime runs on")
 endif()
 # The single source of the version number (see CHANGELOG.md for the scheme).
-project(BeatTheBeatQilinComp VERSION 0.14.0 LANGUAGES C CXX)
+project(BeatTheBeatQilinComp VERSION 0.15.0 LANGUAGES C CXX)
 
 # ---- Language: C++23 everywhere (recompiler, runtime, generated code) ----
 set(CMAKE_CXX_STANDARD 23)
@@ -108,7 +108,7 @@ if(QILIN_UBSAN AND MSVC)
 endif()
 if(QILIN_GEN_DIR)
     file(GLOB QILIN_GEN_SOURCES CONFIGURE_DEPENDS "${QILIN_GEN_DIR}/*.cpp")
-    add_library(qilin_gen_checked STATIC ${QILIN_GEN_SOURCES} recomp/runtime/dispatch.cpp)
+    add_library(qilin_gen_checked STATIC ${QILIN_GEN_SOURCES} recomp/runtime/dispatch.cpp recomp/runtime/timebase.cpp)
     target_include_directories(qilin_gen_checked PUBLIC "${QILIN_GEN_DIR}")
     target_compile_definitions(qilin_gen_checked PUBLIC QILIN_CHECKED_MEMORY QILIN_DETERMINISTIC_TIME)
     target_link_libraries(qilin_gen_checked PUBLIC qilin_runtime PRIVATE qilin_warnings)
@@ -139,7 +139,7 @@ endif()
 set(QILIN_RUNTIME_GEN_DIR "" CACHE PATH "qilin lift --runtime output directory")
 if(QILIN_RUNTIME_GEN_DIR)
     file(GLOB QILIN_RUNTIME_GEN_SOURCES CONFIGURE_DEPENDS "${QILIN_RUNTIME_GEN_DIR}/*.cpp")
-    add_library(qilin_gen_runtime STATIC ${QILIN_RUNTIME_GEN_SOURCES} recomp/runtime/dispatch.cpp)
+    add_library(qilin_gen_runtime STATIC ${QILIN_RUNTIME_GEN_SOURCES} recomp/runtime/dispatch.cpp recomp/runtime/timebase.cpp)
     target_include_directories(qilin_gen_runtime PUBLIC "${QILIN_RUNTIME_GEN_DIR}")
     target_compile_definitions(qilin_gen_runtime PUBLIC QILIN_CHECKED_MEMORY)
     target_link_libraries(qilin_gen_runtime PUBLIC qilin_runtime PRIVATE qilin_warnings)
@@ -160,13 +160,18 @@ if(QILIN_RUNTIME_GEN_DIR)
         recomp/runtime/gx_fifo.cpp
         recomp/runtime/vi.cpp
         recomp/runtime/wpad.cpp
+        recomp/runtime/audio.cpp
+        recomp/runtime/nand.cpp
     )
     target_link_libraries(qilin_run PRIVATE qilin_gen_runtime qilin_dol qilin_warnings)
+    if(WIN32)
+        target_link_libraries(qilin_run PRIVATE winmm)  # timeBeginPeriod: 1 ms timers for the audio clock
+    endif()
 endif()
 
 # ---- Tests (no game files needed) ----
 enable_testing()
-add_executable(qilin_tests recomp/tests/tests.cpp recomp/runtime/native.cpp)
+add_executable(qilin_tests recomp/tests/tests.cpp recomp/runtime/native.cpp recomp/runtime/interrupts.cpp recomp/runtime/timebase.cpp)
 target_link_libraries(qilin_tests PRIVATE qilin_core qilin_runtime qilin_warnings)
 qilin_tool(qilin_tests)
 add_test(NAME qilin_tests COMMAND qilin_tests)
