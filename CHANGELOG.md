@@ -19,6 +19,9 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 - **New settings keys:** `monitor`, `scaling` (`integer`, `fit`, `stretch`), `smooth`, `gpu` in `[display]`; `[controls]` `rumble`. The file is rewritten from the values with its comments (a round trip, unit-tested).
 - **Enhancements:** internal resolution (`internal_scale`, the frame buffer at 1–8×: viewports, scissors, clears, display and texture copies scaled; texture copies keep the resolution), anisotropic filtering (`anisotropy`), and `vsync` (mailbox or FIFO; off: immediate). At 3× (1920×1368) the title draws the same picture (coverage and mean colour as at 1×), the GPU at 1.75 ms a frame on a GTX 1080 Ti.
 
+### Fixed
+- **The game gets past the title.** It had been "waiting" because its title asks for A and B together. With both pressed it stopped in the mixer: AXFX's reverb sends to the surround channel even in stereo, which the mixer took for an unknown. AX's own command list shows stereo has no main surround channel (the DSP set-up for stereo, surround and Pro Logic II is budgeted 733, 829 and 925 cycles, one 96-sample channel more each), so stereo now leaves it out, as the console does. The game now plays through creating a save into its opening scene, its sound clean (no clipping, both channels).
+
 ### Changed
 - **Efficiency, measured** (`QILIN_PROFILE=1`, `docs/runtime.md`): at the title the runtime went from 61% of a desktop core to 12% windowed and 8% headless (unchecked build).
   - Textures follow the console's coherency rule (`coherence.*`): a texture is re-checked only when the game flushed or DMA wrote a page under it (`DC*` natives, lifted `dcbf`/`dcbst` through `rt::cache_store`, disc and NAND reads), then hashed once. Texture checks went from 102 µs to 0.3 µs a draw.

@@ -19,7 +19,9 @@
 // arithmetic has no source, the output is an approximation, each marked
 // APPROX: the polyphase resampling filter (a 4-tap cubic here), rounding,
 // and the compressor (saturation here). Features with no source yet stop
-// when used (biquad, interaural delay, surround output, Dolby Pro Logic II).
+// when used (biquad, interaural delay, surround output, Dolby Pro Logic II:
+// how the DSP encodes S, or Ls and Rs, into its two output channels). Stereo
+// has no main S channel, so sound sent there isn't heard (run_frame).
 // docs/runtime.md has the layouts. Runtime code: no std::format.
 #include <algorithm>
 #include <cstdio>
@@ -364,7 +366,13 @@ void run_frame(uint32_t list) {
         a += 2;
         if (cmd == 14) break;
         switch (cmd) {
-        case 0: case 1: a += 4; break;  // the studio (depop, kept by AX) and the mix buffer
+        // 0: the studio (depop, kept by AX). 1, 2, 3: the mix buffer's set-up
+        // for AX's mode: stereo, surround, Pro Logic II. __AXNextFrame budgets
+        // 733, 829 and 925 DSP cycles for them, one more 96-sample channel
+        // each: L R, then S, then Ls Rs for Pro Logic II's L R Ls Rs. The
+        // output and aux commands are the same for stereo and surround, so
+        // stereo's only difference is that it has no main S channel.
+        case 0: case 1: a += 4; break;
         case 4: first_pb = list_addr(a, list), a += 4; break;
         case 5: case 6: case 7: {
             const unsigned bus = cmd - 4u;
@@ -400,10 +408,11 @@ void run_frame(uint32_t list) {
     for (unsigned bus = 1; bus < kBuses; ++bus)
         if (aux_in[bus]) aux_round_trip(buses[bus], aux_in[bus], aux_out[bus], aux_volume[bus], buses[0]);
 
-    // Stereo output: L and R with the master volume. The surround channel has
-    // no stereo fold-down with a source yet, so it stops when used.
+    // Stereo output: L and R with the master volume. Stereo has no main S
+    // channel (see the set-up command above), so what reached S (an effect's
+    // surround return: AXFX's reverb writes L, R and S in every mode but
+    // Pro Logic II) isn't heard, as on the console.
     for (uint32_t i = 0; i < kFrameSamples; ++i) {
-        if (buses[0][2][i] != 0) unsupported("the surround channel in stereo output", first_pb);
         poke16(output + 4 * i, uint16_t(clamp16((int64_t(buses[0][0][i]) * master) >> 15)));
         poke16(output + 4 * i + 2, uint16_t(clamp16((int64_t(buses[0][1][i]) * master) >> 15)));
     }
