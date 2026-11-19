@@ -204,6 +204,11 @@ struct Frame {
     Buffer readback;
     uint32_t sets = 0;
     bool timed = false;  // its command buffer wrote the two GPU timestamps (QILIN_PROFILE)
+    // A picture read back for QILIN_FRAME_STATS/QILIN_FRAME_DUMP, looked at
+    // when this frame's fence is next waited on (begin_frame): never a stall.
+    bool sampled = false;
+    uint32_t sample_w = 0, sample_h = 0;
+    uint64_t sample_number = 0;
 };
 // A decoded texture: valid while nothing was written over its bytes (or its
 // TLUT's) since `validated` (coherence.hpp); then hashed once, and decoded
@@ -288,7 +293,16 @@ VkDeviceMemory allocate(VkMemoryRequirements req, VkMemoryPropertyFlags want) {
     vk_check(vkAllocateMemory(g.device, &ai, nullptr, &m), "vkAllocateMemory");
     return m;
 }
-Buffer make_buffer(VkDeviceSize size, VkBufferUsageFlags usage) {
+bool has_memory_type(uint32_t bits, VkMemoryPropertyFlags want) {
+    for (uint32_t i = 0; i < g.memory.memoryTypeCount; ++i)
+        if ((bits & (1u << i)) && (g.memory.memoryTypes[i].propertyFlags & want) == want) return true;
+    return false;
+}
+// Host-visible buffers. One the CPU reads (`readback`: the frame statistics
+// and dumps) is put in cached memory where the GPU has it: the CPU reads
+// uncached (write-combined) memory very slowly, and densely sampled runs ran
+// at half speed on it.
+Buffer make_buffer(VkDeviceSize size, VkBufferUsageFlags usage, bool readback = false) {
     Buffer b;
     b.size = size;
     VkBufferCreateInfo bi = vk_struct<VkBufferCreateInfo>(VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO);
@@ -296,7 +310,9 @@ Buffer make_buffer(VkDeviceSize size, VkBufferUsageFlags usage) {
     vk_check(vkCreateBuffer(g.device, &bi, nullptr, &b.buf), "vkCreateBuffer");
     VkMemoryRequirements req;
     vkGetBufferMemoryRequirements(g.device, b.buf, &req);
-    b.mem = allocate(req, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    constexpr VkMemoryPropertyFlags kShared = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    const bool cached = readback && has_memory_type(req.memoryTypeBits, kShared | VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+    b.mem = allocate(req, cached ? kShared | VK_MEMORY_PROPERTY_HOST_CACHED_BIT : kShared);
     vk_check(vkBindBufferMemory(g.device, b.buf, b.mem, 0), "vkBindBufferMemory");
     void* p;
     vk_check(vkMapMemory(g.device, b.mem, 0, VK_WHOLE_SIZE, 0, &p), "vkMapMemory");
@@ -710,11 +726,59 @@ CopyFormat copy_format(uint32_t f) {
 Frame& cur() { return g.frames[g.frame]; }
 void reset(Ring& r);
 
+// QILIN_FRAME_STATS=N: every Nth frame's picture read back and summed up
+// (numbers only), to tell a drawn frame from an empty one without looking at
+// it. QILIN_FRAME_DUMP=<folder>: those frames written there too, as
+// frame_<n>.bmp (every 60th without QILIN_FRAME_STATS);
+// QILIN_FRAME_DUMP_FROM=<frame>: none before that one (a dense dump of one
+// stretch). The readback is looked at a frame later, when the renderer waits
+// on that frame's fence anyway: sampling never stalls the game (it did, and
+// halved the frame rate of densely sampled runs).
+const char* dump_dir() {
+    static const char* d = [] {
+        const char* v = std::getenv("QILIN_FRAME_DUMP");
+        return v && *v ? v : nullptr;
+    }();
+    return d;
+}
+uint32_t sample_every() {
+    static const uint32_t n = [] {
+        const char* v = std::getenv("QILIN_FRAME_STATS");
+        return v ? static_cast<uint32_t>(std::strtoul(v, nullptr, 10)) : dump_dir() ? 60u : 0u;
+    }();
+    return n;
+}
+void write_bmp(const char* dir, uint64_t number, const uint8_t* rgba, uint32_t w, uint32_t h);
+void sample_frame(Frame& f) {  // its fence has signalled
+    f.sampled = false;
+    const uint32_t rw = f.sample_w, rh = f.sample_h;
+    uint64_t lit = 0, sum[3] = {};
+    uint8_t seen[4096] = {};
+    uint32_t colours = 0;
+    for (uint32_t i = 0; i < rw * rh; ++i) {
+        const uint8_t* p = f.readback.map + 4 * size_t(i);
+        if (p[0] | p[1] | p[2]) ++lit;
+        for (unsigned k = 0; k < 3; ++k) sum[k] += p[k];
+        const uint32_t bucket = uint32_t(p[0] >> 4) << 8 | uint32_t(p[1] >> 4) << 4 | uint32_t(p[2] >> 4);
+        if (!seen[bucket]) seen[bucket] = 1, ++colours;
+    }
+    const double n = double(rw) * rh;
+    std::fprintf(stderr, "qilin_run: frame %llu: %ux%u, %.1f%% not black, mean colour %.0f %.0f %.0f, %u colour buckets\n",
+                 static_cast<unsigned long long>(f.sample_number), rw, rh, 100.0 * double(lit) / n, double(sum[0]) / n,
+                 double(sum[1]) / n, double(sum[2]) / n, colours);
+    static const uint64_t dump_from = [] {
+        const char* v = std::getenv("QILIN_FRAME_DUMP_FROM");
+        return v ? std::strtoull(v, nullptr, 10) : 0ull;
+    }();
+    if (dump_dir() && f.sample_number >= dump_from) write_bmp(dump_dir(), f.sample_number, f.readback.map, rw, rh);
+}
+
 void begin_frame() {
     if (g.recording) return;
     Frame& f = cur();
     vk_check(vkWaitForFences(g.device, 1, &f.fence, VK_TRUE, UINT64_MAX), "vkWaitForFences");
     vk_check(vkResetFences(g.device, 1, &f.fence), "vkResetFences");
+    if (f.sampled) sample_frame(f);
     for (VkDescriptorPool p : f.pools) vk_check(vkResetDescriptorPool(g.device, p, 0), "vkResetDescriptorPool");
     if (f.timed) {  // that frame's GPU work is done (its fence): read how long it took
         uint64_t ts[2] = {};
@@ -1643,48 +1707,18 @@ void Renderer::copy_display(const State& s, uint32_t, bool clear) {
         vkCmdCopyImage(cb, g.efb_color.img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g.last_frame.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                        1, &region);
         g.last_w = rw, g.last_h = rh;
-        // QILIN_FRAME_STATS=N: every Nth frame's picture read back and summed
-        // up (numbers only), to tell a drawn frame from an empty one without
-        // looking at it.
-        // QILIN_FRAME_DUMP=<folder>: those frames written there too, as
-        // frame_<n>.bmp (every 60th without QILIN_FRAME_STATS), to see a
-        // scripted or hidden run's picture afterwards.
-        static const char* dump_dir = [] {
-            const char* v = std::getenv("QILIN_FRAME_DUMP");
-            return v && *v ? v : nullptr;
-        }();
-        static const uint32_t stats_every = [] {
-            const char* v = std::getenv("QILIN_FRAME_STATS");
-            return v ? static_cast<uint32_t>(std::strtoul(v, nullptr, 10)) : dump_dir ? 60u : 0u;
-        }();
-        const bool sample = stats_every && g.frame_number % stats_every == 0;
-        if (sample) {
+        // QILIN_FRAME_STATS / QILIN_FRAME_DUMP: the picture read back with
+        // the frame, looked at when its fence is next waited on (sample_frame).
+        if (sample_every() && g.frame_number % sample_every() == 0) {
             VkBufferImageCopy back{};
             back.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
             back.imageOffset = region.srcOffset;
             back.imageExtent = {rw, rh, 1};
             vkCmdCopyImageToBuffer(cb, g.efb_color.img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, f.readback.buf, 1, &back);
+            f.sampled = true, f.sample_w = rw, f.sample_h = rh, f.sample_number = g.frame_number;
         }
         if (clear) clear_efb(s, s.disp_src);
         finish_frame(f);
-        if (sample) {
-            vk_check(vkWaitForFences(g.device, 1, &f.fence, VK_TRUE, UINT64_MAX), "vkWaitForFences");
-            uint64_t lit = 0, sum[3] = {};
-            uint8_t seen[4096] = {};
-            uint32_t colours = 0;
-            for (uint32_t i = 0; i < rw * rh; ++i) {
-                const uint8_t* p = f.readback.map + 4 * size_t(i);
-                if (p[0] | p[1] | p[2]) ++lit;
-                for (unsigned k = 0; k < 3; ++k) sum[k] += p[k];
-                const uint32_t bucket = uint32_t(p[0] >> 4) << 8 | uint32_t(p[1] >> 4) << 4 | uint32_t(p[2] >> 4);
-                if (!seen[bucket]) seen[bucket] = 1, ++colours;
-            }
-            const double n = double(rw) * rh;
-            std::fprintf(stderr, "qilin_run: frame %llu: %ux%u, %.1f%% not black, mean colour %.0f %.0f %.0f, %u colour buckets\n",
-                         static_cast<unsigned long long>(g.frame_number), rw, rh, 100.0 * double(lit) / n, double(sum[0]) / n,
-                         double(sum[1]) / n, double(sum[2]) / n, colours);
-            if (dump_dir) write_bmp(dump_dir, g.frame_number, f.readback.map, rw, rh);
-        }
         g.frame = (g.frame + 1) % kFrames;
         ++g.frame_number;
         if (g.frame_number % 300 == 0) save_pipeline_cache();  // every 5 s, when there are new pipelines
@@ -1781,8 +1815,9 @@ bool create_device() {
 // idle); begin_frame clears them before they're first used.
 void create_efb_images() {
     for (Frame& f : g.frames) {
+        f.sampled = false;  // its readback goes
         free_buffer(f.readback);
-        f.readback = make_buffer(VkDeviceSize(kEfbWidth) * kEfbHeight * 4 * g.scale * g.scale, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        f.readback = make_buffer(VkDeviceSize(kEfbWidth) * kEfbHeight * 4 * g.scale * g.scale, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true);
     }
     free_image(g.efb_color), free_image(g.efb_depth), free_image(g.last_frame);
     g.efb_color = make_image(kEfbWidth * g.scale, kEfbHeight * g.scale, kEfbColor,
