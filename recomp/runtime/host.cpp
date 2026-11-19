@@ -134,6 +134,21 @@ void note_joystick(SDL_JoystickID id) {
     std::fprintf(stderr, "qilin_run: controller: %s isn't a gamepad SDL knows the layout of: not used\n", name ? name : "a game device");
 }
 
+// The gamepads already connected, from SDL's list (not only its "added"
+// events, which the Ghoulies recomp found it couldn't rely on at start-up).
+// attach_pad skips one that is open already.
+void attach_connected() {
+    int n = 0;
+    if (SDL_JoystickID* ids = SDL_GetGamepads(&n)) {
+        for (int i = 0; i < n; ++i) attach_pad(ids[i]);
+        SDL_free(ids);
+    }
+    if (SDL_JoystickID* ids = SDL_GetJoysticks(&n)) {
+        for (int i = 0; i < n; ++i) note_joystick(ids[i]);
+        SDL_free(ids);
+    }
+}
+
 void apply_rumble() {
     const bool on = g_rumble && settings().rumble;
     for (SDL_Gamepad* pad : g_pads) SDL_RumbleGamepad(pad, on ? 0xA000 : 0, on ? 0xA000 : 0, on ? 60000 : 0);
@@ -223,6 +238,7 @@ bool test_controllers(unsigned seconds) {
     }
     std::fprintf(stderr, "qilin_run: SDL %d.%d.%d; looking for controllers for %u s (press buttons)\n", SDL_MAJOR_VERSION,
                  SDL_MINOR_VERSION, SDL_MICRO_VERSION, seconds);
+    attach_connected();
     static constexpr struct {
         uint16_t bit;
         const char* name;
@@ -277,6 +293,7 @@ bool run(const std::function<void()>& game) {
     }
     if (!gx::init_vulkan(g_window)) return false;
     if (!hidden()) open_audio();
+    attach_connected();
     std::fprintf(stderr,
                  "qilin_run: settings: %s (preset %s, %ux internal resolution, %ux anisotropic filtering)\n"
                  "qilin_run: keys: A = Space, K or X; B = L, Z or Left Shift; 1 = 1 or J; 2 = 2 or I; + = Enter; "
