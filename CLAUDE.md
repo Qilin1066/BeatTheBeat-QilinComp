@@ -107,7 +107,7 @@ Before a milestone commit, all of these must hold: tests pass, warnings are clea
 - Calls store only dirty registers and reload only live ones (lifted objects 10.6% smaller).
 - Difftest under UBSan: no undefined behaviour.
 - Runtime to-do list: lifted code calls 309 replaced functions (GX 111, OS 63, WPAD 44, AX 27, NAND 23, ...); its only direct hardware access is the GX FIFO (322 stores in 12 functions); 5 lift-side functions (PSMTXInverse, PSMTXInvXpose, PSVECNormalize, PSVECMag, FrSqrt) need the estimate tables.
-- Generated code is warning-free under MSVC 17.14 and Clang 22; GCC 14 is unchecked (no Linux here), so v0.6.0-v0.10.0 aren't pushed yet.
+- Generated code is warning-free under MSVC 17.14 and Clang 22 (zig, for Windows, Linux and macOS targets); GCC 14 on the generated code is still unchecked (no Linux here; CI builds the tools and tests with GCC 14, but not the game's code). Everything up to v0.15.0 was pushed on 2026-11-19 with the owner's go-ahead, after an audit of every commit (no game data or game-derived files, no third-party code or text, no personal details).
 - `qilin lift` output is in fixed 256-function chunks and only changed files are rewritten, so rebuilds are incremental.
 
 ## Next steps, in order
