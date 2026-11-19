@@ -40,6 +40,9 @@ CMakeUserPresets.json
 compile_commands.json
 .cache/
 
+# ---- Personal Claude Code settings (permissions on this machine) ----
+.claude/settings.local.json
+
 # ---- Editors / OS ----
 .vs/
 .vscode/
