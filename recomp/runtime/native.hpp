@@ -14,6 +14,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <initializer_list>
 
 #include "guest.hpp"
 
@@ -47,7 +48,11 @@ uint32_t symbol_address(const char* name);
 
 class NativeRegistration {
 public:
-    NativeRegistration(const char* name, Fn fn);
+    // `code`: the first instructions the function must have (up to 4), for
+    // natives whose name alone could be put on the wrong function (runs of
+    // equal-size accessors, where the ported names were once three
+    // functions out). Empty: no check.
+    NativeRegistration(const char* name, Fn fn, std::initializer_list<uint32_t> code = {});
 };
 
 // The address of a lifted function native code calls by name. A missing or
@@ -62,9 +67,21 @@ void call_guest(Context& c, uint32_t fn);
 // What stopped the game, with function names, on stderr.
 void report_stop(const Stop& s);
 
+// What the runtime has done so far, printed with a stop: shows which parts
+// a run has exercised. Each counter is bumped by the running guest thread.
+struct Stats {
+    uint64_t switches = 0, threads_started = 0;
+    uint64_t interrupts = 0, decrementer = 0;
+    uint64_t files_opened = 0, bytes_read = 0;
+};
+Stats& stats();
+void report_stats();
+
 // Joins registrations to g_natives. False, with the reason on stderr, if a
-// registered name isn't a replaced function of this game, is ambiguous, or
-// is registered twice: a replacement that can never run is a mistake.
+// registered name isn't a replaced function of this game, is ambiguous, is
+// registered twice, or its code isn't what the registration expects: a
+// replacement that can never run, or runs in the wrong place, is a mistake.
+// Guest memory must hold the DOL if any registration states code.
 bool bind_natives();
 // How many of the game's replaced functions have native code.
 size_t natives_bound();
@@ -72,6 +89,12 @@ size_t natives_bound();
 #define QILIN_NATIVE(name)                                                        \
     static void qilin_native_##name(::qilin::rt::Context& c);                     \
     static const ::qilin::rt::NativeRegistration qilin_reg_##name{#name, qilin_native_##name}; \
+    static void qilin_native_##name([[maybe_unused]] ::qilin::rt::Context& c)
+// The same, checking the function's first instructions (encodings, not game
+// data: e.g. 0x7C7603A6 is `mtspr DEC, r3`).
+#define QILIN_NATIVE_CODE(name, ...)                                              \
+    static void qilin_native_##name(::qilin::rt::Context& c);                     \
+    static const ::qilin::rt::NativeRegistration qilin_reg_##name{#name, qilin_native_##name, {__VA_ARGS__}}; \
     static void qilin_native_##name([[maybe_unused]] ::qilin::rt::Context& c)
 
 // Guest memory for native code: the same big-endian accessors lifted code

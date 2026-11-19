@@ -19,6 +19,7 @@ struct Vi {
 QILIN_NATIVE(SCGetProgressiveMode) { c.r[3] = console().progressive ? 1 : 0; }
 QILIN_NATIVE(SCGetEuRgb60Mode) { c.r[3] = console().eurgb60 ? 1 : 0; }
 QILIN_NATIVE(SCGetAspectRatio) { c.r[3] = console().widescreen ? 1 : 0; }  // 0 is 4:3
+QILIN_NATIVE(SCGetLanguage) { c.r[3] = console().language; }
 
 // ---- VI ----
 QILIN_NATIVE(VIInit) { vi.initialised = true; }

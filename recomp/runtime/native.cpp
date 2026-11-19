@@ -15,6 +15,8 @@ namespace {
 struct Pending {
     const char* name;
     Fn fn;
+    uint32_t code[4];
+    size_t code_words;
 };
 // Registrations run during static initialisation, in no particular order:
 // the list lives in a function so it exists before the first of them.
@@ -25,9 +27,22 @@ std::vector<Pending>& pending() {
 std::vector<Fn> g_slots;  // by index in g_natives; nullptr: not registered
 size_t g_bound = 0;
 
+// The first of a registration's stated instructions the function at `addr`
+// doesn't have; code_words if it has them all.
+size_t first_mismatch(const Pending& p, uint32_t addr) {
+    for (size_t k = 0; k < p.code_words; ++k)
+        if (peek32(addr + 4 * static_cast<uint32_t>(k)) != p.code[k]) return k;
+    return p.code_words;
+}
+
 }  // namespace
 
-NativeRegistration::NativeRegistration(const char* name, Fn fn) { pending().push_back({name, fn}); }
+NativeRegistration::NativeRegistration(const char* name, Fn fn, std::initializer_list<uint32_t> code) {
+    Pending p{name, fn, {}, 0};
+    for (uint32_t w : code)
+        if (p.code_words < 4) p.code[p.code_words++] = w;
+    pending().push_back(p);
+}
 
 bool bind_natives() {
     g_slots.assign(g_native_count, nullptr);
@@ -44,6 +59,17 @@ bool bind_natives() {
             ok = false;
         } else if (g_slots[found]) {
             std::fprintf(stderr, "qilin_run: native %s is registered twice\n", p.name);
+            ok = false;
+        } else if (p.code_words && !g_mem) {
+            std::fprintf(stderr, "qilin_run: native %s states its code, but guest memory isn't loaded yet\n", p.name);
+            ok = false;
+        } else if (const size_t bad = first_mismatch(p, g_natives[found].addr); bad < p.code_words) {
+            const uint32_t at = g_natives[found].addr + 4 * static_cast<uint32_t>(bad);
+            std::fprintf(stderr,
+                         "qilin_run: native %s: the function of that name (%08" PRIX32 ") isn't the expected code (word "
+                         "%zu is %08" PRIX32 ", expected %08" PRIX32 "): the symbol list has put the name on the wrong "
+                         "function\n",
+                         p.name, g_natives[found].addr, bad, peek32(at), p.code[bad]);
             ok = false;
         } else {
             g_slots[found] = p.fn;
@@ -89,6 +115,7 @@ void describe(char* out, size_t n, uint32_t addr) {
 }  // namespace
 
 void report_stop(const Stop& s) {
+    report_stats();
     char pc[400], value[400];
     describe(pc, sizeof pc, s.pc);
     describe(value, sizeof value, s.value);
@@ -120,6 +147,19 @@ void report_stop(const Stop& s) {
                      s.value);
         break;
     }
+}
+
+Stats& stats() {
+    static Stats s;
+    return s;
+}
+
+void report_stats() {
+    const Stats& s = stats();
+    std::fprintf(stderr,
+                 "qilin_run: so far: %" PRIu64 " thread switches (%" PRIu64 " threads started), %" PRIu64
+                 " interrupts (%" PRIu64 " from the decrementer), %" PRIu64 " files opened, %" PRIu64 " bytes read\n",
+                 s.switches, s.threads_started, s.interrupts, s.decrementer, s.files_opened, s.bytes_read);
 }
 
 const Symbol* symbol_at(uint32_t addr) {

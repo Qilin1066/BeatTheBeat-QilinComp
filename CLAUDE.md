@@ -87,11 +87,14 @@ Before a milestone commit, all of these must hold: tests pass, warnings are clea
 - OSThread layout, from the code: context at +0 (SRR0 +408, SRR1 +412, context state +418, GQRs +420, ps1 +456), state +712 (1 ready, 2 running, 4 waiting, 8 moribund), priority +720, queue +732, links +736/+740, stack +772/+776. Low memory: current context 0x800000D4, FPU context 0x800000D8, active list 0x800000DC/E0, current thread 0x800000E4.
 - Disassembly with names: `qilin insns` to a listing, then join with the PAL symbol list (the session used a small script; keep both outside the repo).
 - The decomp's placeholder names (`fn_80038350__Fv`) carry US addresses; the PAL address is in the symbol list.
+- Size alignment can't place a run of equal-size functions: it put base's register accessors three functions early (fixed by `SIGNATURES` in `port_symbols.py`). A native whose name could be misplaced states its code (`QILIN_NATIVE_CODE`), and binding fails if it differs. Base starts at `0x800DA6C0`; the three functions before it are the game's.
+- The extracted disc is the owner's and lives outside the repo (ask for its path; `sys/`, `files/`). `qilin_run` takes the folder. A `.wbfs` can't be read (Wii disc key).
+- Interrupts reach lifted code only at safe points: `OSEnableInterrupts`/`OSRestoreInterrupts` turning them on, and the idle scheduler. `OSLoadContext` throws `rt::Resume` to unwind an interrupt handler; it stops anywhere else.
 - Library split (`docs/code-analysis.md`): lift game/NW4R/MSL/runtime/etc. (74%); replace OS, DVD, GX, AX, pad, WPAD, NAND… (25%); drop MetroTRK/NdevExi2A (1%).
 
 ## Status (v0.12.0)
 
-- Runtime: `qilin_run` gets through the static constructors into `main` and stops at the file manager's `DVDInit`. The OS's thread, mutex, message and time units are lifted (by unit, `kLiftUnits`), over a native `SelectThread` with one host thread per guest thread (`threads.cpp`); the switch hasn't been exercised yet (no thread created before the stop). 31 of 2,096 replaced or dropped functions have native code.
+- Runtime (v0.13.0): `qilin_run <extracted disc folder>` gets through the static constructors and `main`'s start-up to the graphics manager's `GXInit`. The OS's thread, mutex, message, time and alarm units are lifted (by unit, `kLiftUnits`) over a native `SelectThread` (one host thread per guest thread, `threads.cpp`) and interrupts at safe points (`interrupts.cpp`); DVD reads the extracted disc (`dvd.cpp`). None of the thread, interrupt, alarm or DVD-read code has run yet: the game reaches `GXInit` first (`qilin_run` prints 0 switches, interrupts, files). 48 of 2,080 replaced or dropped functions have native code.
 
 - 8,171 functions, all 157 jump tables proven, 98.80% of `.text` reached as code (the rest is identified as padding, dead code or data).
 - 8,103 functions lifted (slices 1, 3 and 4: integer, floating point, paired singles). Left: 56 privileged and 7 FPSCR (replaced libraries), 5 `fres`/`frsqrte`.
@@ -104,7 +107,7 @@ Before a milestone commit, all of these must hold: tests pass, warnings are clea
 
 ## Next steps, in order
 
-1. Interrupt delivery at safe points (re-enabling interrupts, idle), in an interrupt context, then the reschedule (`docs/runtime.md`). Then DVD over an extracted disc (Dolphin's Extract Entire Disc; the owner is asked to provide one outside the repo), using the disc's `fst.bin` for entry numbers. The `.wbfs` can't be read: it needs the Wii's disc key.
+1. GX (roadmap step 4): its CPU side first (the state the setters build, the FIFO and display-list command stream), then Vulkan. Agree the approach with the owner. Once the game gets past `GXInit`, threads, interrupts, alarms and DVD reads run for the first time: watch the counters `qilin_run` prints.
 2. The boot information confirmed in Dolphin (`lowmem.py`).
 3. The rest of the runtime, from its to-do list: OS (threads, time, memory, interrupts as the lifted code calls them), then GX on Vulkan (including the FIFO stores), AX, DVD, NAND, input. Exception tables and a timing model as the runtime needs them.
 

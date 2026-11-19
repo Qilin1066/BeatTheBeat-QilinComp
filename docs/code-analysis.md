@@ -14,8 +14,9 @@ The PAL symbol list it writes is derived from the game binary, so it stays out o
 
 | Result | Decomp functions | What |
 |---|---|---|
-| anchored | 8,030 | Same size, in a run of at least three equal sizes |
+| anchored | 8,022 | Same size, in a run of at least three equal sizes |
 | single | 13 | Same size, alone between differences |
+| signature | 8 | Placed by its code (v0.13.0): base's register accessors, which a run of equal sizes had put three functions early |
 | split | 5 | One decomp function, several of ours: the four register save/restore routines (the decomp has one function with an entry label per register; we have one function per entry, each falling into the next) and `SystemCallVector`, an OS template copied to low memory, whose end label code points at |
 | merge | 4 | Several decomp functions, one of ours: hand-written debugger-stub code (`TRKInterruptHandler` …), not lifted |
 | changed | 39 | Same place, different size: regional changes, all in game code except one in the OS (the title, logo and wrist-strap screens, save data, the message manager …) |
@@ -32,8 +33,8 @@ From the ported names (the decomp's translation units, by directory), each libra
 | `.init`: OS start-up | `80004000`–`800043C4` | 9 | 241 | 0 | 0 | 2 | replace (the runtime starts the game) |
 | `.init`: EABI runtime (`memcpy`, `__fill_mem`, `memset`) | `800043C4`–`80004744` | 3 | 224 | 16 | 0 | 0 | lift |
 | `.init`: debugger interrupt vectors, `__init_data` tables | `80004744`–`80006720` | — | — | | | | drop (templates and data) |
-| game | `80006F00`–`800DA6A4` | 3,205 | 216,553 | 30,664 | 2,189 | 0 | lift |
-| revolution/base (CPU registers: HID, MMCR …) | `800DA6A4`–`800DA8E0` | 27 | 143 | 9 | 0 | 2 | replace |
+| game | `80006F00`–`800DA6C0` | 3,208 | 216,560 | 30,664 | 2,189 | 0 | lift |
+| revolution/base (CPU registers: HID, MMCR …) | `800DA6C0`–`800DA8E0` | 24 | 136 | 9 | 0 | 2 | replace |
 | revolution/os | `800DA8E0`–`800E81FC` | 251 | 13,895 | 382 | 96 | 42 | replace |
 | revolution/mtx | `800E8200`–`800E8CD8` | 21 | 694 | 524 | 295 | 0 | lift |
 | revolution/dvd | `800E8CE0`–`800F1A28` | 121 | 9,042 | 0 | 0 | 0 | replace |
@@ -75,7 +76,9 @@ From the ported names (the decomp's translation units, by directory), each libra
 | GameUtil (the game's own framework) | `801D4CE4`–`801EFBF0` | 554 | 27,587 | 3,731 | 140 | 0 | lift |
 | RVLFaceLibrary (Miis) | `801EFBF0`–`801F968C` | 118 | 9,895 | 603 | 52 | 0 | lift |
 
-Totals in `.text` and the code part of `.init`: **377,386 words lifted (74%)**, 127,612 replaced (25%), 5,858 dropped (1%).
+Totals in `.text` and the code part of `.init`: **377,393 words lifted (74%)**, 127,605 replaced (25%), 5,858 dropped (1%).
+
+**Corrected in v0.13.0:** the boundary between the game and base was three functions early. The game ends with three 8-byte functions that return a constant (`0x800DA6A4`–`0x800DA6BC`, called from game code), and base begins with eight 8-byte register accessors; sizes alone can't place a run of equal sizes, so the alignment had put `PPCMfmsr` … `PPCSync` three functions early (and `PPCMtdec` on the function that writes HID0). `port_symbols.py` now checks the register accessors' names against their code (`SIGNATURES`: each must read or write its register) and moves a name to the matching function nearby, or stops if there is none or several. Eight names moved; nothing else in the build changed.
 
 **Checks of the boundary against the code:**
 - **Every privileged instruction is on the replaced or dropped side:** 2 in `.init`'s start-up, 2 in `base`, 42 in the OS, 49 in the debugger stub, none anywhere else. Lifted code never touches the MSR, segment registers, the TLB or `rfi`.

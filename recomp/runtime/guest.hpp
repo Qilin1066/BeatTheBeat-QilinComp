@@ -456,6 +456,10 @@ void call(Context& c, uint32_t target, uint32_t from);
 uint32_t mfspr(Context& c, unsigned spr, uint32_t pc);
 void mtspr(Context& c, unsigned spr, uint32_t v, uint32_t pc);
 uint32_t mftb(Context& c, unsigned tbr);
+// The 64-bit time base mftb reads (kTimeBaseHz ticks a second, from the
+// host's steady clock).
+inline constexpr uint64_t kTimeBaseHz = 60'750'000, kNsPerSecond = 1'000'000'000;
+uint64_t time_base();
 void syscall(Context& c, uint32_t pc);
 // `qilin lift --runtime` only: a function of a replaced library, by its index
 // in the generated g_natives table. Runs the native code registered for it

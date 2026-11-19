@@ -11,19 +11,27 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-11-19
+The OS and the disc under the game: the OS's threads, mutexes, messages, time and alarms are lifted over a native thread switch and interrupt delivery, and the game's files come from an extracted disc. `qilin_run` gets through the static constructors and `main`'s start-up (video mode, file manager) to its graphics manager's `GXInit`. The new thread, interrupt, alarm and DVD read code is wired in but not yet exercised: the game reaches `GXInit` before it uses any of it.
+
 ### Added
-- **The OS's threads, lifted, over a native thread switch** (`docs/runtime.md`). The runtime's lift now lifts whole translation units out of replaced libraries (`OSThread.c`, `OSMutex.c`, `OSMessage.c`, `OSTime.c`), named by unit in `libraries.cpp`, with exceptions by name (`SelectThread` native). `qilin lift --runtime` fails if a unit or function the plan names isn't in the symbol list.
-- **`recomp/runtime/threads.cpp`**: `SelectThread` ported from the build's own code, with each guest thread on its own host thread and a run token handed between them; its globals are read from its instructions and checked at start-up. `OSSetCurrentContext` and `OSInitContext` native. Not yet exercised by the game: start-up creates no thread before the current stop.
-- **Interrupt-free idle stops loudly** (`Stop::Idle`): no thread can run and nothing would wake one.
-- **VI and SC basics** (`recomp/runtime/vi.cpp`, `console.hpp`): `VIInit`, the TV format and cable, and the console settings the game picks its video mode from (60 Hz, progressive, 16:9 by default; runtime settings until the settings file exists).
-- `qilin_run` reports stops from any host thread with function names (`rt::report_stop`), and native code calls lifted functions with `rt::call_guest`.
+- **The OS's software lifted, by translation unit** (`docs/runtime.md`): `OSThread.c`, `OSMutex.c`, `OSMessage.c`, `OSTime.c` and `OSAlarm.c` are lifted out of the replaced OS (`kLiftUnits` in `libraries.cpp`), with exceptions by name (`kNativeAnyway`: `SelectThread`). Names, not addresses. `qilin lift --runtime` fails if a unit or function the plan names isn't in the symbol list, which now carries each function's unit.
+- **The thread switch** (`recomp/runtime/threads.cpp`): `SelectThread` ported step by step from the build's own code, each guest thread on its own host thread with a run token handed between them; its globals are read from its instructions and checked at start-up. A new thread starts with the registers `OSCreateThread` left; an exited one ends its host thread. `OSSetCurrentContext`, `OSInitContext` (retires a host thread whose context is reused) and `OSLoadContext` native.
+- **Interrupts at safe points** (`recomp/runtime/interrupts.*`): delivered when the game enables interrupts and while the scheduler is idle; queued handlers run as the SDK's dispatcher runs them (scheduler off, handler, scheduler on, reschedule); the decrementer runs the OS's installed handler, whose closing `OSLoadContext` unwinds back to the delivery. `PPCMtdec` sets the deadline; the exception table is native. Idle with nothing that could ever wake a thread stops (`Stop::Idle`).
+- **DVD over an extracted disc** (`recomp/runtime/dvd.*`): `qilin_run` takes the folder Dolphin's Extract Entire Disc writes. The disc's own `fst.bin` gives entry numbers and directories; lookup as the SDK's (from the root, `.`/`..`, no case); files found again by the disc offset in the file info, as the SDK does; asynchronous completions arrive as interrupts after the call returns. Eleven DVD functions.
+- **Natives that check the code they replace** (`QILIN_NATIVE_CODE`): `qilin_run` refuses to start if the function of that name doesn't begin with the stated instructions (`PPCMtdec`, `PPCHalt`). Natives are bound after the DOL is loaded.
+- **VI and SC basics** (`recomp/runtime/vi.cpp`, `console.hpp`): `VIInit`, the TV format and cable, and the console settings the game picks its video mode and language from (60 Hz, progressive, 16:9, English by default; runtime settings until the settings file exists).
+- **What a run exercised:** with a stop, `qilin_run` prints its thread switches, threads started, interrupts, files opened and bytes read. Stops are reported from any host thread with function names (`rt::report_stop`); native code calls lifted functions with `rt::call_guest`; `rt::time_base()` is the one 64-bit time base for `mftb` and the decrementer.
+- `OSInit` writes the bus and CPU clocks to low memory (243 and 729 MHz), which the SDK's tick conversions read, and runs `__OSInitAlarm` and `__OSThreadInit` in its own order.
 - **`tools/analysis/lowmem.py`**: reads a Dolphin MEM1 dump taken at the entry point and prints the low-memory words `OSInit` and `__start` read, next to the runtime's values, flagging those that differ. For confirming the boot values in `docs/runtime.md`.
 
 ### Changed
 - Low memory is open to lifted code under checked memory: the lifted OS keeps its globals there.
-- `qilin_run` gets through the static constructors and into `main`, up to the file manager's `DVDInit`.
+- **`port_symbols.py` checks names against code:** the base library's register accessors must read or write their register (`SIGNATURES`); a name the size alignment put elsewhere moves to the matching function nearby, or the port stops. Eight names moved.
+- **The game/base boundary** (`code-analysis.md`, `libraries.cpp`) moves from `0x800DA6A4` to `0x800DA6C0`: the three functions before it are the game's (they return constants and game code calls them), so they are lifted.
 
 ### Fixed
+- **Eight wrong names in the base library.** A run of equal-size functions had put `PPCMfmsr` … `PPCSync` three functions early, `PPCMtdec` on the function that writes HID0. Natives bound by those names would have replaced the wrong functions; none was yet.
 - **`guest.hpp` on zig's macOS target:** with `<chrono>` included before `<cfloat>`, zig's bundled macOS headers lose `DBL_MIN` and `FLT_MIN`, so `dispatch.cpp` didn't compile. The smallest normal values now come from `std::numeric_limits`: same values, no macros. Found by cross-compiling the runtime for Linux and macOS on x86-64 and ARM64 with zig, which now all pass (the first check of `machine.cpp`'s non-Windows memory mapping).
 
 ## [0.12.0] - 2026-11-18

@@ -21,6 +21,7 @@
 #include <mutex>
 #include <thread>
 
+#include "interrupts.hpp"
 #include "machine.hpp"
 #include "native.hpp"
 #include "threads.hpp"
@@ -37,6 +38,7 @@ constexpr uint32_t kState = 712, kPriority = 720, kQueue = 732, kNext = 736, kPr
 constexpr uint16_t kReady = 1, kRunning = 2, kMoribund = 8;
 constexpr uint16_t kCtxStateExc = 2;  // context state bit SelectThread tests before saving
 constexpr uint32_t kSrr1Fp = 0x2000;  // MSR[FP] in a saved SRR1
+constexpr uint32_t kMsrEe = 0x8000;   // MSR[EE]: interrupts enabled
 // Low memory, as the OS keeps it.
 constexpr uint32_t kCurrentContextPhys = 0x800000C0u, kCurrentContext = 0x800000D4u, kFpuContext = 0x800000D8u,
                    kCurrentThread = 0x800000E4u;
@@ -94,6 +96,8 @@ void host_main(uint32_t t, uint32_t gen) {
         }
         for (unsigned i = 0; i < 8; ++i) c.spr[912 + i] = ld(t + kCtxGqr + 4 * i);
         c.cr = ld(t + kCtxCr), c.lr = ld(t + kCtxLr), c.ctr = ld(t + kCtxCtr), c.xer = ld(t + kCtxXer);
+        // The thread starts with the interrupt enable its saved MSR gives it.
+        set_interrupts_enabled((ld(t + kCtxSrr1) & kMsrEe) != 0);
         const uint32_t entry = ld(t + kCtxSrr0), exit_to = c.lr;
         call(c, entry, 0);
         if (c.ret != exit_to) bad_return(entry, c.ret);
@@ -118,12 +122,14 @@ bool dead(uint32_t t) {
 // again (as OSSaveContext returning 1 in the original).
 void switch_to(uint32_t next) {
     if (next == t_self) return;
+    ++stats().switches;
     {
         std::lock_guard l(g_lock);
         const uint32_t gen = g_gen[next];
         auto it = g_hosts.find(next);
         if (it == g_hosts.end() || it->second.gen != gen) {
             g_hosts[next] = Host{gen};
+            ++stats().threads_started;
             std::thread(host_main, next, gen).detach();
         }
         g_running = next;
@@ -183,12 +189,19 @@ uint32_t select_thread(Context& c, bool yield) {
         if (peek16(cur + kCtxState) & kCtxStateExc) throw Stop{Stop::Unsupported, g.select, cur};
     }
     if (ld(g.bits) == 0) {
-        // Idle: the original enables interrupts and waits for one to make a
-        // thread ready. Nothing in this runtime raises interrupts yet.
+        // Idle, as the original: no current thread, the idle context, and
+        // interrupts on until one makes a thread ready. If nothing could
+        // ever do that, the game is stuck: stop and say so.
         guest_call(c, ld(g.callback), cur, 0);
         poke32(kCurrentThread, 0);
         set_current_context(g.idle);
-        throw Stop{Stop::Idle, g.select, cur};
+        set_interrupts_enabled(true);
+        while (ld(g.bits) == 0)
+            if (!wait_and_deliver(c)) throw Stop{Stop::Idle, g.select, cur};
+        set_interrupts_enabled(false);
+        static uint32_t clear = 0;
+        if (!clear) clear = require_function("OSClearContext");
+        guest_call(c, clear, g.idle, 0);
     }
     poke32(g.hint, 0);
     const auto p = static_cast<uint32_t>(std::countl_zero(ld(g.bits)));
@@ -264,6 +277,15 @@ void wait_forever() {
 QILIN_NATIVE(SelectThread) { c.r[3] = select_thread(c, c.r[3] != 0); }
 
 QILIN_NATIVE(OSSetCurrentContext) { set_current_context(c.r[3]); }
+
+// On the console it loads a context and never returns. Lifted code calls it
+// only to end an interrupt handler (the decrementer callback): that unwinds
+// to the delivery, which puts the interrupted registers back. Anywhere else
+// it would be a context switch this runtime doesn't make: stop.
+QILIN_NATIVE(OSLoadContext) {
+    if (!delivering()) throw Stop{Stop::Unsupported, c.lr - 4, c.r[3]};
+    throw Resume{};
+}
 
 // OSInitContext(context, entry, stack), as the supported build's: the entry
 // in SRR0, the stack, the small-data bases, everything else cleared, then

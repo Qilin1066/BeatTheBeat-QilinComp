@@ -23,7 +23,8 @@ Roadmap step 1, **analysis**, is nearly done; step 2, the **recompiler core**, i
 | Runtime to-do list: replaced functions lifted code calls, its direct hardware accesses (`qilin hwaccess`, `tools/analysis/runtime_todo.py`) | ✅ 309 replaced functions called; the GX FIFO is the only hardware lifted code touches |
 | Differential test under UBSan (`-DQILIN_UBSAN=ON`, or `tools/difftest/build_ubsan.py` on any host) | ✅ no undefined behaviour in 64,824 trials |
 | Lifter slice 4: paired singles and GQR quantisation (from IBM's 750CL manual; a reference model in the difftest, since Unicorn has none) | ✅ 8,103 of 8,171 functions lift; the rest are replaced libraries and 5 estimate-instruction users |
-| Runtime skeleton: `qilin_run`, the registry of native functions, the runtime's own lift (`qilin lift --runtime`) | 🔨 starts the game, runs `OSInit` natively and the static constructors lifted; stops, naming it, at the first replaced function without native code (`docs/runtime.md`) |
+| Runtime skeleton: `qilin_run`, the registry of native functions, the runtime's own lift (`qilin lift --runtime`) | ✅ starts the game and stops, naming it, at the first replaced function without native code (`docs/runtime.md`) |
+| Runtime: the OS's threads and alarms (lifted, over a native switch and interrupt delivery), DVD over an extracted disc | 🔨 the game runs its start-up up to `GXInit`; the thread, interrupt and DVD code isn't exercised yet (the game reaches GX first) |
 | Runtime: OS, DVD, NAND, GX on Vulkan, AX audio, input | later (see roadmap) |
 
 The repository's first version (0.1.0-alpha.1, a Dolphin-based preview, and a native boot probe on top of DolRecomp) was written with ChatGPT and has been retired. `docs/prior-art.md` §1 says what it did and what carried over.
@@ -82,10 +83,10 @@ Runs every lifted function from random states, as lifted C++ and as the original
 python3 tools/analysis/port_symbols.py --qilin build/qilin --dol path/to/main.dol --symbols-out pal_symbols.txt
 build/qilin lift path/to/main.dol --out gen-rt --runtime --symbols pal_symbols.txt
 cmake -S . -B build-rt -DQILIN_RUNTIME_GEN_DIR=$PWD/gen-rt && cmake --build build-rt --target qilin_run
-build-rt/qilin_run path/to/main.dol
+build-rt/qilin_run path/to/extracted-disc
 ```
 
-It doesn't get far yet: it stops at the first SDK function the runtime has no native code for, and says which and who called it. `docs/runtime.md` has the details. Keep `pal_symbols.txt` outside the repository.
+`qilin_run` takes the folder Dolphin's **Extract Entire Disc** writes (`sys/` and `files/`); a `.wbfs` or `.iso` can't be read directly, since a Wii disc is encrypted with a key this project can't include. It doesn't get far yet: it stops at the first SDK function the runtime has no native code for, and says which, who called it, and what the run did before. `docs/runtime.md` has the details. Keep `pal_symbols.txt` and the extracted disc outside the repository.
 
 ### Decoder check
 

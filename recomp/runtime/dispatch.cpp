@@ -38,15 +38,18 @@ void mtspr(Context& c, unsigned spr, uint32_t v, uint32_t pc) {
 }
 
 // The time base runs at a quarter of the bus clock: 243 MHz / 4 on the Wii.
-uint32_t mftb(Context&, unsigned tbr) {
+uint64_t time_base() {
 #ifdef QILIN_DETERMINISTIC_TIME
-    const uint64_t ticks = kTimeStart + g_time_reads++ * kTimeStep;
+    return kTimeStart + g_time_reads++ * kTimeStep;
 #else
     using namespace std::chrono;
     const auto ns = static_cast<uint64_t>(duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count());
-    constexpr uint64_t kHz = 60'750'000, kNs = 1'000'000'000;
-    const uint64_t ticks = ns / kNs * kHz + ns % kNs * kHz / kNs;  // no overflow for centuries
+    return ns / kNsPerSecond * kTimeBaseHz + ns % kNsPerSecond * kTimeBaseHz / kNsPerSecond;  // no overflow for centuries
 #endif
+}
+
+uint32_t mftb(Context&, unsigned tbr) {
+    const uint64_t ticks = time_base();
     return tbr == 269 ? static_cast<uint32_t>(ticks >> 32) : static_cast<uint32_t>(ticks);
 }
 

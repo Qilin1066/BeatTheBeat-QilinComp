@@ -6,6 +6,8 @@
 // Runtime code: no std::format.
 #pragma once
 
+#include <cstdint>
+
 namespace qilin::rt {
 
 struct ConsoleSettings {
@@ -13,6 +15,10 @@ struct ConsoleSettings {
     bool component = true;    // a cable that can carry 480p
     bool eurgb60 = true;      // 60 Hz on this PAL game (otherwise 50 Hz)
     bool widescreen = true;   // 16:9 (otherwise 4:3)
+    // SC's language codes: 0 Japanese, 1 English, 2 German, 3 French,
+    // 4 Spanish, 5 Italian, 6 Dutch. This PAL disc has English, French,
+    // German, Italian and Spanish.
+    uint8_t language = 1;
 };
 
 inline const ConsoleSettings& console() {

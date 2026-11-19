@@ -1,6 +1,6 @@
 // qilin_run: the game.
 //
-//   qilin_run <main.dol>
+//   qilin_run <extracted disc folder>     (or main.dol, until the game reads the disc)
 //
 // Loads the DOL into MEM1 and runs start-up as the SDK's __start does, with
 // native code where the plan replaces a library (docs/code-analysis.md).
@@ -12,7 +12,10 @@
 #include <cstdlib>
 #include <cstring>
 
+#include <filesystem>
+
 #include "dol.hpp"
+#include "dvd.hpp"
 #include "machine.hpp"
 #include "native.hpp"
 #include "threads.hpp"
@@ -51,24 +54,30 @@ void call_from(rt::Context& c, uint32_t fn, uint32_t return_to) {
 
 int main(int argc, char** argv) {
     if (argc != 2) {
-        std::fprintf(stderr, "usage: qilin_run <main.dol>\n");
+        std::fprintf(stderr, "usage: qilin_run <extracted disc folder | main.dol>\n");
         return 2;
     }
-    const auto dol = Dol::load(argv[1]);
+    // The extracted disc's folder (Dolphin: Extract Entire Disc) gives the
+    // game and its files; main.dol alone runs until the game reads the disc.
+    const std::filesystem::path arg = argv[1];
+    const bool folder = std::filesystem::is_directory(arg);
+    const std::filesystem::path dol_path = folder ? arg / "sys" / "main.dol" : arg;
+    const auto dol = Dol::load(dol_path);
     if (!dol) {
-        std::fprintf(stderr, "qilin_run: %s: %s\n", argv[1], dol.error().c_str());
+        std::fprintf(stderr, "qilin_run: %s: %s\n", dol_path.string().c_str(), dol.error().c_str());
         return 2;
     }
+    if (folder && !rt::open_disc(arg)) return 2;
     if (!known_build(dol->sha256)) {
         std::fprintf(stderr, "qilin_run: %s is not the supported build (SHA-256 %s)\n", argv[1], dol->sha256.c_str());
         return 2;
     }
-    if (!rt::bind_natives()) return 2;
     if (!rt::map_guest_memory()) {
         std::fprintf(stderr, "qilin_run: cannot map the guest's memory (4 GB of address space, 88 MB of RAM)\n");
         return 2;
     }
     std::memcpy(rt::g_mem + dol->base(), dol->image().data(), dol->image().size());
+    if (!rt::bind_natives()) return 2;  // after loading: some natives check the code they replace
 #ifdef QILIN_CHECKED_MEMORY
     // Bring-up: lifted code may use MEM1, low memory included (the lifted OS
     // keeps its globals there, the current thread among them), and MEM2.

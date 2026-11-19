@@ -2,7 +2,9 @@
 // (the runtime's to-do list, tools/analysis/runtime_todo.py), added as
 // bring-up reaches each one. Runtime code: no std::format.
 #include <cstdio>
+#include <vector>
 
+#include "interrupts.hpp"
 #include "machine.hpp"
 #include "native.hpp"
 
@@ -28,10 +30,17 @@ using namespace qilin::rt;
 constexpr uint32_t kMem1ArenaLo = 0x803E94A0u, kMem1ArenaHi = 0x81730000u;
 constexpr uint32_t kMem2ArenaLo = 0x90000800u, kMem2ArenaHi = 0x933E0000u;
 
+// The clocks the SDK's tick conversions read from low memory: the bus at
+// 243 MHz (the time base runs at a quarter of it) and the CPU at 729 MHz.
+// TO CONFIRM with lowmem.py, as the arenas above.
+constexpr uint32_t kBusClockAddr = 0x800000F8u, kCpuClockAddr = 0x800000FCu;
+constexpr uint32_t kBusClock = 243'000'000u, kCpuClock = 729'000'000u;
+static_assert(kBusClock / 4 == kTimeBaseHz);
+
 struct Os {
     bool initialised = false;
-    bool interrupts = false;  // MSR[EE] as the game sees it through OSDisable/Enable/RestoreInterrupts
     uint32_t mem1_lo = 0, mem1_hi = 0, mem2_lo = 0, mem2_hi = 0;
+    std::vector<uint32_t> shutdown_functions;  // OSRegisterShutdownFunction, for when shutdown is native
 } os;
 
 // ---- start-up and shutdown ----
@@ -40,29 +49,44 @@ QILIN_NATIVE(OSInit) {
     os.initialised = true;
     os.mem1_lo = kMem1ArenaLo, os.mem1_hi = kMem1ArenaHi;
     os.mem2_lo = kMem2ArenaLo, os.mem2_hi = kMem2ArenaHi;
+    poke32(kBusClockAddr, kBusClock);
+    poke32(kCpuClockAddr, kCpuClock);
     // The initialisers of the OS units that are lifted, in OSInit's order.
+    call_guest(c, require_function("__OSInitAlarm"));
     call_guest(c, require_function("__OSThreadInit"));
-    os.interrupts = true;  // OSInit ends with OSEnableInterrupts
+    set_interrupts_enabled(true);  // OSInit ends with OSEnableInterrupts
 }
 
-// base: where exit ends after the static destructors.
-QILIN_NATIVE(PPCHalt) { throw Exit{0}; }
+QILIN_NATIVE(OSRegisterShutdownFunction) { os.shutdown_functions.push_back(c.r[3]); }
+
+// base: where exit ends after the static destructors (sync; nop; li r3,0).
+QILIN_NATIVE_CODE(PPCHalt, 0x7C0004ACu, 0x60000000u, 0x38600000u) { throw Exit{0}; }
 
 // ---- interrupts ----
-// Each returns whether interrupts were enabled before.
+// Each returns whether interrupts were enabled before. Enabling them is a
+// safe point: what is due is delivered there.
 QILIN_NATIVE(OSDisableInterrupts) {
-    c.r[3] = os.interrupts;
-    os.interrupts = false;
+    c.r[3] = interrupts_enabled();
+    set_interrupts_enabled(false);
 }
 QILIN_NATIVE(OSEnableInterrupts) {
-    c.r[3] = os.interrupts;
-    os.interrupts = true;
+    const bool was = interrupts_enabled();
+    set_interrupts_enabled(true);
+    deliver_due(c);
+    c.r[3] = was;
 }
 QILIN_NATIVE(OSRestoreInterrupts) {
-    const bool level = c.r[3] != 0;
-    c.r[3] = os.interrupts;
-    os.interrupts = level;
+    const bool level = c.r[3] != 0, was = interrupts_enabled();
+    set_interrupts_enabled(level);
+    if (level) deliver_due(c);
+    c.r[3] = was;
 }
+
+// ---- exceptions and the decrementer ----
+QILIN_NATIVE(__OSSetExceptionHandler) { c.r[3] = set_exception_handler(c.r[3] & 0xFF, c.r[4]); }
+QILIN_NATIVE(__OSGetExceptionHandler) { c.r[3] = exception_handler(c.r[3] & 0xFF); }
+// mtspr DEC, r3; blr. The alarm code sets the next deadline through it.
+QILIN_NATIVE_CODE(PPCMtdec, 0x7C7603A6u, 0x4E800020u) { set_decrementer(c.r[3]); }
 
 // ---- arenas ----
 QILIN_NATIVE(OSGetMEM1ArenaLo) { c.r[3] = os.mem1_lo; }

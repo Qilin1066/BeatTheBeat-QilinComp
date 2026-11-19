@@ -167,6 +167,70 @@ def align(us, pal):
     return out
 
 
+def _spr(spr):
+    """The SPR field of mfspr/mtspr: the number's two 5-bit halves swapped."""
+    return ((spr & 0x1F) << 5 | spr >> 5) << 11
+
+
+# Functions whose name says what they do, checked against their first
+# instruction. Size alone can't place a run of equal-size accessors (the PAL
+# build has three 8-byte game functions just before PPCArch.c's 8-byte
+# accessors, so the alignment put every name there three functions early).
+# The encodings are PowerPC's (rD/rS = r3), nothing taken from the game.
+SIGNATURES = {
+    "PPCMfmsr": 0x7C6000A6,              # mfmsr r3
+    "PPCMtmsr": 0x7C600124,              # mtmsr r3
+    "PPCMfhid0": 0x7C6002A6 | _spr(1008),
+    "PPCMthid0": 0x7C6003A6 | _spr(1008),
+    "PPCMfl2cr": 0x7C6002A6 | _spr(1017),
+    "PPCMtl2cr": 0x7C6003A6 | _spr(1017),
+    "PPCMtdec": 0x7C6003A6 | _spr(22),
+    "PPCSync": 0x44000002,               # sc
+    "PPCMtmmcr0": 0x7C6003A6 | _spr(952),
+    "PPCMtmmcr1": 0x7C6003A6 | _spr(956),
+    "PPCMtpmc1": 0x7C6003A6 | _spr(953),
+    "PPCMtpmc2": 0x7C6003A6 | _spr(954),
+    "PPCMtpmc3": 0x7C6003A6 | _spr(957),
+    "PPCMtpmc4": 0x7C6003A6 | _spr(958),
+    "PPCMfhid2": 0x7C6002A6 | _spr(920),
+    "PPCMthid2": 0x7C6003A6 | _spr(920),
+    "PPCMtwpar": 0x7C6003A6 | _spr(921),
+}
+BLR = 0x4E800020
+
+
+NEAR = 16  # how many functions either side of its aligned place a name may move
+
+
+def check_signatures(pairs, pal, word):
+    """Moves each name in SIGNATURES to the function near its aligned place
+    whose code matches it, if it was placed elsewhere. Returns
+    [(name, from, to)]. Stops if a name's code is nowhere near, or in several
+    functions there: a guess would be worse."""
+    index = {p["addr"]: k for k, p in enumerate(pal)}
+    moved = []
+    for i, (u, ps, kind) in enumerate(pairs):
+        if not u or u["name"] not in SIGNATURES or not ps:
+            continue
+        want = SIGNATURES[u["name"]]
+        if word(ps[0]["addr"]) == want:
+            continue
+        k = index[ps[0]["addr"]]
+        near = pal[max(0, k - NEAR):k + NEAR + 1]
+        found = [p for p in near if p["size"] == 8 and word(p["addr"]) == want and word(p["addr"] + 4) == BLR]
+        if len(found) != 1:
+            sys.exit(f"port_symbols: {u['name']}: its instruction {want:08X} is in {len(found)} functions; "
+                     f"the name can't be placed")
+        moved.append((u["name"], ps[0]["addr"], found[0]["addr"]))
+        pairs[i] = (u, [found[0]], "signature")
+    # A function now claimed by two names keeps only the one its code matches.
+    claimed = collections.Counter(ps[0]["addr"] for u, ps, kind in pairs if u and ps)
+    for i, (u, ps, kind) in enumerate(pairs):
+        if u and ps and claimed[ps[0]["addr"]] > 1 and kind != "signature":
+            pairs[i] = (u, [], "us-only")
+    return moved
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--qilin", required=True)
@@ -186,9 +250,14 @@ def main():
             pairs.append((U[ui] if ui is not None else None, [P[k] for k in pis], kind))
             kinds[kind] += 1
 
+    word, _ = load_dol(args.dol)
+    moved = check_signatures(pairs, pal, word)
+    kinds = collections.Counter(kind for _, _, kind in pairs)
     named = {k: v for k, v in kinds.items()}
     print(f"US functions {len(us)}, PAL functions {len(pal)}")
-    for k in ("anchored", "single", "split", "merge", "regroup", "changed", "us-only", "pal-only"):
+    for name, frm, to in moved:
+        print(f"  moved by its code: {name} {frm:08X} -> {to:08X}")
+    for k in ("anchored", "single", "signature", "split", "merge", "regroup", "changed", "us-only", "pal-only"):
         if named.get(k):
             print(f"  {k:9} {named[k]}")
 

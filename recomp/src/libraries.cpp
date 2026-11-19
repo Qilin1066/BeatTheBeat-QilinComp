@@ -18,8 +18,11 @@ constexpr Library kLibraries[] = {
     {0x80004000, 0x800043C4, "init/start", Replace},  // the runtime starts the game
     {0x800043C4, 0x80004744, "init/runtime", Lift},   // memcpy, __fill_mem, memset
     {0x80004744, 0x80006720, "init/trk", Drop},       // debugger vectors, __init_data's tables
-    {0x80006F00, 0x800DA6A4, "game", Lift},
-    {0x800DA6A4, 0x800DA8E0, "base", Replace},
+    // The game's last three functions (0x800DA6A4-0x800DA6BC, each returning
+    // a constant) sit just before base: port_symbols.py once put base's
+    // first names on them (fixed in v0.13.0 by checking names against code).
+    {0x80006F00, 0x800DA6C0, "game", Lift},
+    {0x800DA6C0, 0x800DA8E0, "base", Replace},
     {0x800DA8E0, 0x800E81FC, "os", Replace},
     {0x800E8200, 0x800E8CD8, "mtx", Lift},
     {0x800E8CE0, 0x800F1A28, "dvd", Replace},
@@ -100,6 +103,10 @@ constexpr std::string_view kLiftUnits[] = {
     "revolution/os/OSMessage.c",
     // The time base (mftb, which lifted code reads) and conversions of it.
     "revolution/os/OSTime.c",
+    // Alarms: the queue, periodic alarms and the decrementer callback that
+    // fires them. Under them, native: the decrementer (PPCMtdec), the
+    // exception table, and OSLoadContext returning to the interrupted code.
+    "revolution/os/OSAlarm.c",
 };
 
 // Native although their unit is lifted. SelectThread switches threads: lifted,
