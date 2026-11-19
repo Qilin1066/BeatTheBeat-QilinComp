@@ -205,5 +205,24 @@ Sink& sink();
 
 // The size of one vertex in format `vtxfmt` with the current descriptors.
 uint32_t vertex_size(const State& s, unsigned vtxfmt);
+// The size of one attribute component and of a colour (gx_fifo.cpp); an
+// undefined type stops.
+uint32_t comp_size(uint8_t type, uint32_t attr);
+uint32_t color_size(uint8_t type, uint32_t attr);
+
+// GXTexFmt (gx_texture.cpp decodes them).
+enum : uint32_t {
+    kTexI4 = 0, kTexI8 = 1, kTexIA4 = 2, kTexIA8 = 3, kTexRgb565 = 4, kTexRgb5A3 = 5, kTexRgba8 = 6,
+    kTexC4 = 8, kTexC8 = 9, kTexC14X2 = 10, kTexCmpr = 14,
+};
+// The bytes a texture's first level takes in guest memory; 0 for a format
+// GX doesn't define.
+uint32_t texture_bytes(uint32_t format, uint32_t w, uint32_t h);
+// The first level as RGBA8 (r, g, b, a bytes, w * h * 4); colour-indexed
+// formats through `tlut`. An unknown format stops.
+void decode_texture(uint32_t format, uint32_t addr, uint32_t w, uint32_t h, const Tlut* tlut, uint8_t* out);
+
+// The renderer replaces the headless sink (gx_vulkan.cpp).
+void set_sink(Sink* s);
 
 }  // namespace qilin::rt::gx

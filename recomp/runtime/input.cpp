@@ -1,5 +1,6 @@
-// Input sources for the Wii Remote (input.hpp). For now one: QILIN_INPUT, a
-// script of button presses for headless and repeatable runs, e.g.
+// Input sources for the Wii Remote (input.hpp): the keyboard when there is a
+// window (host.cpp), and QILIN_INPUT, a script of button presses for
+// headless and repeatable runs (both at once add up), e.g.
 //
 //   QILIN_INPUT=A@5,A@8.5,B+A@12:0.3
 //
@@ -16,6 +17,7 @@
 #include <vector>
 
 #include "guest.hpp"
+#include "host.hpp"
 
 namespace qilin::rt {
 
@@ -93,14 +95,14 @@ void parse() {
 
 bool input_source() {
     parse();
-    return g_script.present;
+    return g_script.present || host::windowed();
 }
 
 uint16_t input_buttons(unsigned channel) {
     parse();
     if (channel != 0) return 0;
     const uint64_t now = time_base();
-    uint16_t held = 0;
+    uint16_t held = host::windowed() ? host::keyboard_buttons() : 0;
     for (const Press& p : g_script.presses)
         if (now >= p.from && now < p.to) held |= p.buttons;
     return held;

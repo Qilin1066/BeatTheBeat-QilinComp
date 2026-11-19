@@ -25,6 +25,8 @@ uint32_t store_pc() {
 #endif
 }
 
+}  // namespace
+
 // The bytes one component of type `type` takes; a type GX doesn't define stops.
 uint32_t comp_size(uint8_t type, uint32_t attr) {
     switch (type) {
@@ -51,6 +53,8 @@ uint32_t color_size(uint8_t type, uint32_t attr) {
         throw Stop{Stop::Unsupported, 0, type};
     }
 }
+
+namespace {
 
 struct Stream {
     bool open = false;

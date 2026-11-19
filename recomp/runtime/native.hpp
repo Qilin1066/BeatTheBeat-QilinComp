@@ -87,7 +87,8 @@ struct Stats {
     // deliveries happened: in the idle scheduler, or at a safe point in
     // running code.
     uint64_t periods_dropped = 0, idle_deliveries = 0, running_deliveries = 0;
-    uint64_t remotes_connected = 0, voice_frames = 0;
+    uint64_t remotes_connected = 0, voice_frames = 0, audio_frames_dropped = 0;
+    uint64_t textures_uploaded = 0, frames_presented = 0;
 };
 Stats& stats();
 void report_stats();

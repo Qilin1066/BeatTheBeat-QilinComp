@@ -18,6 +18,7 @@
 
 #include "dol.hpp"
 #include "dvd.hpp"
+#include "host.hpp"
 #include "machine.hpp"
 #include "nand.hpp"
 #include "native.hpp"
@@ -61,6 +62,8 @@ void start_time_limit() {
         end(3);
     }).detach();
 }
+
+[[noreturn]] void run_game(rt::Context& c);
 
 // Calls a guest function as a `bl` at return_to - 4 would.
 void call_from(rt::Context& c, uint32_t fn, uint32_t return_to) {
@@ -119,8 +122,24 @@ int main(int argc, char** argv) {
     c.r[2] = kSmallData2;
     c.r[13] = kSmallData;
     c.spr[kHid2] = kHid2Lsqe | kHid2Pse;
+    // With a window, the game runs on a thread of its own and the main thread
+    // keeps the window (host.hpp). The boot thread's context is adopted by
+    // whichever host thread runs it.
+    if (rt::host::windowed()) {
+#ifndef QILIN_HEADLESS_ONLY
+        const bool ok = rt::host::run([&c] { run_game(c); });
+        if (!ok) std::fprintf(stderr, "qilin_run: QILIN_HEADLESS=1 runs without a window\n");
+        return 2;
+#endif
+    }
+    run_game(c);
+}
+
+namespace {
+
+void run_game(rt::Context& c) {
     rt::set_thread_context(&c);
-    if (!rt::init_threads(c)) return 2;
+    if (!rt::init_threads(c)) end(2);
     start_time_limit();
     try {
         call_from(c, rt::require_function("OSInit"), kAfterOSInit);
@@ -145,3 +164,5 @@ int main(int argc, char** argv) {
         rt::wait_forever();
     }
 }
+
+}  // namespace

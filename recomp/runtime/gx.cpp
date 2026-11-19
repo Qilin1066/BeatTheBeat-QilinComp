@@ -99,7 +99,11 @@ uint32_t g_tex_region_cb = 0, g_tlut_region_cb = 0;
 }  // namespace
 
 State& state() { return g_state; }
-Sink& sink() { return g_headless; }
+namespace {
+Sink* g_sink = &g_headless;
+}
+Sink& sink() { return *g_sink; }
+void set_sink(Sink* s) { g_sink = s ? s : &g_headless; }
 
 // ---- initialisation ----
 // GXInit(base, size): the SDK's defaults, from its own __GXInitGX (lifted),

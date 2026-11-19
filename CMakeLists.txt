@@ -170,6 +170,66 @@ if(QILIN_RUNTIME_GEN_DIR)
     if(WIN32)
         target_link_libraries(qilin_run PRIVATE winmm)  # timeBeginPeriod: 1 ms timers for the audio clock
     endif()
+
+    # The host side: a window, Vulkan, audio and the keyboard. Third-party
+    # code is fetched at configure time, pinned by hash, and never committed:
+    # SDL3 (zlib licence; a system SDL3 is used if there is one), Khronos'
+    # Vulkan headers (Apache-2.0; the loader comes through SDL, so no Vulkan
+    # SDK is needed) and glslang (BSD-3/Apache-2.0), built here to compile
+    # the runtime's GLSL shaders to SPIR-V. QILIN_HEADLESS_ONLY builds without
+    # any of it (QILIN_HEADLESS=1 also runs a full build without a window).
+    option(QILIN_HEADLESS_ONLY "Build qilin_run without a window, Vulkan or audio" OFF)
+    if(QILIN_HEADLESS_ONLY)
+        target_compile_definitions(qilin_run PRIVATE QILIN_HEADLESS_ONLY)
+    else()
+        include(FetchContent)
+        find_package(SDL3 CONFIG QUIET)
+        if(NOT SDL3_FOUND)
+            set(SDL_SHARED OFF CACHE BOOL "" FORCE)
+            set(SDL_STATIC ON CACHE BOOL "" FORCE)
+            set(SDL_TEST_LIBRARY OFF CACHE BOOL "" FORCE)
+            set(SDL_EXAMPLES OFF CACHE BOOL "" FORCE)
+            FetchContent_Declare(SDL3
+                URL https://github.com/libsdl-org/SDL/archive/refs/tags/release-3.4.20.tar.gz
+                URL_HASH SHA256=5cb56d4223a41283f3c2baf6f1263fba171692409ae405a50417a7c8e7e28deb)
+            FetchContent_MakeAvailable(SDL3)
+        endif()
+        FetchContent_Declare(VulkanHeaders
+            URL https://github.com/KhronosGroup/Vulkan-Headers/archive/refs/tags/v1.3.299.tar.gz
+            URL_HASH SHA256=95bb8fe731469b9e1be532b9d3b4d7d33e28ddbd99a926da7f0eca82a134b92f)
+        FetchContent_MakeAvailable(VulkanHeaders)
+        set(ENABLE_OPT OFF CACHE BOOL "" FORCE)
+        set(ENABLE_HLSL OFF CACHE BOOL "" FORCE)
+        set(GLSLANG_TESTS OFF CACHE BOOL "" FORCE)
+        set(GLSLANG_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
+        set(ENABLE_GLSLANG_BINARIES ON CACHE BOOL "" FORCE)
+        set(BUILD_EXTERNAL OFF CACHE BOOL "" FORCE)
+        FetchContent_Declare(glslang
+            URL https://github.com/KhronosGroup/glslang/archive/refs/tags/16.6.0.tar.gz
+            URL_HASH SHA256=9c09b901149c729df745057dafa815278aaa101b84d2b6e14f16a42de52f97f2)
+        FetchContent_MakeAvailable(glslang)
+
+        # The shaders, compiled to SPIR-V headers (uint32_t arrays) at build time.
+        set(QILIN_SHADER_DIR "${CMAKE_CURRENT_BINARY_DIR}/shaders")
+        set(QILIN_SHADER_HEADERS "")
+        foreach(shader gx.vert gx.frag)
+            string(REPLACE "." "_" name "${shader}")
+            set(out "${QILIN_SHADER_DIR}/${name}.h")
+            add_custom_command(OUTPUT "${out}"
+                COMMAND "${CMAKE_COMMAND}" -E make_directory "${QILIN_SHADER_DIR}"
+                COMMAND glslang-standalone -V --target-env vulkan1.3 --vn "k_${name}" -o "${out}"
+                        "${CMAKE_CURRENT_SOURCE_DIR}/recomp/runtime/shaders/${shader}"
+                DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/recomp/runtime/shaders/${shader}" glslang-standalone
+                VERBATIM)
+            list(APPEND QILIN_SHADER_HEADERS "${out}")
+        endforeach()
+        add_custom_target(qilin_shaders DEPENDS ${QILIN_SHADER_HEADERS})
+
+        target_sources(qilin_run PRIVATE recomp/runtime/host.cpp recomp/runtime/gx_vulkan.cpp recomp/runtime/gx_texture.cpp)
+        add_dependencies(qilin_run qilin_shaders)
+        target_include_directories(qilin_run PRIVATE "${QILIN_SHADER_DIR}")
+        target_link_libraries(qilin_run PRIVATE SDL3::SDL3 Vulkan::Headers)
+    endif()
 endif()
 
 # ---- Tests (no game files needed) ----

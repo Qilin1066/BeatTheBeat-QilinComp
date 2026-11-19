@@ -25,6 +25,7 @@
 #include <cstdio>
 #include <cstdlib>
 
+#include "host.hpp"
 #include "interrupts.hpp"
 #include "native.hpp"
 
@@ -87,10 +88,19 @@ void dump_frame(uint32_t start) {
     write_wav_sizes();
 }
 
+// What AI plays goes to the host's audio output (host byte order).
+void play_frame(uint32_t start) {
+    if (!host::windowed()) return;
+    int16_t lr[kFrameSamples * 2];
+    for (uint32_t i = 0; i < kFrameSamples * 2; ++i) lr[i] = static_cast<int16_t>(peek16(start + 2 * i));
+    host::play_audio(lr, kFrameSamples);
+}
+
 void dma_interrupt(Context& c) {
     if (!ai.running) return;
     ++stats().audio_frames;
     dump_frame(ai.start);
+    play_frame(ai.start);
     if (ai.callback) call_guest(c, ai.callback);
 }
 

@@ -213,6 +213,10 @@ void report_stats() {
                  s.draws, s.vertices, s.display_copies, s.texture_copies, s.retraces, s.audio_frames, s.voice_frames,
                  s.remotes_connected);
     std::fprintf(stderr,
+                 "qilin_run:          host: %" PRIu64 " frames presented, %" PRIu64 " texture uploads, %" PRIu64
+                 " audio frames dropped (output behind)\n",
+                 s.frames_presented, s.textures_uploaded, s.audio_frames_dropped);
+    std::fprintf(stderr,
                  "qilin_run:          %" PRIu64 " periodic interrupts dropped (late by a period); deliveries: %" PRIu64
                  " when idle, %" PRIu64 " in running code\n",
                  s.periods_dropped, s.idle_deliveries, s.running_deliveries);

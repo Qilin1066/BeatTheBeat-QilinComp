@@ -10,7 +10,7 @@ Static recompilation of **Beat the Beat: Rhythm Paradise** (Wii, PAL `SOMP01` re
 - **Static recompilation only.** No interpreter, JIT or emulator at runtime, not even as a fallback.
 - Targets: 64-bit **Windows, Linux, macOS** on **x86-64 and ARM64**. The low-end reference is ARM boards like the **Raspberry Pi 4**. No iPadOS, no 32-bit.
 - Compiler minimums: GCC 14, Clang 19, Apple Clang (Xcode 16), MSVC 2022 17.10.
-- No GPL code. The only third-party data is the CC0 decomp symbol list in `third_party/rhf/`.
+- No GPL code. The only third-party data is the CC0 decomp symbol list in `third_party/rhf/`. Third-party libraries (SDL3, Khronos' Vulkan headers, glslang: all permissive) are fetched by CMake at configure time, pinned by SHA-256, and never committed.
 - Never commit game data or anything derived from it: `main.dol`, `gen/`, `cfg.json`, ported symbol lists. These are gitignored.
 
 ## Layout
@@ -50,7 +50,8 @@ The runtime (its own lift: replaced libraries call native code; `pal_symbols.txt
 python3 tools/analysis/port_symbols.py --qilin build/qilin --dol path/to/main.dol --symbols-out pal_symbols.txt
 build/qilin lift path/to/main.dol --out gen-rt --runtime --symbols pal_symbols.txt
 cmake -S . -B build-rt -DQILIN_RUNTIME_GEN_DIR=$PWD/gen-rt && cmake --build build-rt --target qilin_run --parallel
-build-rt/qilin_run path/to/main.dol       # stops, naming it, at the first replaced function without native code
+build-rt/qilin_run path/to/disc          # a window (SDL3 + Vulkan), sound, the keyboard as the remote
+QILIN_HEADLESS=1 build-rt/qilin_run ... # no window (tests, scripted runs: QILIN_INPUT, QILIN_RUN_SECONDS, QILIN_AUDIO_DUMP)
 ```
 
 Before a milestone commit, all of these must hold: tests pass, warnings are clean (`QILIN_WERROR`), generated code is warning-free under GCC, Clang and MSVC, and the difftest has **0 unexplained mismatches**. Any new Unicorn quirk goes in `known_difference` with a comment explaining why.
