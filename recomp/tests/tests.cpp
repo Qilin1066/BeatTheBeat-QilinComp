@@ -2,6 +2,7 @@
 // Broadway decoder, function discovery and the lifter on a synthetic
 // program, and the runtime helpers lifted code calls. No game files required (runs in CI).
 #include <algorithm>
+#include <cmath>
 #include <map>
 #include <cstring>
 #include <filesystem>
@@ -16,6 +17,7 @@
 #include "cfg.hpp"
 #include "decoder.hpp"
 #include "dol.hpp"
+#include "dpl2.hpp"
 #include "guest.hpp"
 #include "gx.hpp"
 #include "hwaccess.hpp"
@@ -1121,6 +1123,67 @@ void test_input_script() {
     CHECK(!rt::parse_input_script("A@1,Z@2", p, bad) && bad == "Z@2");
 }
 
+// ---------------------------------------------------------------- Pro Logic II
+// The encoder against its matrix: Lt = L - j(a Ls + b Rs), Rt = R + j(b Ls + a Rs).
+void test_dpl2() {
+    constexpr uint32_t kFrame = 96;
+    constexpr double kPi = 3.14159265358979323846;
+    // Feeds `frames` frames of each channel's signal (a function of the
+    // sample index), and returns Lt and Rt from the last frames, once the
+    // filter has settled.
+    auto run = [&](auto l, auto r, auto ls, auto rs, std::vector<float>& lt, std::vector<float>& rt) {
+        rt::Dpl2Encoder<kFrame> e;
+        lt.clear(), rt.clear();
+        for (uint32_t f = 0; f < 300; ++f) {  // 0.9 s: settled after 200 frames, then 0.3 s measured (whole periods at the test tones)
+            int32_t in[4][kFrame];
+            for (uint32_t i = 0; i < kFrame; ++i) {
+                const uint32_t n = f * kFrame + i;
+                in[0][i] = l(n), in[1][i] = r(n), in[2][i] = ls(n), in[3][i] = rs(n);
+            }
+            float a[kFrame], b[kFrame];
+            e.encode(in[0], in[1], in[2], in[3], a, b);
+            if (f >= 200) lt.insert(lt.end(), a, a + kFrame), rt.insert(rt.end(), b, b + kFrame);
+        }
+    };
+    auto zero = [](uint32_t) { return 0; };
+    // 1 kHz at 32 kHz, amplitude 10000
+    auto tone = [&](uint32_t n) { return int32_t(std::lrint(10000.0 * std::sin(2 * kPi * 1000.0 * n / 32000.0))); };
+    auto rms = [](const std::vector<float>& v) {
+        double s = 0;
+        for (float x : v) s += double(x) * x;
+        return std::sqrt(s / double(v.size()));
+    };
+    auto corr = [](const std::vector<float>& a, const std::vector<float>& b) {
+        double ab = 0, aa = 0, bb = 0;
+        for (size_t i = 0; i < a.size(); ++i) ab += double(a[i]) * b[i], aa += double(a[i]) * a[i], bb += double(b[i]) * b[i];
+        return ab / std::sqrt(aa * bb);
+    };
+    const double tone_rms = 10000.0 / std::sqrt(2.0);
+    std::vector<float> lt, rt;
+    // front only: its own channel at unity gain (all-pass), nothing on the other
+    for (double hz : {60.0, 1000.0, 12000.0}) {
+        auto t = [&](uint32_t n) { return int32_t(std::lrint(10000.0 * std::sin(2 * kPi * hz * n / 32000.0))); };
+        run(t, zero, zero, zero, lt, rt);
+        CHECK(std::abs(rms(lt) / tone_rms - 1.0) < 0.01 && rms(rt) == 0);
+        // and the surround at the matrix's level at every frequency
+        run(zero, zero, t, zero, lt, rt);
+        CHECK(std::abs(rms(lt) / tone_rms - 0.8718) < 0.01 && std::abs(rms(rt) / tone_rms - 0.4899) < 0.01);
+    }
+    // Ls: 0.8718 on Lt, 0.4899 on Rt, in opposite phase (-j and +j)
+    run(zero, zero, tone, zero, lt, rt);
+    CHECK(std::abs(rms(lt) / tone_rms - 0.8718) < 0.01 && std::abs(rms(rt) / tone_rms - 0.4899) < 0.01);
+    CHECK(corr(lt, rt) < -0.99);
+    // Rs: mirrored
+    run(zero, zero, zero, tone, lt, rt);
+    CHECK(std::abs(rms(lt) / tone_rms - 0.4899) < 0.01 && std::abs(rms(rt) / tone_rms - 0.8718) < 0.01);
+    CHECK(corr(lt, rt) < -0.99);
+    // the surround is 90 degrees from the front: Ls with the same tone on L
+    // adds in quadrature (Lt's power is L's plus the surround's), within what
+    // the filters' worst 1.4-degree phase error allows (1.2% here)
+    run(tone, zero, tone, zero, lt, rt);
+    CHECK(std::abs(rms(lt) / tone_rms - std::sqrt(1.0 + 0.8718 * 0.8718)) < 0.02);
+}
+
 // ---------------------------------------------------------------- settings
 void test_settings() {
     auto parse = [](const char* text, rt::Settings& s, std::string& error, unsigned& line) {
@@ -1167,6 +1230,7 @@ void test_settings() {
 }  // namespace
 
 int main() {
+    test_dpl2();
     test_settings();
     test_textures();
     test_input_script();

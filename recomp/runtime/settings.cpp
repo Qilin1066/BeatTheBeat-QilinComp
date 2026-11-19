@@ -80,7 +80,7 @@ std::string settings_text(const Settings& s) {
     line("# 16:9; false: 4:3.");
     line(std::string("widescreen = ") + b(s.widescreen));
     line(std::string("progressive = ") + b(s.progressive));
-    line("# 0 mono, 1 stereo, 2 surround.");
+    line("# 0 mono, 1 stereo, 2 surround (the game encodes Dolby Pro Logic II, for a receiver that decodes it).");
     line("sound_mode = " + std::to_string(s.sound_mode));
     line(std::string("sensor_bar_above = ") + b(s.sensor_bar_above));
     line("# Pointer sensitivity, 1-5.");

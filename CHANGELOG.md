@@ -19,6 +19,9 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 - **New settings keys:** `monitor`, `scaling` (`integer`, `fit`, `stretch`), `smooth`, `gpu` in `[display]`; `[controls]` `rumble`. The file is rewritten from the values with its comments (a round trip, unit-tested).
 - **Enhancements:** internal resolution (`internal_scale`, the frame buffer at 1–8×: viewports, scissors, clears, display and texture copies scaled; texture copies keep the resolution), anisotropic filtering (`anisotropy`), and `vsync` (mailbox or FIFO; off: immediate). At 3× (1920×1368) the title draws the same picture (coverage and mean colour as at 1×), the GPU at 1.75 ms a frame on a GTX 1080 Ti.
 
+### Added
+- **Surround: Dolby Pro Logic II**, which the game uses for the console's surround setting (it stopped before). The channel layout is the game's own (L, R, Ls and Rs per bus, with Rs in aux C's mix slots, read from NW4R's and AX's code); the encoding into two channels is the published Pro Logic II matrix with a 90-degree shift by an all-pass pair of this project's own design (`tools/analysis/design_dpl2_allpass.py`; marked APPROX), unit-tested against the matrix. The menu offers it as "Surround (Dolby Pro Logic II)".
+
 ### Fixed
 - **The game gets past the title.** It had been "waiting" because its title asks for A and B together. With both pressed it stopped in the mixer: AXFX's reverb sends to the surround channel even in stereo, which the mixer took for an unknown. AX's own command list shows stereo has no main surround channel (the DSP set-up for stereo, surround and Pro Logic II is budgeted 733, 829 and 925 cycles, one 96-sample channel more each), so stereo now leaves it out, as the console does. The game now plays through creating a save into its opening scene, its sound clean (no clipping, both channels).
 

@@ -18,15 +18,19 @@
 // NW4R computes them), and the write-back AX reads. Where the DSP's own
 // arithmetic has no source, the output is an approximation, each marked
 // APPROX: the polyphase resampling filter (a 4-tap cubic here), rounding,
-// and the compressor (saturation here). Features with no source yet stop
-// when used (biquad, interaural delay, surround output, Dolby Pro Logic II:
-// how the DSP encodes S, or Ls and Rs, into its two output channels). Stereo
-// has no main S channel, so sound sent there isn't heard (run_frame).
+// the compressor (saturation here), and Dolby Pro Logic II's encoding (the
+// published matrix with a FIR phase shift: Dpl2Encoder). The channel layout
+// in each mode is exact, from AX's and NW4R's code: stereo has no main S
+// channel, so sound sent there isn't heard; Pro Logic II carries L, R, Ls and
+// Rs, with Rs in aux C's mix slots (run_frame, mix_voice). Features with no
+// source yet stop when used (biquad, interaural delay, AX's Pro Logic I mode).
 // docs/runtime.md has the layouts. Runtime code: no std::format.
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 
+#include "dpl2.hpp"
 #include "host.hpp"
 #include "interrupts.hpp"
 #include "native.hpp"
@@ -169,9 +173,13 @@ constexpr uint16_t kAdpcm = 0x00, kPcm16 = 0x0A, kPcm8 = 0x19;
 constexpr uint16_t kSrcLinear = 1, kSrcNone = 2;  // 0: polyphase
 }  // namespace pb
 
-// Buses: main, aux A, B, C; channels L, R, S (surround).
-constexpr unsigned kBuses = 4, kChannelsPerBus = 3;
+// Buses: main, aux A, B, C. Channels: L, R, S in stereo (where S isn't
+// heard); L, R, Ls, Rs in Dolby Pro Logic II, where aux C doesn't exist.
+constexpr unsigned kBuses = 4, kChannelsPerBus = 4;
+constexpr unsigned kL = 0, kR = 1, kS = 2, kLs = 2, kRs = 3;
 using Bus = int32_t[kChannelsPerBus][kFrameSamples];
+// AX's output mode, from the command list's set-up command (1, 2, 3).
+enum class Mode : uint8_t { stereo, surround, dpl2 };
 // The mix: 12 (volume, change per sample) pairs, and which bits of the
 // mixer control enable each and its ramp (read from NW4R's SetVoiceMix).
 struct MixSlot {
@@ -184,6 +192,11 @@ constexpr MixSlot kMixSlots[12] = {
     {3, 0, 0x04000000, 0x10000000}, {3, 1, 0x08000000, 0x10000000}, {0, 2, 0x00000008, 0x00000010},
     {1, 2, 0x00080000, 0x00100000}, {2, 2, 0x01000000, 0x02000000}, {3, 2, 0x20000000, 0x40000000},
 };
+// Where a slot goes in Dolby Pro Logic II (NW4R's CalcMixParam): main, A and
+// B keep L and R and send Ls in their S slot; aux C doesn't exist, and its
+// three slots carry the Rs of main, A and B.
+constexpr unsigned kMixBusDpl2[12] = {0, 0, 1, 1, 2, 2, 0, 1, 0, 1, 2, 2};
+constexpr unsigned kMixChannelDpl2[12] = {kL, kR, kL, kR, kL, kR, kRs, kRs, kLs, kLs, kLs, kRs};
 
 // Sample data: DSP addresses are physical (MEM1 from 0, MEM2 from
 // 0x10000000), in nibbles for ADPCM, bytes for PCM8 and samples for PCM16.
@@ -273,7 +286,7 @@ int16_t cubic(const int16_t h[4], uint32_t frac) {
 
 // One voice for one frame: decode, resample, filter, envelope, mix into the
 // buses; then the DSP's state goes back into the PB for AX to read.
-void mix_voice(uint32_t p, Bus* buses) {
+void mix_voice(uint32_t p, Bus* buses, Mode mode) {
     if (peek16(p + pb::kItd) != 0) unsupported("interaural time delay", p);
     if (peek16(p + pb::kBiquad) != 0) unsupported("the biquad filter", p);
     Source src(p);
@@ -290,7 +303,9 @@ void mix_voice(uint32_t p, Bus* buses) {
     const int32_t ve_delta = int16_t(peek16(p + pb::kVeDelta));
     const uint32_t ctrl = half_pair(p + pb::kMixerCtrl);
     int32_t vol[12], delta[12];
+    int32_t* target[12];
     for (unsigned m = 0; m < 12; ++m) {
+        target[m] = mode == Mode::dpl2 ? buses[kMixBusDpl2[m]][kMixChannelDpl2[m]] : buses[kMixSlots[m].bus][kMixSlots[m].channel];
         vol[m] = peek16(p + pb::kMix + 4 * m);
         delta[m] = (ctrl & kMixSlots[m].ramp) ? int16_t(peek16(p + pb::kMix + 4 * m + 2)) : 0;
     }
@@ -308,9 +323,8 @@ void mix_voice(uint32_t p, Bus* buses) {
         s = int32_t((int64_t(s) * ve) >> 15);
         ve = std::clamp(ve + ve_delta, 0, 0xFFFF);
         for (unsigned m = 0; m < 12; ++m) {
-            const MixSlot& slot = kMixSlots[m];
-            if (!(ctrl & slot.on)) continue;
-            buses[slot.bus][slot.channel][i] += int32_t((int64_t(s) * vol[m]) >> 15);
+            if (!(ctrl & kMixSlots[m].on)) continue;
+            target[m][i] += int32_t((int64_t(s) * vol[m]) >> 15);
             vol[m] = std::clamp(vol[m] + delta[m], 0, 0xFFFF);
         }
     }
@@ -324,18 +338,28 @@ void mix_voice(uint32_t p, Bus* buses) {
     ++stats().voice_frames;
 }
 
-// An aux bus's buffers (32-bit samples, L, R and S one after the other):
-// the DSP writes the bus to `in` for AX's aux callback and mixes `out`, which
-// the callback processed in an earlier frame, back into the main bus.
-void aux_round_trip(const int32_t (&bus)[kChannelsPerBus][kFrameSamples], uint32_t in, uint32_t out, uint16_t volume,
-                    Bus& main) {
-    for (unsigned ch = 0; ch < kChannelsPerBus; ++ch)
+// An aux bus's round trip: the DSP writes the bus to AX's input buffer for
+// the aux callback and mixes the output, which the callback processed in an
+// earlier frame, back into the main bus at the return volume. Buffers are
+// 32-bit samples, 96 a channel (__AXGetAux*: three of 1536 bytes a bus).
+// Stereo (commands 5, 6, 7): L, R, S one after the other, in and out.
+// Pro Logic II (8, 9; __AXGetAux*Dpl2): L, R, Ls in, Rs in from its own
+// pointer (the input's fourth channel); out, each channel from its own
+// pointer (L at the output, then R, Ls, Rs).
+struct Aux {
+    uint16_t volume = 0;
+    uint32_t in[kChannelsPerBus] = {}, out[kChannelsPerBus] = {};
+};
+void aux_round_trip(const Bus& bus, const Aux& aux, unsigned channels, Bus& main) {
+    for (unsigned ch = 0; ch < channels; ++ch)
         for (uint32_t i = 0; i < kFrameSamples; ++i) {
-            const uint32_t at = 4 * (ch * kFrameSamples + i);
-            poke32(in + at, uint32_t(bus[ch][i]));
-            main[ch][i] += int32_t((int64_t(int32_t(peek32(out + at))) * volume) >> 15);
+            poke32(aux.in[ch] + 4 * i, uint32_t(bus[ch][i]));
+            main[ch][i] += int32_t((int64_t(int32_t(peek32(aux.out[ch] + 4 * i))) * aux.volume) >> 15);
         }
 }
+
+Dpl2Encoder<kFrameSamples> g_dpl2;  // dpl2.hpp
+Mode g_last_mode = Mode::stereo;
 
 // An address in the command list (two halves, physical): a buffer in MEM1 or
 // MEM2. Zero, or one outside guest memory, stops rather than becoming a
@@ -345,19 +369,28 @@ uint32_t list_addr(uint32_t at, uint32_t list) {
     if (phys == 0 || !guest_range_ok(phys | 0x80000000u, 4)) unsupported("an address in the command list", list);
     return phys | 0x80000000u;
 }
-// One frame. AX's command list (16-bit words; addresses as two halves):
-//   0 studio | 1, 2, 3 mix buffer (by output mode) | 4 first PB
-//   5, 6, 7 aux A, B, C: return volume, input, output
-//   8, 9 aux A, B for Dolby Pro Logic II | 10 compressor: 0x8000, value, table
+// One frame. AX's command list (__AXNextFrame; 16-bit words, addresses as
+// two halves):
+//   0 studio | 1, 2, 3 mix buffer set-up (stereo, surround, Pro Logic II)
+//   4 first PB | 5, 6, 7 aux A, B, C: return volume, input, output
+//   8, 9 aux A, B for Pro Logic II: return volume, input, input Rs,
+//        output L, R, Ls, Rs | 10 compressor: 0x8000, value, table
 //   11 output: master volume, mix buffer, the AI buffer | 12 the same, DPL2
 //   13 the four remote speakers' buffers | 14 end
+//
+// The set-up commands: __AXNextFrame budgets 733, 829 and 925 DSP cycles for
+// them, one more 96-sample channel each (L R; L R S; L R Ls Rs), and the
+// output and aux commands are the same for stereo and surround. So stereo
+// has no main S channel: what reaches S (AXFX's reverb writes L, R and S in
+// every mode but Pro Logic II) isn't heard, as on the console.
 void run_frame(uint32_t list) {
     const Timed timed(Section::Mixer);
     Bus buses[kBuses] = {};
-    uint32_t aux_in[kBuses] = {}, aux_out[kBuses] = {};
-    uint16_t aux_volume[kBuses] = {};
+    Aux aux[kBuses];
+    bool aux_on[kBuses] = {}, mode_set = false;
+    Mode mode = Mode::stereo;
     uint32_t output = 0, remotes[4] = {};
-    uint16_t master = 0;
+    uint16_t master = 0, output_cmd = 0;
     uint32_t first_pb = 0;
     uint32_t a = list;
     for (unsigned n = 0;; ++n) {
@@ -366,23 +399,41 @@ void run_frame(uint32_t list) {
         a += 2;
         if (cmd == 14) break;
         switch (cmd) {
-        // 0: the studio (depop, kept by AX). 1, 2, 3: the mix buffer's set-up
-        // for AX's mode: stereo, surround, Pro Logic II. __AXNextFrame budgets
-        // 733, 829 and 925 DSP cycles for them, one more 96-sample channel
-        // each: L R, then S, then Ls Rs for Pro Logic II's L R Ls Rs. The
-        // output and aux commands are the same for stereo and surround, so
-        // stereo's only difference is that it has no main S channel.
-        case 0: case 1: a += 4; break;
+        case 0: a += 4; break;  // the studio (depop, kept by AX)
+        case 1: case 3:
+            mode = cmd == 1 ? Mode::stereo : Mode::dpl2, mode_set = true;
+            a += 4;
+            break;
+        // AX's surround mode (Pro Logic I: S matrixed into L and R) has no
+        // source for its encoding, and this game never asks for it (it maps
+        // the console's surround setting to Pro Logic II).
+        case 2: unsupported("AX's surround (Pro Logic I) mode", list);
         case 4: first_pb = list_addr(a, list), a += 4; break;
         case 5: case 6: case 7: {
             const unsigned bus = cmd - 4u;
-            aux_volume[bus] = peek16(a);
-            aux_in[bus] = list_addr(a + 2, list), aux_out[bus] = list_addr(a + 6, list);
+            Aux& x = aux[bus];
+            x.volume = peek16(a);
+            const uint32_t in = list_addr(a + 2, list), out = list_addr(a + 6, list);
+            for (unsigned ch = kL; ch <= kS; ++ch) x.in[ch] = in + 384 * ch, x.out[ch] = out + 384 * ch;  // L, R, S
+            aux_on[bus] = true;
             a += 10;
             break;
         }
+        case 8: case 9: {
+            const unsigned bus = cmd - 7u;
+            Aux& x = aux[bus];
+            x.volume = peek16(a);
+            const uint32_t in = list_addr(a + 2, list);
+            x.in[kL] = in, x.in[kR] = in + 384, x.in[kLs] = in + 768, x.in[kRs] = list_addr(a + 6, list);
+            x.out[kL] = list_addr(a + 10, list), x.out[kR] = list_addr(a + 14, list);
+            x.out[kLs] = list_addr(a + 18, list), x.out[kRs] = list_addr(a + 22, list);
+            aux_on[bus] = true;
+            a += 26;
+            break;
+        }
         case 10: a += 8; break;  // APPROX: the compressor is saturation at the output
-        case 11:
+        case 11: case 12:
+            output_cmd = cmd;
             master = peek16(a);
             output = list_addr(a + 6, list);
             a += 10;
@@ -391,30 +442,43 @@ void run_frame(uint32_t list) {
             for (unsigned r = 0; r < 4; ++r) remotes[r] = list_addr(a + 4 * r, list);
             a += 16;
             break;
-        case 2: case 3: case 8: case 9: case 12: unsupported("surround or Dolby Pro Logic II output", list);
         default:
             std::fprintf(stderr, "qilin_run: DSP: command %u in the list at %08X\n", cmd, list);
             throw Stop{Stop::Unsupported, 0, a - 2};
         }
     }
-    if (!first_pb || !output) unsupported("a command list without voices or output", list);
+    if (!first_pb || !output || !mode_set) unsupported("a command list without voices, output or set-up", list);
+    const bool dpl2 = mode == Mode::dpl2;
+    if ((output_cmd == 12) != dpl2) unsupported("an output command for another mode than the set-up's", list);
+    if (dpl2 && aux_on[3]) unsupported("aux C in Pro Logic II", list);
+    if (mode != g_last_mode) {  // no old surround in a new mode
+        g_dpl2.reset(), g_last_mode = mode;
+        std::fprintf(stderr, "qilin_run: DSP: output %s\n", dpl2 ? "Dolby Pro Logic II" : "stereo");
+    }
 
     uint32_t p = first_pb;
     for (unsigned n = 0; p != 0x80000000u; ++n) {
         if (n > 256) unsupported("a voice chain that doesn't end", first_pb);
-        if (peek16(p + pb::kState) == pb::kRunning) mix_voice(p, buses);
+        if (peek16(p + pb::kState) == pb::kRunning) mix_voice(p, buses, mode);
         p = half_pair(p + pb::kNext) | 0x80000000u;
     }
     for (unsigned bus = 1; bus < kBuses; ++bus)
-        if (aux_in[bus]) aux_round_trip(buses[bus], aux_in[bus], aux_out[bus], aux_volume[bus], buses[0]);
+        if (aux_on[bus]) aux_round_trip(buses[bus], aux[bus], dpl2 ? 4 : 3, buses[0]);
 
-    // Stereo output: L and R with the master volume. Stereo has no main S
-    // channel (see the set-up command above), so what reached S (an effect's
-    // surround return: AXFX's reverb writes L, R and S in every mode but
-    // Pro Logic II) isn't heard, as on the console.
-    for (uint32_t i = 0; i < kFrameSamples; ++i) {
-        poke16(output + 4 * i, uint16_t(clamp16((int64_t(buses[0][0][i]) * master) >> 15)));
-        poke16(output + 4 * i + 2, uint16_t(clamp16((int64_t(buses[0][1][i]) * master) >> 15)));
+    // The output, with the master volume: L and R in stereo (S isn't heard);
+    // the Pro Logic II matrix of L, R, Ls and Rs.
+    if (dpl2) {
+        float lt[kFrameSamples], rt[kFrameSamples];
+        g_dpl2.encode(buses[0][kL], buses[0][kR], buses[0][kLs], buses[0][kRs], lt, rt);
+        for (uint32_t i = 0; i < kFrameSamples; ++i) {
+            poke16(output + 4 * i, uint16_t(clamp16((int64_t(std::lrint(lt[i])) * master) >> 15)));
+            poke16(output + 4 * i + 2, uint16_t(clamp16((int64_t(std::lrint(rt[i])) * master) >> 15)));
+        }
+    } else {
+        for (uint32_t i = 0; i < kFrameSamples; ++i) {
+            poke16(output + 4 * i, uint16_t(clamp16((int64_t(buses[0][kL][i]) * master) >> 15)));
+            poke16(output + 4 * i + 2, uint16_t(clamp16((int64_t(buses[0][kR][i]) * master) >> 15)));
+        }
     }
     // The remote speakers: silent (no remote speaker output yet; see wpad.cpp).
     constexpr uint32_t kRemoteSamples = 18;  // 6 kHz

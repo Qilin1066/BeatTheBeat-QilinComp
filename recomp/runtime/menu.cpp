@@ -424,9 +424,9 @@ void Menu::game_page() {
     ImGui::Checkbox("60 Hz (EuRGB60; off: PAL 50 Hz)", &s.sixty_hz);
     ImGui::Checkbox("Widescreen (16:9)", &s.widescreen);
     ImGui::Checkbox("Progressive scan", &s.progressive);
-    // Surround makes the game use Dolby Pro Logic II, whose encoding the
-    // mixer doesn't have yet (it stops there).
-    static constexpr const char* kSound[] = {"Mono", "Stereo", "Surround (not yet: the game stops)"};
+    // The game plays surround as Dolby Pro Logic II (dpl2.hpp), for a
+    // receiver or TV that decodes it.
+    static constexpr const char* kSound[] = {"Mono", "Stereo", "Surround (Dolby Pro Logic II)"};
     int sound = std::clamp(int(s.sound_mode), 0, 2);
     if (ImGui::Combo("Sound", &sound, kSound, 3)) s.sound_mode = uint8_t(sound);
     ImGui::Checkbox("Sensor bar above the TV", &s.sensor_bar_above);
