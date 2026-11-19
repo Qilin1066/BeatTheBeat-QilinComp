@@ -88,7 +88,8 @@ struct Stats {
     uint64_t files_opened = 0, bytes_read = 0;
     uint64_t draws = 0, vertices = 0, display_copies = 0, texture_copies = 0, retraces = 0;
     uint64_t audio_frames = 0;
-    uint64_t dsp_frames = 0;  // AX frames the DSP mixed: one per audio frame on the console
+    uint64_t dsp_frames = 0;
+    uint64_t dvd_pending = 0;  // asynchronous disc requests not yet completed (now)  // AX frames the DSP mixed: one per audio frame on the console
     // Periodic interrupts that were late by a whole period or more and so
     // never ran (an audio frame lost is music running slow), and where
     // deliveries happened: in the idle scheduler, or at a safe point in

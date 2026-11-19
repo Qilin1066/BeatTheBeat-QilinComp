@@ -309,7 +309,7 @@ void Menu::controls_page() {
     if (n == 0) ImGui::TextDisabled("None connected: the keyboard plays the Wii Remote.");
     for (int i = 0; i < n; ++i) {
         const char* name = SDL_GetGamepadNameForID(ids[i]);
-        ImGui::BulletText("%s%s", name ? name : "A controller", i == 0 ? " (plays the Wii Remote)" : "");
+        ImGui::BulletText("%s", name ? name : "A controller");  // each one plays the Wii Remote
     }
     SDL_free(ids);
     ImGui::Checkbox("Rumble", &s.rumble);

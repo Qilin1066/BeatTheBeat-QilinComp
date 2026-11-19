@@ -30,6 +30,7 @@
 #include <cstdio>
 #include <cstdlib>
 
+#include "bot.hpp"
 #include "dpl2.hpp"
 #include "host.hpp"
 #include "interrupts.hpp"
@@ -48,6 +49,7 @@ struct Ai {
     bool initialised = false, running = false;
     uint32_t callback = 0;          // AIRegisterDMACallback
     uint32_t start = 0, length = 0;  // AIInitDMA: the buffer the next DMA plays
+    uint64_t started = 0, frames = 0;  // AIStartDMA's time (the game's clock), frames played since
 } ai;
 
 // QILIN_AUDIO_DUMP=<file.wav>: what AI plays, as a WAV file (16-bit stereo,
@@ -103,11 +105,23 @@ void play_frame(uint32_t start) {
     host::play_audio(lr, kFrameSamples);
 }
 
+// The lockstep bot hears what AI plays, each frame with the game's clock
+// when it started: by the DMA's schedule (its start, then a frame every
+// period), not by when the interrupt was delivered.
+void bot_frame(uint32_t start) {
+    if (!bot::active()) return;
+    int16_t lr[kFrameSamples * 2];
+    for (uint32_t i = 0; i < kFrameSamples * 2; ++i) lr[i] = static_cast<int16_t>(peek16(start + 2 * i));
+    bot::audio(lr, kFrameSamples, ai.started + ai.frames * (kTimeBaseHz * kFrameSamples / kSampleRate));
+}
+
 void dma_interrupt(Context& c) {
     if (!ai.running) return;
     ++stats().audio_frames;
     dump_frame(ai.start);
     play_frame(ai.start);
+    bot_frame(ai.start);
+    ++ai.frames;
     if (ai.callback) call_guest(c, ai.callback);
 }
 
@@ -128,6 +142,7 @@ QILIN_NATIVE(AIInitDMA) {
 QILIN_NATIVE(AIStartDMA) {
     if (ai.running) return;
     ai.running = true;
+    ai.started = time_base() + kTimeBaseHz * kFrameSamples / kSampleRate;  // the first interrupt's due time
     add_periodic(kTimeBaseHz * kFrameSamples / kSampleRate, dma_interrupt);
 }
 // The DMA interrupt comes when a buffer has played out: AX asks at that

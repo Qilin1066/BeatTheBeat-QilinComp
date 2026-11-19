@@ -1,6 +1,6 @@
 // Input sources for the Wii Remote (input.hpp): the keyboard when there is a
 // window (host.cpp), and QILIN_INPUT, a script of button presses for
-// headless and repeatable runs (both at once add up), e.g.
+// headless and repeatable runs, and the lockstep bot (bot.hpp); all add up. E.g.
 //
 //   QILIN_INPUT=A@5,A@8.5,B+A@12:0.3
 //
@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <cstdlib>
 
+#include "bot.hpp"
 #include "guest.hpp"
 #include "host.hpp"
 
@@ -107,13 +108,14 @@ bool parse_input_script(std::string_view script, std::vector<ScriptedPress>& out
 
 bool input_source() {
     load();
-    return g_script.present || host::windowed();
+    return g_script.present || host::windowed() || bot::active();
 }
 
 uint16_t input_buttons(unsigned channel) {
     load();
     if (channel != 0) return 0;
     uint16_t held = host::windowed() ? host::keyboard_buttons() : 0;
+    held |= bot::buttons();
     const double now = double(time_base() - g_start) / double(kTimeBaseHz);
     for (const ScriptedPress& p : g_script.presses)
         if (now >= p.from && now < p.to) held |= p.buttons;

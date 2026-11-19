@@ -25,7 +25,10 @@ bool windowed();
 // window closes, which ends the process. Returns false (with the reason on
 // stderr) if the window or the renderer can't start.
 bool run(const std::function<void()>& game);
-// The Wii Remote buttons the keyboard and the controller hold (input.hpp's bits).
+// qilin_run --controllers: lists the game devices SDL sees and shows the
+// Wii Remote buttons the controllers make as they're pressed, for `seconds`.
+bool test_controllers(unsigned seconds);
+// The Wii Remote buttons the keyboard and the controllers hold (input.hpp's bits).
 uint16_t keyboard_buttons();
 // Plays stereo 16-bit frames (host byte order, left then right).
 void play_audio(const int16_t* lr, uint32_t frames);

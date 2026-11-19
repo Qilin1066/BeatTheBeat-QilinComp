@@ -49,6 +49,7 @@
 #include "gx.hpp"
 #include "machine.hpp"
 #include "native.hpp"
+#include "bot.hpp"
 #include "pause.hpp"
 #include "profile.hpp"
 #include "settings.hpp"
@@ -1709,16 +1710,25 @@ void Renderer::copy_display(const State& s, uint32_t, bool clear) {
         g.last_w = rw, g.last_h = rh;
         // QILIN_FRAME_STATS / QILIN_FRAME_DUMP: the picture read back with
         // the frame, looked at when its fence is next waited on (sample_frame).
-        if (sample_every() && g.frame_number % sample_every() == 0) {
+        const bool sampled = sample_every() && g.frame_number % sample_every() == 0;
+        if (sampled || bot::active()) {  // the lockstep bot sees every frame
             VkBufferImageCopy back{};
             back.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
             back.imageOffset = region.srcOffset;
             back.imageExtent = {rw, rh, 1};
             vkCmdCopyImageToBuffer(cb, g.efb_color.img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, f.readback.buf, 1, &back);
-            f.sampled = true, f.sample_w = rw, f.sample_h = rh, f.sample_number = g.frame_number;
+            if (sampled) f.sampled = true, f.sample_w = rw, f.sample_h = rh, f.sample_number = g.frame_number;
         }
         if (clear) clear_efb(s, s.disp_src);
         finish_frame(f);
+        if (bot::active()) {
+            // The game's clock stops from here until the bot has answered:
+            // the wait for the picture and the bot's thinking aren't the game's.
+            const uint64_t stopped = time_base_unpaused();
+            vk_check(vkWaitForFences(g.device, 1, &f.fence, VK_TRUE, UINT64_MAX), "vkWaitForFences");
+            bot::frame(g.frame_number, f.readback.map, rw, rh);
+            skip_time_base(time_base_unpaused() - stopped);
+        }
         g.frame = (g.frame + 1) % kFrames;
         ++g.frame_number;
         if (g.frame_number % 300 == 0) save_pipeline_cache();  // every 5 s, when there are new pipelines

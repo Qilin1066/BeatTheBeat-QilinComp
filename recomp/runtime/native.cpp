@@ -208,8 +208,8 @@ void report_stats() {
     const Stats& s = stats();
     std::fprintf(stderr,
                  "qilin_run: so far: %" PRIu64 " thread switches (%" PRIu64 " threads started), %" PRIu64
-                 " interrupts (%" PRIu64 " from the decrementer), %" PRIu64 " files opened, %" PRIu64 " bytes read\n",
-                 s.switches, s.threads_started, s.interrupts, s.decrementer, s.files_opened, s.bytes_read);
+                 " interrupts (%" PRIu64 " from the decrementer), %" PRIu64 " files opened, %" PRIu64 " bytes read, %" PRIu64 " disc requests pending\n",
+                 s.switches, s.threads_started, s.interrupts, s.decrementer, s.files_opened, s.bytes_read, s.dvd_pending);
     std::fprintf(stderr,
                  "qilin_run:          %" PRIu64 " draws (%" PRIu64 " vertices), %" PRIu64 " frames copied out, %" PRIu64
                  " copies to textures, %" PRIu64 " retraces, %" PRIu64 " audio frames (%" PRIu64 " mixed by the DSP, %" PRIu64

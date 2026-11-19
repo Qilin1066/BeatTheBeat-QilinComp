@@ -152,11 +152,13 @@ uint64_t g_next_request = 1;
 void complete(uint32_t fi, int32_t result, uint32_t callback) {
     const uint64_t request = g_next_request++;
     g_pending[fi] = request;
+    stats().dvd_pending = g_pending.size();
     g_cancelled.erase(fi);
     post_interrupt([fi, result, callback, request](Context& c) {
         const auto it = g_pending.find(fi);
         if (it == g_pending.end() || it->second != request) return;
         g_pending.erase(it);
+        stats().dvd_pending = g_pending.size();
         const bool cancelled = g_cancelled.erase(fi) != 0;
         poke32(fi + kCbState, cancelled ? kStateCanceled : kStateEnd);
         if (!cancelled && result >= 0) poke32(fi + kCbTransferred, static_cast<uint32_t>(result));
@@ -173,6 +175,7 @@ void complete(uint32_t fi, int32_t result, uint32_t callback) {
 // finds nothing to do.
 void cancel_now(Context& c, uint32_t block) {
     if (!g_pending.erase(block)) return;
+    stats().dvd_pending = g_pending.size();
     g_cancelled.erase(block);
     poke32(block + kCbState, kStateCanceled);
     const uint32_t callback = peek32(block + kCallback);

@@ -16,6 +16,7 @@
 #include <filesystem>
 #include <thread>
 
+#include "bot.hpp"
 #include "dol.hpp"
 #include "dvd.hpp"
 #include "host.hpp"
@@ -89,10 +90,17 @@ void call_from(rt::Context& c, uint32_t fn, uint32_t return_to) {
 }  // namespace
 
 int main(int argc, char** argv) {
+#ifndef QILIN_HEADLESS_ONLY
+    // qilin_run --controllers: what SDL sees, and each button as it's
+    // pressed, for 20 s: to check a controller without the game.
+    if (argc == 2 && std::strcmp(argv[1], "--controllers") == 0) return rt::host::test_controllers(20) ? 0 : 2;
+#endif
     if (argc != 2) {
-        std::fprintf(stderr, "usage: qilin_run <extracted disc folder | main.dol>\n");
+        std::fprintf(stderr, "usage: qilin_run <extracted disc folder | main.dol>\n"
+                             "       qilin_run --controllers   (lists the controllers and shows their buttons as pressed)\n");
         return 2;
     }
+    rt::bot::at_end = rt::report_threads;  // a bot's run ends with where the threads are
     // The extracted disc's folder (Dolphin: Extract Entire Disc) gives the
     // game and its files; main.dol alone runs until the game reads the disc.
     const std::filesystem::path arg = argv[1];

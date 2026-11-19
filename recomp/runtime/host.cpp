@@ -30,7 +30,7 @@ constexpr const char* kGameName = "Beat the Beat: Rhythm Paradise";
 
 SDL_Window* g_window = nullptr;
 SDL_AudioStream* g_audio = nullptr;
-SDL_Gamepad* g_pad = nullptr;  // the controller playing as the Wii Remote (the first connected)
+std::vector<SDL_Gamepad*> g_pads;  // every connected gamepad: any of them plays the Wii Remote
 std::atomic<uint16_t> g_keys{0}, g_pad_buttons{0};
 std::atomic<bool> g_rumble{false};
 uint32_t g_wake_event = 0;  // an SDL user event: something for the main thread to do
@@ -64,54 +64,80 @@ void update_keys() {
     g_keys.store(held, std::memory_order_relaxed);
 }
 
-// A controller as the Wii Remote held upright: the south face button is A,
+// Controllers as the Wii Remote held upright: the south face button is A,
 // the east one and the right trigger B (the remote's trigger), west 1,
 // north 2, Start +, Back -, Guide Home; the d-pad and the left stick the
 // remote's d-pad.
+//
+// Every gamepad SDL knows is opened and any of them plays (their buttons
+// add up), as the other recomps do it (Zelda64Recomp reads all pads,
+// UnleashedRecomp the one last touched). Taking only the first one listed
+// went wrong on computers with other game devices: a virtual pad or a wheel
+// listed first took the place and the real controller was never read.
+uint16_t pad_buttons(SDL_Gamepad* pad) {
+    uint16_t held = 0;
+    auto button = [pad](SDL_GamepadButton b) { return SDL_GetGamepadButton(pad, b); };
+    if (button(SDL_GAMEPAD_BUTTON_SOUTH)) held |= kButtonA;
+    if (button(SDL_GAMEPAD_BUTTON_EAST) || SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) > 16000) held |= kButtonB;
+    if (button(SDL_GAMEPAD_BUTTON_WEST)) held |= kButton1;
+    if (button(SDL_GAMEPAD_BUTTON_NORTH)) held |= kButton2;
+    if (button(SDL_GAMEPAD_BUTTON_START)) held |= kButtonPlus;
+    if (button(SDL_GAMEPAD_BUTTON_BACK)) held |= kButtonMinus;
+    if (button(SDL_GAMEPAD_BUTTON_GUIDE)) held |= kButtonHome;
+    const int x = SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFTX), y = SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFTY);
+    if (button(SDL_GAMEPAD_BUTTON_DPAD_UP) || y < -16000) held |= kButtonUp;
+    if (button(SDL_GAMEPAD_BUTTON_DPAD_DOWN) || y > 16000) held |= kButtonDown;
+    if (button(SDL_GAMEPAD_BUTTON_DPAD_LEFT) || x < -16000) held |= kButtonLeft;
+    if (button(SDL_GAMEPAD_BUTTON_DPAD_RIGHT) || x > 16000) held |= kButtonRight;
+    return held;
+}
+
 void update_pad() {
     uint16_t held = 0;
-    if (g_pad) {
-        auto button = [](SDL_GamepadButton b) { return SDL_GetGamepadButton(g_pad, b); };
-        if (button(SDL_GAMEPAD_BUTTON_SOUTH)) held |= kButtonA;
-        if (button(SDL_GAMEPAD_BUTTON_EAST) || SDL_GetGamepadAxis(g_pad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) > 16000) held |= kButtonB;
-        if (button(SDL_GAMEPAD_BUTTON_WEST)) held |= kButton1;
-        if (button(SDL_GAMEPAD_BUTTON_NORTH)) held |= kButton2;
-        if (button(SDL_GAMEPAD_BUTTON_START)) held |= kButtonPlus;
-        if (button(SDL_GAMEPAD_BUTTON_BACK)) held |= kButtonMinus;
-        if (button(SDL_GAMEPAD_BUTTON_GUIDE)) held |= kButtonHome;
-        const int x = SDL_GetGamepadAxis(g_pad, SDL_GAMEPAD_AXIS_LEFTX), y = SDL_GetGamepadAxis(g_pad, SDL_GAMEPAD_AXIS_LEFTY);
-        if (button(SDL_GAMEPAD_BUTTON_DPAD_UP) || y < -16000) held |= kButtonUp;
-        if (button(SDL_GAMEPAD_BUTTON_DPAD_DOWN) || y > 16000) held |= kButtonDown;
-        if (button(SDL_GAMEPAD_BUTTON_DPAD_LEFT) || x < -16000) held |= kButtonLeft;
-        if (button(SDL_GAMEPAD_BUTTON_DPAD_RIGHT) || x > 16000) held |= kButtonRight;
-    }
+    for (SDL_Gamepad* pad : g_pads) held |= pad_buttons(pad);
     g_pad_buttons.store(held, std::memory_order_relaxed);
 }
 
+const char* pad_type(SDL_Gamepad* pad) {
+    const char* s = SDL_GetGamepadStringForType(SDL_GetGamepadType(pad));
+    return s ? s : "unknown";
+}
+
 void attach_pad(SDL_JoystickID id) {
-    if (g_pad) return;  // one Wii Remote: the first controller plays it
-    g_pad = SDL_OpenGamepad(id);
-    if (g_pad) std::fprintf(stderr, "qilin_run: controller: %s plays the Wii Remote\n", SDL_GetGamepadName(g_pad));
+    for (SDL_Gamepad* pad : g_pads)
+        if (SDL_GetGamepadID(pad) == id) return;  // already open
+    SDL_Gamepad* pad = SDL_OpenGamepad(id);
+    if (!pad) {
+        std::fprintf(stderr, "qilin_run: controller: a gamepad can't be opened (%s)\n", SDL_GetError());
+        return;
+    }
+    g_pads.push_back(pad);
+    std::fprintf(stderr, "qilin_run: controller: %s (%s, %04X:%04X) plays the Wii Remote\n", SDL_GetGamepadName(pad), pad_type(pad),
+                 SDL_GetGamepadVendor(pad), SDL_GetGamepadProduct(pad));
     update_pad();
 }
 void detach_pad(SDL_JoystickID id) {
-    if (!g_pad || SDL_GetGamepadID(g_pad) != id) return;
-    SDL_CloseGamepad(g_pad);
-    g_pad = nullptr;
-    // Another controller still connected takes over.
-    int n = 0;
-    if (SDL_JoystickID* ids = SDL_GetGamepads(&n)) {
-        if (n > 0) attach_pad(ids[0]);
-        SDL_free(ids);
-    }
+    for (auto it = g_pads.begin(); it != g_pads.end(); ++it)
+        if (SDL_GetGamepadID(*it) == id) {
+            std::fprintf(stderr, "qilin_run: controller: %s disconnected\n", SDL_GetGamepadName(*it));
+            SDL_CloseGamepad(*it);
+            g_pads.erase(it);
+            break;
+        }
     update_pad();
+}
+// A game device SDL sees but has no gamepad layout for (a wheel, a flight
+// stick): said once, so it's known why it does nothing.
+void note_joystick(SDL_JoystickID id) {
+    if (SDL_IsGamepad(id)) return;
+    const char* name = SDL_GetJoystickNameForID(id);
+    std::fprintf(stderr, "qilin_run: controller: %s isn't a gamepad SDL knows the layout of: not used\n", name ? name : "a game device");
 }
 
 void apply_rumble() {
     const bool on = g_rumble && settings().rumble;
-    if (g_pad) SDL_RumbleGamepad(g_pad, on ? 0xA000 : 0, on ? 0xA000 : 0, on ? 60000 : 0);
+    for (SDL_Gamepad* pad : g_pads) SDL_RumbleGamepad(pad, on ? 0xA000 : 0, on ? 0xA000 : 0, on ? 60000 : 0);
 }
-
 bool open_audio() {
     const SDL_AudioSpec spec{SDL_AUDIO_S16, 2, kSampleRate};
     g_audio = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, nullptr, nullptr);
@@ -186,8 +212,59 @@ void rumble(bool on) {
     SDL_PushEvent(&e);
 }
 
+// qilin_run --controllers: every game device SDL sees, then each change of
+// the Wii Remote's buttons the controllers make, for `seconds`. The same
+// code paths as the game's (attach_pad, update_pad), with no game.
+bool test_controllers(unsigned seconds) {
+    SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
+    if (!SDL_Init(SDL_INIT_GAMEPAD | SDL_INIT_EVENTS)) {
+        std::fprintf(stderr, "qilin_run: SDL can't start: %s\n", SDL_GetError());
+        return false;
+    }
+    std::fprintf(stderr, "qilin_run: SDL %d.%d.%d; looking for controllers for %u s (press buttons)\n", SDL_MAJOR_VERSION,
+                 SDL_MINOR_VERSION, SDL_MICRO_VERSION, seconds);
+    static constexpr struct {
+        uint16_t bit;
+        const char* name;
+    } kNames[] = {{kButtonA, "A"},       {kButtonB, "B"},         {kButton1, "1"},       {kButton2, "2"},
+                  {kButtonPlus, "+"},    {kButtonMinus, "-"},     {kButtonHome, "Home"}, {kButtonUp, "Up"},
+                  {kButtonDown, "Down"}, {kButtonLeft, "Left"},   {kButtonRight, "Right"}};
+    const uint64_t end = SDL_GetTicks() + 1000ull * seconds;
+    uint16_t last = 0;
+    unsigned changes = 0;
+    while (SDL_GetTicks() < end) {
+        SDL_Event e;
+        if (!SDL_WaitEventTimeout(&e, 50)) continue;
+        switch (e.type) {
+        case SDL_EVENT_GAMEPAD_ADDED: attach_pad(e.gdevice.which); break;
+        case SDL_EVENT_GAMEPAD_REMOVED: detach_pad(e.gdevice.which); break;
+        case SDL_EVENT_JOYSTICK_ADDED: note_joystick(e.jdevice.which); break;
+        case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
+        case SDL_EVENT_GAMEPAD_BUTTON_UP:
+        case SDL_EVENT_GAMEPAD_AXIS_MOTION: update_pad(); break;
+        default: break;
+        }
+        const uint16_t now = g_pad_buttons.load(std::memory_order_relaxed);
+        if (now != last) {
+            ++changes;
+            std::fprintf(stderr, "qilin_run: the Wii Remote's buttons held:");
+            for (const auto& n : kNames)
+                if (now & n.bit) std::fprintf(stderr, " %s", n.name);
+            std::fprintf(stderr, "%s\n", now ? "" : " (none)");
+            last = now;
+        }
+    }
+    std::fprintf(stderr, "qilin_run: %zu gamepad(s) open, %u button change(s) seen\n", g_pads.size(), changes);
+    SDL_Quit();
+    return true;
+}
+
 bool run(const std::function<void()>& game) {
     SDL_SetHint(SDL_HINT_APP_NAME, kGameName);
+    // Controllers are read whether or not the window has the focus (SDL drops
+    // their input in the background otherwise: a click elsewhere, an overlay,
+    // and the controller seemed dead).
+    SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMEPAD)) {
         std::fprintf(stderr, "qilin_run: SDL can't start: %s\n", SDL_GetError());
         return false;
@@ -266,6 +343,7 @@ bool run(const std::function<void()>& game) {
             case SDL_EVENT_KEY_UP:
             case SDL_EVENT_WINDOW_FOCUS_LOST: update_keys(); break;
             case SDL_EVENT_GAMEPAD_ADDED: attach_pad(e.gdevice.which); break;
+            case SDL_EVENT_JOYSTICK_ADDED: note_joystick(e.jdevice.which); break;
             case SDL_EVENT_GAMEPAD_REMOVED: detach_pad(e.gdevice.which); break;
             case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
             case SDL_EVENT_GAMEPAD_BUTTON_UP:
