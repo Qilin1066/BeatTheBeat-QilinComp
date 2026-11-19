@@ -153,6 +153,8 @@ if(QILIN_RUNTIME_GEN_DIR)
         recomp/runtime/machine.cpp
         recomp/runtime/native.cpp
         recomp/runtime/os.cpp
+        recomp/runtime/threads.cpp
+        recomp/runtime/vi.cpp
     )
     target_link_libraries(qilin_run PRIVATE qilin_gen_runtime qilin_dol qilin_warnings)
 endif()

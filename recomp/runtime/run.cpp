@@ -8,13 +8,14 @@
 // replaced function, the hardware address or the instruction, and where it
 // was reached from. Exit status: 0 the game ended itself, 1 it stopped,
 // 2 the runtime couldn't start. Runtime code: no std::format.
-#include <cinttypes>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 #include "dol.hpp"
 #include "machine.hpp"
 #include "native.hpp"
+#include "threads.hpp"
 
 using namespace qilin;
 
@@ -31,50 +32,12 @@ constexpr uint32_t kHid2 = 920, kHid2Lsqe = 0x80000000u, kHid2Pse = 0x20000000u;
 // __start's return addresses, so the game sees the link register it would.
 constexpr uint32_t kAfterOSInit = 0x80004170u, kAfterInitUser = 0x800041A8u, kAfterMain = 0x800041B4u;
 
-void describe(char* out, size_t n, uint32_t addr) {
-    const rt::Symbol* s = rt::symbol_containing(addr);
-    if (!s) std::snprintf(out, n, "%08" PRIX32, addr);
-    else if (s->addr == addr) std::snprintf(out, n, "%08" PRIX32 " (%s)", addr, s->name);
-    else std::snprintf(out, n, "%08" PRIX32 " (%s+0x%" PRIX32 ")", addr, s->name, addr - s->addr);
-}
-
-void report(const rt::Stop& s) {
-    char pc[400], value[400];
-    describe(pc, sizeof pc, s.pc);
-    describe(value, sizeof value, s.value);
-    switch (s.kind) {
-    case rt::Stop::Unregistered: {
-        const char* library = "?";
-        for (size_t k = 0; k < rt::g_native_count; ++k)
-            if (rt::g_natives[k].addr == s.pc) library = rt::g_natives[k].library;
-        std::fprintf(stderr, "qilin_run: stopped: no native code yet for %s [%s], called from %s\n", pc, library, value);
-        break;
-    }
-    case rt::Stop::Memory:
-        std::fprintf(stderr, "qilin_run: stopped: access to %08" PRIX32 ", outside the memory lifted code may use, at %s\n",
-                     s.value, pc);
-        break;
-    case rt::Stop::BadJump:
-        std::fprintf(stderr, "qilin_run: stopped: indirect call or jump to %s, which is not a function, at %s\n", value, pc);
-        break;
-    case rt::Stop::BadReturn:
-        std::fprintf(stderr, "qilin_run: stopped: %s returned to %s instead of its caller\n", pc, value);
-        break;
-    case rt::Stop::Trap: std::fprintf(stderr, "qilin_run: stopped: trap at %s\n", pc); break;
-    case rt::Stop::NotLifted: std::fprintf(stderr, "qilin_run: stopped: %s is not lifted\n", pc); break;
-    case rt::Stop::Unsupported:
-        std::fprintf(stderr, "qilin_run: stopped: unsupported at %s (value %08" PRIX32 ")\n", pc, s.value);
-        break;
-    }
-}
-
-uint32_t need(const char* name) {
-    const uint32_t a = rt::symbol_address(name);
-    if (!a) {
-        std::fprintf(stderr, "qilin_run: the lifted code has no (or more than one) function named %s\n", name);
-        throw rt::Exit{2};
-    }
-    return a;
+// Once guest threads exist on host threads, the process ends without
+// running static destructors under them.
+[[noreturn]] void end(int code) {
+    std::fflush(stdout);
+    std::fflush(stderr);
+    std::_Exit(code);
 }
 
 // Calls a guest function as a `bl` at return_to - 4 would.
@@ -107,11 +70,11 @@ int main(int argc, char** argv) {
     }
     std::memcpy(rt::g_mem + dol->base(), dol->image().data(), dol->image().size());
 #ifdef QILIN_CHECKED_MEMORY
-    // Bring-up: lifted code may use MEM1 from the DOL's base up, and MEM2.
-    // Low memory (the loader's and the OS's globals below the DOL), the
-    // uncached mirrors and the hardware registers stop, so each one lifted
-    // code really uses is found and then provided on purpose.
-    rt::g_regions[0] = {dol->base(), rt::kMem1 + rt::kMem1Bytes};
+    // Bring-up: lifted code may use MEM1, low memory included (the lifted OS
+    // keeps its globals there, the current thread among them), and MEM2.
+    // The uncached mirrors and the hardware registers stop, so each one
+    // lifted code really uses is found and then provided on purpose.
+    rt::g_regions[0] = {rt::kMem1, rt::kMem1 + rt::kMem1Bytes};
     rt::g_regions[1] = {rt::kMem2, rt::kMem2 + rt::kMem2Bytes};
     rt::g_region_count = 2;
 #endif
@@ -125,21 +88,27 @@ int main(int argc, char** argv) {
     c.r[2] = kSmallData2;
     c.r[13] = kSmallData;
     c.spr[kHid2] = kHid2Lsqe | kHid2Pse;
+    if (!rt::init_threads(c)) return 2;
     try {
-        call_from(c, need("OSInit"), kAfterOSInit);
-        call_from(c, need("__init_user"), kAfterInitUser);
+        call_from(c, rt::require_function("OSInit"), kAfterOSInit);
+        rt::adopt_boot_thread();
+        call_from(c, rt::require_function("__init_user"), kAfterInitUser);
         c.r[3] = 0;  // argc, argv: none (the disc's bi2 passes no arguments)
         c.r[4] = 0;
-        call_from(c, need("main"), kAfterMain);
+        call_from(c, rt::require_function("main"), kAfterMain);
         // __start branches to exit without linking: it returns nowhere.
         c.lr = kAfterMain;
-        rt::call(c, need("exit"), kAfterMain);
+        rt::call(c, rt::require_function("exit"), kAfterMain);
         std::fprintf(stderr, "qilin_run: stopped: exit returned\n");
-        return 1;
+        end(1);
     } catch (const rt::Stop& s) {
-        report(s);
-        return 1;
+        rt::report_stop(s);
+        end(1);
     } catch (const rt::Exit& e) {
-        return e.code;
+        end(e.code);
+    } catch (const rt::ThreadEnd&) {
+        // The boot thread exited; the game goes on in its other threads,
+        // and one of them ends it.
+        rt::wait_forever();
     }
 }

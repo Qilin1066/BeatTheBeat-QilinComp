@@ -81,6 +81,32 @@ constexpr std::string_view kLiftAnyway[] = {
     "GXInitLightDir",
     "GXGetLightDir",
     "GXInitLightColor",
+    // OSContext.c: these only clear or read the context structures and the
+    // current-context pointer in low memory. Saving and loading a context
+    // (the switch itself) stays native, and so does OSInitContext, which
+    // tells the runtime a context is being reused for a new thread.
+    "OSClearContext",
+    "OSGetCurrentContext",
+    "OSGetStackPointer",
+};
+
+// The OS's software (docs/runtime.md, v0.13.0): threads, mutexes and message
+// queues are bookkeeping on guest structures, over the interrupt enable and
+// the thread switch, which stay native. Lifted, the SDK's own scheduler
+// decides which thread runs, with its priorities and queues exactly.
+constexpr std::string_view kLiftUnits[] = {
+    "revolution/os/OSThread.c",
+    "revolution/os/OSMutex.c",
+    "revolution/os/OSMessage.c",
+    // The time base (mftb, which lifted code reads) and conversions of it.
+    "revolution/os/OSTime.c",
+};
+
+// Native although their unit is lifted. SelectThread switches threads: lifted,
+// its idle loop would spin forever, waiting for an interrupt the runtime
+// could never deliver inside it.
+constexpr std::string_view kNativeAnyway[] = {
+    "SelectThread",
 };
 
 }  // namespace
@@ -97,20 +123,37 @@ const Library* library_at(uint32_t addr) {
 std::span<const std::string_view> lift_anyway_names() { return kLiftAnyway; }
 
 bool lift_anyway(std::string_view name) { return std::ranges::find(kLiftAnyway, name) != std::end(kLiftAnyway); }
+std::span<const std::string_view> lift_unit_names() { return kLiftUnits; }
+bool lift_unit(std::string_view unit) { return std::ranges::find(kLiftUnits, unit) != std::end(kLiftUnits); }
+std::span<const std::string_view> native_anyway_names() { return kNativeAnyway; }
+bool native_anyway(std::string_view name) { return std::ranges::find(kNativeAnyway, name) != std::end(kNativeAnyway); }
 
-std::map<uint32_t, std::string> load_symbols(const std::string& path) {
+std::optional<Plan> runtime_plan(uint32_t addr, std::string_view name, std::string_view unit) {
+    const Library* lib = library_at(addr);
+    if (!lib) return std::nullopt;
+    if (native_anyway(name)) return Plan::Replace;
+    if (lib->plan == Plan::Lift || lift_anyway(name) || lift_unit(unit)) return Plan::Lift;
+    return lib->plan;
+}
+
+std::map<uint32_t, SymbolInfo> load_symbols(const std::string& path) {
     std::ifstream f(path);
     if (!f) throw std::runtime_error(std::format("cannot open {}", path));
-    std::map<uint32_t, std::string> names;
+    std::map<uint32_t, SymbolInfo> names;
     for (std::string line; std::getline(f, line);) {
-        // name = .section:0xADDRESS; ...
+        // name = .section:0xADDRESS; // ... unit:path
         const size_t eq = line.find(" = ."), colon = line.find(":0x", eq == std::string::npos ? 0 : eq);
         if (eq == std::string::npos || eq == 0 || colon == std::string::npos || colon + 11 > line.size()) continue;
         uint32_t addr = 0;
         const char* first = line.data() + colon + 3;
         const auto [end, ec] = std::from_chars(first, first + 8, addr, 16);
         if (ec != std::errc{} || end != first + 8) continue;
-        names.emplace(addr, line.substr(0, eq));
+        std::string unit;
+        if (const size_t u = line.find(" unit:"); u != std::string::npos) {
+            unit = line.substr(u + 6);
+            unit = unit.substr(0, unit.find_first_of(" \r"));
+        }
+        names.emplace(addr, SymbolInfo{line.substr(0, eq), std::move(unit)});
     }
     if (names.empty()) throw std::runtime_error(std::format("{}: no symbols (expected \"name = .text:0x80001234; ...\")", path));
     return names;

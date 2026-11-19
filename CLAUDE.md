@@ -84,11 +84,14 @@ Before a milestone commit, all of these must hold: tests pass, warnings are clea
 - `OSInit`'s arenas come from low memory that IOS and the apploader fill in. The runtime's values are from `OSInit`'s own defaults and are still to be confirmed with a Dolphin memory dump at the entry point: `tools/analysis/lowmem.py mem1.raw` compares (`docs/runtime.md`).
 - Cross-compile check without Linux or a Mac: `python -m ziglang c++ -target {x86_64,aarch64}-{linux-gnu,macos} ...` with the flags above, per source file. zig's macOS headers lose `DBL_MIN` if `<chrono>` comes first, so the runtime uses `std::numeric_limits`, not the `<cfloat>` macros.
 - `OSLockMutex` and the thread, message and alarm code are bookkeeping on guest structures over `OSDisableInterrupts`, the context switch (`SelectThread`) and the time base. `OSGetCurrentThread` and the SDK's inlined clock macros read low memory.
+- OSThread layout, from the code: context at +0 (SRR0 +408, SRR1 +412, context state +418, GQRs +420, ps1 +456), state +712 (1 ready, 2 running, 4 waiting, 8 moribund), priority +720, queue +732, links +736/+740, stack +772/+776. Low memory: current context 0x800000D4, FPU context 0x800000D8, active list 0x800000DC/E0, current thread 0x800000E4.
+- Disassembly with names: `qilin insns` to a listing, then join with the PAL symbol list (the session used a small script; keep both outside the repo).
+- The decomp's placeholder names (`fn_80038350__Fv`) carry US addresses; the PAL address is in the symbol list.
 - Library split (`docs/code-analysis.md`): lift game/NW4R/MSL/runtime/etc. (74%); replace OS, DVD, GX, AX, pad, WPAD, NAND… (25%); drop MetroTRK/NdevExi2A (1%).
 
 ## Status (v0.12.0)
 
-- Runtime skeleton: `qilin_run` starts the game, runs `OSInit` natively and the static constructors lifted, and stops at `OSInitMutex` (the first replaced function without native code). 22 of 2,135 replaced or dropped functions have native code; 6,031 functions are lifted for the runtime.
+- Runtime: `qilin_run` gets through the static constructors into `main` and stops at the file manager's `DVDInit`. The OS's thread, mutex, message and time units are lifted (by unit, `kLiftUnits`), over a native `SelectThread` with one host thread per guest thread (`threads.cpp`); the switch hasn't been exercised yet (no thread created before the stop). 31 of 2,096 replaced or dropped functions have native code.
 
 - 8,171 functions, all 157 jump tables proven, 98.80% of `.text` reached as code (the rest is identified as padding, dead code or data).
 - 8,103 functions lifted (slices 1, 3 and 4: integer, floating point, paired singles). Left: 56 privileged and 7 FPSCR (replaced libraries), 5 `fres`/`frsqrte`.
@@ -101,8 +104,9 @@ Before a milestone commit, all of these must hold: tests pass, warnings are clea
 
 ## Next steps, in order
 
-1. Get the owner's answer on the proposal in `docs/runtime.md`: lift the OS's thread, mutex, message and alarm units; replace only the interrupt enable, the context switch (`SelectThread` native, one host thread per guest thread under a run lock) and the timers. And the boot information confirmed in Dolphin.
-2. The rest of the runtime, from its to-do list: OS (threads, time, memory, interrupts as the lifted code calls them), then GX on Vulkan (including the FIFO stores), AX, DVD, NAND, input. Exception tables and a timing model as the runtime needs them.
+1. Interrupt delivery at safe points (re-enabling interrupts, idle), in an interrupt context, then the reschedule (`docs/runtime.md`). Then DVD over an extracted disc (Dolphin's Extract Entire Disc; the owner is asked to provide one outside the repo), using the disc's `fst.bin` for entry numbers. The `.wbfs` can't be read: it needs the Wii's disc key.
+2. The boot information confirmed in Dolphin (`lowmem.py`).
+3. The rest of the runtime, from its to-do list: OS (threads, time, memory, interrupts as the lifted code calls them), then GX on Vulkan (including the FIFO stores), AX, DVD, NAND, input. Exception tables and a timing model as the runtime needs them.
 
 ## Conventions
 

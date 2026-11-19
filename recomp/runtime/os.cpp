@@ -40,6 +40,8 @@ QILIN_NATIVE(OSInit) {
     os.initialised = true;
     os.mem1_lo = kMem1ArenaLo, os.mem1_hi = kMem1ArenaHi;
     os.mem2_lo = kMem2ArenaLo, os.mem2_hi = kMem2ArenaHi;
+    // The initialisers of the OS units that are lifted, in OSInit's order.
+    call_guest(c, require_function("__OSThreadInit"));
     os.interrupts = true;  // OSInit ends with OSEnableInterrupts
 }
 

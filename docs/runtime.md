@@ -1,6 +1,6 @@
 # The runtime (roadmap step 3)
 
-Last updated 2026-11-18 (v0.12.0: the skeleton. `qilin_run` starts the game, runs `OSInit` natively and the static constructors as lifted code, and stops at the first replaced function without native code).
+Last updated 2026-11-18 (v0.13.0 in progress: the OS's threads, mutexes, messages and time lifted over a native thread switch; `main` runs up to `DVDInit`. v0.12.0: the skeleton).
 
 ## Building and running
 
@@ -36,9 +36,13 @@ build-rt/qilin_run path/to/main.dol
 
 **Bring-up runs with checked memory.** Lifted code may use MEM1 from the DOL's base up and MEM2. Low memory (the loader's and the OS's globals below `0x80004000`), the uncached mirrors and the hardware registers stop with the address and the instruction, so each one lifted code really uses is found and then provided on purpose. Native code reads and writes guest memory unchecked.
 
-## Native code so far (`recomp/runtime/os.cpp`)
+## Native code so far
 
-22 of the 2,135 replaced and dropped functions: `OSInit` (arenas, interrupts on), `OSDisableInterrupts`/`OSEnableInterrupts`/`OSRestoreInterrupts` (the enable flag the game sees), the twelve arena getters and setters, the cache range functions (nothing to do: guest memory has no caches behind it), `OSRegisterVersion` (the version string, to stderr) and `PPCHalt`.
+31 of the 2,096 replaced and dropped functions:
+
+- `os.cpp`: `OSInit` (arenas, the lifted units' initialisers, interrupts on), `OSDisableInterrupts`/`OSEnableInterrupts`/`OSRestoreInterrupts` (the enable flag the game sees), the twelve arena getters and setters, the cache range functions (nothing to do: guest memory has no caches behind it), `OSRegisterVersion` (the version string, to stderr) and `PPCHalt`.
+- `threads.cpp`: `SelectThread`, `OSSetCurrentContext`, `OSInitContext`.
+- `vi.cpp`: `VIInit`, `VIGetTvFormat`, `VIGetDTVStatus`, and SC's `SCGetProgressiveMode`, `SCGetEuRgb60Mode`, `SCGetAspectRatio`.
 
 ### To confirm: what the loader hands `OSInit`
 
@@ -59,13 +63,27 @@ python3 tools/analysis/lowmem.py path/to/mem1.raw
 
 It prints every low-memory word `OSInit` and `__start` read (arenas, clocks, console type, IOS version, the boot information) next to the runtime's value, and flags the ones that differ. The dump holds the whole game image, so it stays out of git (`*.raw` is ignored).
 
+## Threads (v0.13.0, in progress)
+
+Agreed with the owner on 2026-11-18: the OS's software is lifted, and only what is under it is native.
+
+- **Lifted units** (`kLiftUnits` in `recomp/src/libraries.cpp`, by translation unit, so no PAL addresses are listed): `OSThread.c`, `OSMutex.c`, `OSMessage.c`, `OSTime.c`. None of them has a privileged instruction. The SDK's own code decides which thread runs, with its priorities and queues exactly. From `OSContext.c`, `OSClearContext`, `OSGetCurrentContext` and `OSGetStackPointer` are lifted too.
+- **Native in a lifted unit** (`kNativeAnyway`): `SelectThread`. Lifted, its idle loop would spin forever: it waits, in a loop with no call in it, for an interrupt to make a thread ready.
+- **The switch** (`recomp/runtime/threads.cpp`): `SelectThread` follows the build's own code step by step (run queues, the bitmask of non-empty queues, the reschedule flag, the switch callback, the idle context). Only its context save and load differ. Each guest thread runs on its own host thread, which keeps the guest registers in its own `rt::Context`; a switch hands a run token to the next thread's host thread and waits for its own turn. One guest thread runs at a time, as on the Wii's single core. Host threads rather than fibres or stack switching, to keep the runtime free of platform assembly.
+- **`SelectThread`'s globals are read from its own instructions** at start-up (eight D-form instructions at known offsets: the small-data offsets from `r13` and the two `lis`/`addi` pairs). If they aren't where the supported build has them, `qilin_run` refuses to start.
+- **A new thread** starts on its own host thread the first time it is chosen, with the registers `OSCreateThread` left in its context, at its entry point; when the entry returns, it goes on into `OSExitThread`, as the link register `OSCreateThread` set sends it. A thread that has exited ends its host thread when it switches away. `OSInitContext` is native so that a thread structure reused for a new thread retires the host thread still waiting on the old one.
+- **Idle:** with no thread ready, the original enables interrupts and waits. Until the runtime raises interrupts, that stops the game (`Stop::Idle`), naming the thread that went to sleep last.
+- **Low memory is open to lifted code** under checked memory: the lifted OS keeps its globals there (the current thread at `0x800000E4`, the current context at `0x800000D4`, the active thread list).
+
+**Not exercised yet:** start-up creates no thread and no mutex is contended before the stop below, so the switch has not run yet. The first thread the game creates will exercise it.
+
+### Console settings (`recomp/runtime/console.hpp`)
+
+The game picks its video mode from the console's settings (SC) and VI: 480p when progressive scan is on and the cable allows it, otherwise interlaced by TV format and the 60 Hz setting; 4:3 when the aspect setting is 0. On a Wii these are the owner's system settings. Here they are the runtime's, until the settings file exists: 60 Hz (EuRGB60), progressive, 16:9. **Compare with Dolphin only with the same settings on both sides:** they decide 50 or 60 Hz.
+
 ## Where bring-up stands
 
-The static constructors run until one calls `OSInitMutex`. That function, like `OSLockMutex` and the thread, message-queue and alarm code around it, is bookkeeping on structures in guest memory: it reaches the hardware only through the interrupt enable (`OSDisableInterrupts`, native already), the context switch and the time base.
+`main` runs: the game's init (`VIInit`, the console settings, the video mode) and then its file manager, whose constructor calls `DVDInit`. Next:
 
-**Proposed for the next step (to be agreed, since it moves the lifted/replaced boundary of `code-analysis.md`):**
-
-- **Lift the OS's software units** (mutexes, threads, message queues, alarms, the heap, time conversions) and replace only what is under them: the interrupt enable, the context switch, exceptions, the decrementer and the time base. The SDK's own scheduler then decides which thread runs, with the Wii's priorities and queues exactly, which matters for a rhythm game; and the native code shrinks to the part that can't be lifted (it uses the privileged instructions).
-- **The context switch:** each guest thread gets a host thread, and one run lock lets a single one run at a time (the Wii has one core). `SelectThread`, where the SDK saves one context and loads the next, becomes native: it picks the next thread from the SDK's run queues in guest memory and hands the run lock over. Host threads rather than fibres or hand-written stack switching, to keep the runtime free of platform assembly; a switch costs a few microseconds and the game makes few.
-- **Interrupts** (alarms from the decrementer, later VI retrace and audio) are delivered at safe points: when the game re-enables interrupts, and in the idle loop. Whether lifted loops also need a poll on their back edges is decided when a loop that waits on an interrupt is found.
-- **Low memory** then has to hold what the lifted OS and the game's inlined SDK macros read (the bus and CPU clocks, the current thread, the thread queue): the values in the table above, plus those, confirmed in Dolphin.
+1. **Interrupts**, delivered at safe points: when the game re-enables interrupts, and in the idle loop. The handler runs in an interrupt context (so `SelectThread` doesn't switch inside it), then the reschedule runs, as the SDK's dispatcher does. DVD completion callbacks, alarms (the decrementer), VI retrace and audio all arrive this way.
+2. **DVD over an extracted disc.** Reading the `.wbfs` would need the Wii's disc key, which this project can't include; Dolphin's **Extract Entire Disc** writes the files decrypted. The native DVD layer reads them, using the disc's own `fst.bin` so the game's file entry numbers are the console's.

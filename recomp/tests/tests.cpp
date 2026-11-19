@@ -857,6 +857,15 @@ void test_libraries() {
     CHECK(library_at(0x7FFFFFFFu) == nullptr && library_at(0x801F968Cu) == nullptr);
     CHECK(lift_anyway("exit") && lift_anyway("__init_cpp") && !lift_anyway("OSInit") && !lift_anyway(""));
     for (std::string_view n : lift_anyway_names()) CHECK(lift_anyway(n));
+    for (std::string_view n : lift_unit_names()) CHECK(lift_unit(n));
+    // The runtime's plan: library, then unit, then the exceptions by name.
+    CHECK(runtime_plan(0x80038314u, "main", "Game/main.cpp") == Plan::Lift);
+    CHECK(runtime_plan(0x800DB3A0u, "OSInit", "revolution/os/OS.c") == Plan::Replace);
+    CHECK(runtime_plan(0x800E28B0u, "OSInitMutex", "revolution/os/OSMutex.c") == Plan::Lift);    // a lifted unit
+    CHECK(runtime_plan(0x800E46E0u, "SelectThread", "revolution/os/OSThread.c") == Plan::Replace);  // native in it
+    CHECK(runtime_plan(0x800E81B0u, "exit", "revolution/os/__ppc_eabi_init.c") == Plan::Lift);    // by name
+    CHECK(runtime_plan(0x80115FCCu, "x", "") == Plan::Drop);
+    CHECK(!runtime_plan(0x80006800u, "x", ""));
 
     // The PAL symbol list, as port_symbols.py writes it.
     const auto path = std::filesystem::temp_directory_path() / "qilin_test_symbols.txt";
@@ -868,8 +877,9 @@ void test_libraries() {
              "__save_gpr.part2 = .text:0x80105000; // size:0x4\n";
     }
     const auto names = load_symbols(path.string());
-    CHECK(names.size() == 3 && names.at(0x80038314u) == "main" && names.at(0x80004050u) == "__start");
-    CHECK(names.at(0x80105000u) == "__save_gpr.part2");
+    CHECK(names.size() == 3 && names.at(0x80038314u).name == "main" && names.at(0x80004050u).name == "__start");
+    CHECK(names.at(0x80038314u).unit == "Game/main.cpp" && names.at(0x80004050u).unit.empty());
+    CHECK(names.at(0x80105000u).name == "__save_gpr.part2");
     std::filesystem::remove(path);
     bool threw = false;
     try {
@@ -919,6 +929,9 @@ extern const Symbol g_symbols[] = {{0x80000100u, "alpha"},
                                    {0x80003000u, "twice"},
                                    {0x80003100u, "twice"}};
 extern const size_t g_symbol_count = 5;
+// The function table isn't linked into the tests: native.cpp's call_guest
+// would stop at any call.
+void call(Context&, uint32_t target, uint32_t from) { bad_jump(from, target); }
 }  // namespace qilin::rt
 
 int main() {

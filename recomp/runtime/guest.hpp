@@ -36,8 +36,10 @@ struct Context {
 // runtime can name it and its caller, and the differential test can compare it.
 struct Stop {
     // Unregistered: a replaced function the runtime has no native code for
-    // yet (pc: the function, value: where it was called from).
-    enum Kind : uint32_t { Memory, BadJump, BadReturn, Trap, NotLifted, Unsupported, Unregistered } kind;
+    // yet (pc: the function, value: where it was called from). Idle: no
+    // guest thread can run and nothing would make one ready (pc: the
+    // scheduler, value: the thread that went to sleep last).
+    enum Kind : uint32_t { Memory, BadJump, BadReturn, Trap, NotLifted, Unsupported, Unregistered, Idle } kind;
     uint32_t pc;     // guest address of the instruction (or function)
     uint32_t value;  // the address involved
 };

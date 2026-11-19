@@ -2,7 +2,9 @@
 #include "native.hpp"
 
 #include <algorithm>
+#include <cinttypes>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -58,6 +60,66 @@ void native(Context& c, uint32_t index) {
     if (!fn) throw Stop{Stop::Unregistered, g_natives[index].addr, c.lr};
     fn(c);
     c.ret = c.lr;  // as the function's blr
+}
+
+uint32_t require_function(const char* name) {
+    const uint32_t a = symbol_address(name);
+    if (!a) {
+        std::fprintf(stderr, "qilin_run: the lift has no (or more than one) function named %s\n", name);
+        std::fflush(stderr);
+        std::_Exit(2);
+    }
+    return a;
+}
+
+void call_guest(Context& c, uint32_t fn) {
+    const uint32_t lr = c.lr;
+    call(c, fn, lr);
+    if (c.ret != lr) bad_return(fn, c.ret);
+    c.lr = lr;
+}
+
+namespace {
+void describe(char* out, size_t n, uint32_t addr) {
+    const Symbol* s = symbol_containing(addr);
+    if (!s) std::snprintf(out, n, "%08" PRIX32, addr);
+    else if (s->addr == addr) std::snprintf(out, n, "%08" PRIX32 " (%s)", addr, s->name);
+    else std::snprintf(out, n, "%08" PRIX32 " (%s+0x%" PRIX32 ")", addr, s->name, addr - s->addr);
+}
+}  // namespace
+
+void report_stop(const Stop& s) {
+    char pc[400], value[400];
+    describe(pc, sizeof pc, s.pc);
+    describe(value, sizeof value, s.value);
+    switch (s.kind) {
+    case Stop::Unregistered: {
+        const char* library = "?";
+        for (size_t k = 0; k < g_native_count; ++k)
+            if (g_natives[k].addr == s.pc) library = g_natives[k].library;
+        std::fprintf(stderr, "qilin_run: stopped: no native code yet for %s [%s], called from %s\n", pc, library, value);
+        break;
+    }
+    case Stop::Memory:
+        std::fprintf(stderr, "qilin_run: stopped: access to %08" PRIX32 ", outside the memory lifted code may use, at %s\n",
+                     s.value, pc);
+        break;
+    case Stop::BadJump:
+        std::fprintf(stderr, "qilin_run: stopped: indirect call or jump to %s, which is not a function, at %s\n", value, pc);
+        break;
+    case Stop::BadReturn: std::fprintf(stderr, "qilin_run: stopped: %s returned to %s instead of its caller\n", pc, value); break;
+    case Stop::Trap: std::fprintf(stderr, "qilin_run: stopped: trap at %s\n", pc); break;
+    case Stop::NotLifted: std::fprintf(stderr, "qilin_run: stopped: %s is not lifted\n", pc); break;
+    case Stop::Unsupported:
+        std::fprintf(stderr, "qilin_run: stopped: unsupported at %s (value %08" PRIX32 ")\n", pc, s.value);
+        break;
+    case Stop::Idle:
+        std::fprintf(stderr,
+                     "qilin_run: stopped: no thread can run (the last, %08" PRIX32 ", went to sleep), and nothing the "
+                     "runtime provides yet would wake one\n",
+                     s.value);
+        break;
+    }
 }
 
 const Symbol* symbol_at(uint32_t addr) {

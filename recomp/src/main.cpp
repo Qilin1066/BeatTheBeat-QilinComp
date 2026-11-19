@@ -294,7 +294,7 @@ int cmd_lift(const Args& a) {
     std::string stubs = banner + "#include \"functions.hpp\"\n\nnamespace qilin::gen {\n";
     // --runtime: functions of replaced and dropped libraries call the
     // runtime's native code through rt::native, by index in g_natives.
-    std::map<uint32_t, std::string> names;
+    std::map<uint32_t, SymbolInfo> names;
     if (a.runtime && !a.symbols)
         throw Failure{"lift --runtime needs --symbols <the list tools/analysis/port_symbols.py --symbols-out writes>"};
     if (a.symbols) {
@@ -315,7 +315,7 @@ int cmd_lift(const Args& a) {
         }
         return q + "\"";
     };
-    std::set<std::string_view> lifted_anyway;
+    std::set<std::string> seen_names, seen_units;  // to check the plan's names exist
     std::vector<std::string> chunks;
     size_t index = 0, lifted = 0, failed = 0, skipped = 0, native = 0;
     std::map<std::string, std::vector<uint32_t>> failures;  // reason -> functions
@@ -324,19 +324,20 @@ int cmd_lift(const Args& a) {
         header += std::format("void {}(rt::Context& c);\n", fn_name(start));
         table += std::format("    {{0x{:08X}u, gen::{}}},\n", start, fn_name(start));
         if (a.runtime) {
-            const Library* lib = library_at(start);
-            if (!lib) throw Failure{std::format("function {:08X} is in no library of the plan (libraries.cpp)", start)};
             const auto named = names.find(start);
-            const std::string name = named != names.end() ? named->second : fn_name(start);
+            const std::string name = named != names.end() ? named->second.name : fn_name(start);
+            const std::string unit = named != names.end() ? named->second.unit : "";
+            seen_names.insert(name);
+            seen_units.insert(unit);
+            const auto plan = runtime_plan(start, name, unit);
+            if (!plan) throw Failure{std::format("function {:08X} is in no library of the plan (libraries.cpp)", start)};
             symbols += std::format("    {{0x{:08X}u, {}}},\n", start, quoted(name));
-            if (lib->plan != Plan::Lift && !lift_anyway(name)) {
+            if (*plan != Plan::Lift) {
                 natives += std::format("void {}(rt::Context& c) {{ rt::native(c, {}); }}\n", fn_name(start), native++);
-                native_table += std::format("    {{0x{:08X}u, {}, {}}},\n", start, quoted(name), quoted(lib->name));
+                native_table += std::format("    {{0x{:08X}u, {}, {}}},\n", start, quoted(name),
+                                            quoted(library_at(start)->name));
                 continue;
             }
-            if (lib->plan != Plan::Lift)
-                for (std::string_view n : lift_anyway_names())
-                    if (n == name) lifted_anyway.insert(n);
         }
         const bool wanted = !a.range || (start >= a.range->first && start < a.range->second);
         LiftResult r;
@@ -364,10 +365,16 @@ int cmd_lift(const Args& a) {
     written += update_file(dir / "stubs.cpp", stubs);
     size_t extra = 0;
     if (a.runtime) {
-        for (std::string_view n : lift_anyway_names())
-            if (!lifted_anyway.contains(n))
-                throw Failure{std::format("libraries.cpp lifts {} out of a replaced library, but {} names no such function", n,
-                                          *a.symbols)};
+        // A name in the plan that matches nothing is a mistake (a typo, or a
+        // symbol list from another build): it would silently change nothing.
+        auto check = [&](std::span<const std::string_view> list, const std::set<std::string>& seen, const char* what) {
+            for (std::string_view n : list)
+                if (!seen.contains(std::string(n)))
+                    throw Failure{std::format("libraries.cpp names {} {}, but {} has no such {}", what, n, *a.symbols, what)};
+        };
+        check(lift_anyway_names(), seen_names, "function");
+        check(native_anyway_names(), seen_names, "function");
+        check(lift_unit_names(), seen_units, "unit");
         native_table += "};\nextern const size_t g_native_count = sizeof(g_natives) / sizeof(g_natives[0]);\n"
                         "}  // namespace qilin::rt\n";
         symbols += "};\nextern const size_t g_symbol_count = sizeof(g_symbols) / sizeof(g_symbols[0]);\n"

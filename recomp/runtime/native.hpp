@@ -50,6 +50,18 @@ public:
     NativeRegistration(const char* name, Fn fn);
 };
 
+// The address of a lifted function native code calls by name. A missing or
+// ambiguous name ends the run with a message: the runtime and the lift
+// don't fit together.
+uint32_t require_function(const char* name);
+// Calls a lifted function from native code with the registers in `c`,
+// keeping the native caller's link register (as a `bl` would, from the
+// caller's point of view).
+void call_guest(Context& c, uint32_t fn);
+
+// What stopped the game, with function names, on stderr.
+void report_stop(const Stop& s);
+
 // Joins registrations to g_natives. False, with the reason on stderr, if a
 // registered name isn't a replaced function of this game, is ambiguous, or
 // is registered twice: a replacement that can never run is a mistake.
