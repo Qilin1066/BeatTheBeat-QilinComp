@@ -105,7 +105,7 @@ build-rt/qilin_run path/to/extracted-disc
 | Home | H |
 | D-pad | arrow keys |
 
-Saves go to a per-user folder (`%LOCALAPPDATA%`, `~/Library/Application Support` or `~/.local/share`, under `BeatTheBeat-QilinComp/nand`), or wherever `QILIN_NAND` points. For tests and repeatable runs:
+Saves go to a per-user folder (`%LOCALAPPDATA%`, `~/Library/Application Support` or `~/.local/share`, under `BeatTheBeat-QilinComp/nand`), or wherever `QILIN_NAND` points. The same folder keeps `pipelines.bin`, the compiled shaders, so later runs start without compile stutters. For tests and repeatable runs:
 
 | Variable | Effect |
 |---|---|

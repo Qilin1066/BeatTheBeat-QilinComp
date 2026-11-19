@@ -16,6 +16,7 @@
 
 #include "coherence.hpp"
 #include "interrupts.hpp"
+#include "machine.hpp"
 #include "native.hpp"
 
 namespace qilin::rt {
@@ -43,17 +44,8 @@ struct Nand {
 
 std::filesystem::path default_root() {
     if (const char* p = std::getenv("QILIN_NAND"); p && *p) return p;
-    const std::filesystem::path app = std::filesystem::path("BeatTheBeat-QilinComp") / "nand";
-#if defined(_WIN32)
-    if (const char* p = std::getenv("LOCALAPPDATA"); p && *p) return std::filesystem::path(p) / app;
-#elif defined(__APPLE__)
-    if (const char* p = std::getenv("HOME"); p && *p)
-        return std::filesystem::path(p) / "Library" / "Application Support" / app;
-#else
-    if (const char* p = std::getenv("XDG_DATA_HOME"); p && *p) return std::filesystem::path(p) / app;
-    if (const char* p = std::getenv("HOME"); p && *p) return std::filesystem::path(p) / ".local" / "share" / app;
-#endif
-    return {};
+    const std::filesystem::path dir = user_data_dir();
+    return dir.empty() ? dir : dir / "nand";
 }
 
 void poke_string(uint32_t addr, const std::string& s) {

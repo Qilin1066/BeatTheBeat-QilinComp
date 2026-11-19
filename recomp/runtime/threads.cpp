@@ -61,7 +61,11 @@ struct Host {
     const Context* ctx = nullptr;  // its registers, for report_threads
 };
 std::mutex g_lock;
-std::condition_variable g_cv;
+// Each guest thread's host thread waits on its own condition variable, so a
+// switch wakes only the thread that runs next (one shared one woke every
+// waiting thread on every switch, only for all but one to sleep again).
+// std::map keeps each variable where it is.
+std::map<uint32_t, std::condition_variable> g_turn;
 uint32_t g_running = 0;                // the guest thread whose host thread may run
 std::map<uint32_t, uint32_t> g_gen;    // guest thread -> context generation (OSInitContext bumps it)
 std::map<uint32_t, Host> g_hosts;      // guest thread -> its host thread
@@ -72,7 +76,7 @@ thread_local uint32_t t_self = 0, t_gen = 0;
 // thread whose context was re-initialised for a new thread ends instead.
 void wait_turn() {
     std::unique_lock l(g_lock);
-    g_cv.wait(l, [] { return g_gen[t_self] != t_gen || g_running == t_self; });
+    g_turn[t_self].wait(l, [] { return g_gen[t_self] != t_gen || g_running == t_self; });
     if (g_gen[t_self] != t_gen) throw ThreadEnd{};
 }
 
@@ -147,8 +151,10 @@ void switch_to(uint32_t next) {
             std::thread(host_main, next, gen).detach();
         }
         g_running = next;
+        // Under the lock: the variable's map node is stable, and the next
+        // thread can't miss it (it tests g_running under this lock first).
+        g_turn[next].notify_one();
     }
-    g_cv.notify_all();
     if (self_dead) throw ThreadEnd{};
     wait_turn();
 }
@@ -291,8 +297,9 @@ void report_threads() {
 }
 
 void wait_forever() {
+    static std::condition_variable never;  // nothing notifies it
     std::unique_lock l(g_lock);
-    for (;;) g_cv.wait(l);
+    for (;;) never.wait(l);
 }
 
 QILIN_NATIVE(SelectThread) { c.r[3] = select_thread(c, c.r[3] != 0); }
@@ -328,10 +335,11 @@ QILIN_NATIVE(OSInitContext) {
     poke16(ctx + kCtxState, 0);
     if (ld(kFpuContext) == ctx) poke32(kFpuContext, 0);
     {
+        // A host thread still waiting on the old generation wakes and ends.
         std::lock_guard l(g_lock);
         ++g_gen[ctx];
+        g_turn[ctx].notify_all();
     }
-    g_cv.notify_all();
 }
 
 }  // namespace qilin::rt

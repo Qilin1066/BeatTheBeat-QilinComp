@@ -49,16 +49,21 @@ void report_profile() {
     std::fprintf(stderr, "qilin_run: profile: %.1f s of CPU in %.1f s (%.0f%% of one core)\n", cpu, wall,
                  wall > 0 ? 100.0 * cpu / wall : 0.0);
     static const char* const names[] = {"draws (all of each, textures included)", "  of which textures (check, decode)",
-                                        "frames (copy, submit, present)", "the mixer"};
+                                        "  of which new pipelines (compiles)", "frames (copy, submit, present)", "the mixer"};
     double sections = 0;
     for (unsigned i = 0; i < static_cast<unsigned>(Section::Count); ++i) {
         const double s = double(g_section_ns[i].load()) / 1e9;
         const uint64_t n = g_section_calls[i].load();
-        if (static_cast<Section>(i) != Section::Texture) sections += s;  // inside draws
+        const auto sec = static_cast<Section>(i);
+        if (sec != Section::Texture && sec != Section::Pipeline) sections += s;  // those are inside draws
         std::fprintf(stderr, "qilin_run:          %-38s %7.2f s  %9llu calls  %7.1f us each\n", names[i], s,
                      static_cast<unsigned long long>(n), n ? s * 1e6 / double(n) : 0.0);
     }
     std::fprintf(stderr, "qilin_run:          %-38s %7.2f s\n", "the rest (lifted code, OS, waits' CPU)", cpu - sections);
+    if (g_gpu_frames)
+        std::fprintf(stderr, "qilin_run:          the GPU: %.3f ms a frame on average, %.3f ms at most (%llu frames)\n",
+                     double(g_gpu_ns) / double(g_gpu_frames) / 1e6, double(g_gpu_max_ns) / 1e6,
+                     static_cast<unsigned long long>(g_gpu_frames));
     std::fprintf(stderr,
                  "qilin_run:          a frame's peak use: %llu KB of vertices, %llu KB of uniforms, %llu KB of texture "
                  "uploads, %llu descriptor sets\n",

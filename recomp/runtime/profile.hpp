@@ -12,7 +12,7 @@
 
 namespace qilin::rt {
 
-enum class Section : unsigned { Draw, Texture, Present, Mixer, Count };
+enum class Section : unsigned { Draw, Texture, Pipeline, Present, Mixer, Count };
 
 bool profiling();
 inline std::atomic<uint64_t> g_section_ns[static_cast<unsigned>(Section::Count)];
@@ -45,6 +45,13 @@ inline void note_ring_peaks(uint64_t vtx, uint64_t ubo, uint64_t upload, uint64_
     if (ubo > g_peak_uniform_bytes) g_peak_uniform_bytes = ubo;
     if (upload > g_peak_upload_bytes) g_peak_upload_bytes = upload;
     if (sets > g_peak_sets) g_peak_sets = sets;
+}
+
+// The GPU's time for each frame (timestamp queries; the renderer's frames).
+inline uint64_t g_gpu_frames = 0, g_gpu_ns = 0, g_gpu_max_ns = 0;
+inline void note_gpu_frame(uint64_t ns) {
+    ++g_gpu_frames, g_gpu_ns += ns;
+    if (ns > g_gpu_max_ns) g_gpu_max_ns = ns;
 }
 
 // The profile so far, on stderr (with the stop or time-limit report).

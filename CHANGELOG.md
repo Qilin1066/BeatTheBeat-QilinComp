@@ -16,6 +16,9 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
   - Textures follow the console's coherency rule (`coherence.*`): a texture is re-checked only when the game flushed or DMA wrote a page under it (`DC*` natives, lifted `dcbf`/`dcbst` through `rt::cache_store`, disc and NAND reads), then hashed once. Texture checks went from 102 µs to 0.3 µs a draw.
   - The renderer's rings and descriptor pools start small and grow on demand (spilling, then resizing): about 20 MB of host-visible memory reserved instead of about 210 MB, which matters where the GPU shares the CPU's memory.
   - `-DQILIN_RUNTIME_CHECKED=OFF` builds without checked memory (half the lifted code's time); the default stays checked for bring-up. `-DQILIN_LTO=ON` builds with link-time optimisation (no measurable gain at the title).
+  - **The TEV shader is specialised per configuration** (specialisation constants: the driver compiles straight-line code for each, a pipeline each): GPU time 2.18 → 0.61 ms a frame at the title, the same picture (frame statistics identical). The pipeline cache is kept on disk (`pipelines.bin` in the per-user folder), so later runs don't compile again: first use of a configuration 45 ms without it, 0.1 ms with it.
+  - **A thread switch wakes only the next thread** (a condition variable per guest thread): about 9% less CPU.
+  - The profile measures GPU time per frame (timestamp queries) and pipeline compiles.
 
 ### Fixed
 From a full review of the runtime (three independent reads, each finding checked against the code before fixing):

@@ -4,6 +4,7 @@
 #pragma once
 
 #include <cstdint>
+#include <filesystem>
 
 #include "guest.hpp"
 
@@ -15,6 +16,11 @@ inline constexpr uint32_t kMem2 = 0x90000000u, kMem2Bytes = 64u << 20;
 // Reserves the guest address space and commits MEM1 and MEM2, zeroed. Sets
 // g_mem; false if the host refuses.
 bool map_guest_memory();
+// The runtime's per-user folder (BeatTheBeat-QilinComp under the platform's
+// application data: %LOCALAPPDATA%, ~/Library/Application Support,
+// $XDG_DATA_HOME or ~/.local/share): saves, the pipeline cache. Never the
+// repository. Empty if the platform gives none.
+std::filesystem::path user_data_dir();
 
 // Host timers fine enough for the audio clock's 3 ms (Windows: 1 ms
 // resolution; elsewhere the default already is).

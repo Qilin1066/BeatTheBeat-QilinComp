@@ -27,12 +27,16 @@
 #include <vulkan/vulkan.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <bit>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <unordered_map>
 #include <vector>
 
@@ -74,7 +78,8 @@ namespace {
     X(vkCmdBindVertexBuffers) X(vkCmdDraw) X(vkCmdSetViewport) X(vkCmdSetScissor) X(vkCmdSetCullMode)               \
     X(vkCmdSetFrontFace) X(vkCmdSetDepthTestEnable) X(vkCmdSetDepthWriteEnable) X(vkCmdSetDepthCompareOp)           \
     X(vkCmdBlitImage) X(vkCmdCopyBufferToImage) X(vkCmdClearAttachments) X(vkCmdClearColorImage) X(vkCmdPushConstants)    \
-    X(vkCmdClearDepthStencilImage) X(vkDestroyBuffer)                                                                \
+    X(vkCmdClearDepthStencilImage) X(vkDestroyBuffer) X(vkCreateQueryPool) X(vkCmdResetQueryPool)                    \
+    X(vkCmdWriteTimestamp2) X(vkGetQueryPoolResults) X(vkCreatePipelineCache) X(vkGetPipelineCacheData)              \
     X(vkCmdCopyImageToBuffer)
 
 PFN_vkGetInstanceProcAddr vkGetInstanceProcAddr = nullptr;
@@ -118,17 +123,35 @@ struct GpuVertex {
     float col0[4], col1[4];
     float tex[8][3];
 };
-// The fragment shader's uniform block (shaders/gx.frag), std140.
+// The fragment shader's uniform block (shaders/gx.frag), std140: what
+// changes from draw to draw.
 struct DrawBlock {
     int32_t regs[4][4];
     int32_t konst[4][4];
-    uint32_t swaps[4][4];
-    uint32_t misc[4];
-    uint32_t stages[48][4];
-    uint32_t fog[4];
+    uint32_t misc[4];  // alpha refs, destination alpha, fog colour
     float fog_abc[4];
     float depth_range[4];
     uint32_t tcscale[8][4];
+};
+// The fragment shader's specialisation constants (shaders/gx.frag): the
+// TEV configuration, constant ids 0-68.
+constexpr unsigned kSpecStages = 0, kSpecStage0 = 1, kSpecSwaps = 65, kSpecAlphaCompare = 66, kSpecFog = 67,
+                   kSpecFlags = 68, kSpecCount = 69;
+struct Spec {
+    std::array<uint32_t, kSpecCount> v{};
+};
+// A pipeline: its blending and write masks, and the TEV configuration.
+struct PipelineKey {
+    uint32_t blend = 0;
+    Spec spec;
+    bool operator==(const PipelineKey& o) const { return blend == o.blend && spec.v == o.spec.v; }
+};
+struct PipelineKeyHash {
+    size_t operator()(const PipelineKey& k) const {
+        uint64_t h = 0xCBF29CE484222325ull ^ k.blend;
+        for (uint32_t w : k.spec.v) h = (h ^ w) * 0x100000001B3ull;
+        return static_cast<size_t>(h);
+    }
 };
 // The copy shader's push constants (shaders/copy.*).
 struct CopyBlock {
@@ -174,6 +197,7 @@ struct Frame {
     Ring vtx, ubo, upload;
     Buffer readback;
     uint32_t sets = 0;
+    bool timed = false;  // its command buffer wrote the two GPU timestamps (QILIN_PROFILE)
 };
 // A decoded texture: valid while nothing was written over its bytes (or its
 // TLUT's) since `validated` (coherence.hpp); then hashed once, and decoded
@@ -211,7 +235,9 @@ struct Vk {
     VkDescriptorSetLayout set_layout = VK_NULL_HANDLE;
     VkPipelineLayout layout = VK_NULL_HANDLE;
     VkShaderModule vert = VK_NULL_HANDLE, frag = VK_NULL_HANDLE;
-    std::unordered_map<uint32_t, VkPipeline> pipelines;
+    std::unordered_map<PipelineKey, VkPipeline, PipelineKeyHash> pipelines;
+    VkPipelineCache pipeline_cache = VK_NULL_HANDLE;  // kept on disk (save_pipeline_cache)
+    bool pipeline_cache_dirty = false;
     std::unordered_map<uint64_t, VkSampler> samplers;
     std::unordered_map<uint64_t, Texture> textures;
     // copies from the EFB to textures (shaders/copy.*)
@@ -220,6 +246,9 @@ struct Vk {
     VkShaderModule copy_vert = VK_NULL_HANDLE, copy_frag = VK_NULL_HANDLE;
     VkPipeline copy_pipeline = VK_NULL_HANDLE;
     VkSampler efb_sampler = VK_NULL_HANDLE;
+    // GPU time per frame (QILIN_PROFILE): two timestamps per frame slot.
+    VkQueryPool timestamps = VK_NULL_HANDLE;
+    double timestamp_ns = 0;  // nanoseconds per timestamp tick
     Image blank;  // what unused texture maps sample
     std::vector<std::pair<uint64_t, Image>> garbage;  // images to free once their frame is done
 } g;
@@ -408,13 +437,71 @@ uint32_t pipeline_key(const State& s) {
            uint32_t(s.alpha_update) << 9;
 }
 
-VkPipeline pipeline(uint32_t key) {
-    if (auto it = g.pipelines.find(key); it != g.pipelines.end()) return it->second;
-    const uint32_t type = key & 3;
+// The pipeline cache on disk (pipelines.bin in the per-user folder): what
+// the driver compiled for each TEV configuration, so a later run doesn't
+// compile them again on first use. Used only if its header names this
+// GPU and driver (Vulkan's cache header: size, version 1, vendor, device,
+// the driver's cache UUID).
+std::filesystem::path pipeline_cache_path() {
+    const std::filesystem::path dir = user_data_dir();
+    return dir.empty() ? dir : dir / "pipelines.bin";
+}
+
+void create_pipeline_cache() {
+    std::vector<uint8_t> data;
+    if (const std::filesystem::path path = pipeline_cache_path(); !path.empty()) {
+        std::ifstream f(path, std::ios::binary);
+        data.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+    }
+    VkPhysicalDeviceProperties props;
+    vkGetPhysicalDeviceProperties(g.gpu, &props);
+    auto u32 = [&](size_t o) {
+        uint32_t v;
+        std::memcpy(&v, data.data() + o, 4);
+        return v;
+    };
+    const bool ours = data.size() >= 32 && u32(0) >= 32 && u32(4) == VK_PIPELINE_CACHE_HEADER_VERSION_ONE &&
+                      u32(8) == props.vendorID && u32(12) == props.deviceID &&
+                      std::memcmp(data.data() + 16, props.pipelineCacheUUID, VK_UUID_SIZE) == 0;
+    VkPipelineCacheCreateInfo ci = vk_struct<VkPipelineCacheCreateInfo>(VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO);
+    if (ours) ci.initialDataSize = data.size(), ci.pInitialData = data.data();
+    vk_check(vkCreatePipelineCache(g.device, &ci, nullptr, &g.pipeline_cache), "vkCreatePipelineCache");
+}
+
+// Writes the cache out when it has new pipelines (through a temporary file,
+// so a crash mid-write leaves the old one).
+void save_pipeline_cache() {
+    if (!g.pipeline_cache_dirty) return;
+    g.pipeline_cache_dirty = false;
+    const std::filesystem::path path = pipeline_cache_path();
+    if (path.empty()) return;
+    size_t size = 0;
+    if (vkGetPipelineCacheData(g.device, g.pipeline_cache, &size, nullptr) != VK_SUCCESS || size == 0) return;
+    std::vector<uint8_t> data(size);
+    if (vkGetPipelineCacheData(g.device, g.pipeline_cache, &size, data.data()) != VK_SUCCESS) return;
+    std::error_code ec;
+    std::filesystem::create_directories(path.parent_path(), ec);
+    const std::filesystem::path tmp = path.string() + ".tmp";
+    {
+        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+        f.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(size));
+        if (!f) return;
+    }
+    std::filesystem::rename(tmp, path, ec);
+}
+
+VkPipeline pipeline(const PipelineKey& pk) {
+    if (auto it = g.pipelines.find(pk); it != g.pipelines.end()) return it->second;
+    const Timed timed(Section::Pipeline);
+    const uint32_t key = pk.blend, type = key & 3;
+    VkSpecializationMapEntry entries[kSpecCount];
+    for (uint32_t i = 0; i < kSpecCount; ++i) entries[i] = {i, 4 * i, 4};
+    VkSpecializationInfo spec{kSpecCount, entries, sizeof pk.spec.v, pk.spec.v.data()};
     VkPipelineShaderStageCreateInfo stages[2]{};
     stages[0].sType = stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT, stages[0].module = g.vert, stages[0].pName = "main";
     stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT, stages[1].module = g.frag, stages[1].pName = "main";
+    stages[1].pSpecializationInfo = &spec;
 
     VkVertexInputBindingDescription binding{0, sizeof(GpuVertex), VK_VERTEX_INPUT_RATE_VERTEX};
     VkVertexInputAttributeDescription attrs[11];
@@ -465,8 +552,9 @@ VkPipeline pipeline(uint32_t key) {
     pi.pViewportState = &vp, pi.pRasterizationState = &rs, pi.pMultisampleState = &ms, pi.pDepthStencilState = &ds;
     pi.pColorBlendState = &cb, pi.pDynamicState = &dy, pi.layout = g.layout;
     VkPipeline p;
-    vk_check(vkCreateGraphicsPipelines(g.device, VK_NULL_HANDLE, 1, &pi, nullptr, &p), "vkCreateGraphicsPipelines");
-    g.pipelines.emplace(key, p);
+    vk_check(vkCreateGraphicsPipelines(g.device, g.pipeline_cache, 1, &pi, nullptr, &p), "vkCreateGraphicsPipelines");
+    g.pipelines.emplace(pk, p);
+    g.pipeline_cache_dirty = true;
     return p;
 }
 
@@ -591,6 +679,13 @@ void begin_frame() {
     vk_check(vkWaitForFences(g.device, 1, &f.fence, VK_TRUE, UINT64_MAX), "vkWaitForFences");
     vk_check(vkResetFences(g.device, 1, &f.fence), "vkResetFences");
     for (VkDescriptorPool p : f.pools) vk_check(vkResetDescriptorPool(g.device, p, 0), "vkResetDescriptorPool");
+    if (f.timed) {  // that frame's GPU work is done (its fence): read how long it took
+        uint64_t ts[2] = {};
+        if (vkGetQueryPoolResults(g.device, g.timestamps, g.frame * 2, 2, sizeof ts, ts, sizeof ts[0], VK_QUERY_RESULT_64_BIT) ==
+            VK_SUCCESS)
+            note_gpu_frame(static_cast<uint64_t>(double(ts[1] - ts[0]) * g.timestamp_ns));
+        f.timed = false;
+    }
     note_ring_peaks(f.vtx.demand, f.ubo.demand, f.upload.demand, f.sets);
     reset(f.vtx), reset(f.ubo), reset(f.upload);
     f.pool = 0, f.sets = 0;
@@ -613,6 +708,10 @@ void begin_frame() {
     vk_check(vkResetCommandBuffer(f.cb, 0), "vkResetCommandBuffer");
     vk_check(vkBeginCommandBuffer(f.cb, &bi), "vkBeginCommandBuffer");
     g.recording = true;
+    if (g.timestamps) {
+        vkCmdResetQueryPool(f.cb, g.timestamps, g.frame * 2, 2);
+        vkCmdWriteTimestamp2(f.cb, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, g.timestamps, g.frame * 2);
+    }
 }
 
 void end_rendering() {
@@ -1030,21 +1129,25 @@ void transform(const State& s, const InVertex& in, GpuVertex& out) {
     }
 }
 
-// ---- the draw's uniform block ----
-void pack_draw(const State& s, DrawBlock& b) {
+// ---- a draw's configuration and uniform block ----
+// The TEV configuration goes to the specialisation constants (shaders/
+// gx.frag: a pipeline each, its selectors folded away); what changes from
+// draw to draw goes to the uniform block.
+void pack_draw(const State& s, DrawBlock& b, Spec& k) {
     std::memset(&b, 0, sizeof b);
+    k = Spec{};
     for (unsigned i = 0; i < 4; ++i) {
         const ColorS10& r = s.tev_color[i];
         b.regs[i][0] = r.r, b.regs[i][1] = r.g, b.regs[i][2] = r.b, b.regs[i][3] = r.a;
-        const Color& k = s.kcolor[i];
-        b.konst[i][0] = k.r, b.konst[i][1] = k.g, b.konst[i][2] = k.b, b.konst[i][3] = k.a;
-        for (unsigned c = 0; c < 4; ++c) b.swaps[i][c] = s.swap_table[i][c];
+        const Color& kc = s.kcolor[i];
+        b.konst[i][0] = kc.r, b.konst[i][1] = kc.g, b.konst[i][2] = kc.b, b.konst[i][3] = kc.a;
+        for (unsigned c = 0; c < 4; ++c) k.v[kSpecSwaps] |= uint32_t(s.swap_table[i][c] & 3) << (i * 8 + c * 2);
     }
-    b.misc[0] = s.num_tev_stages;
-    b.misc[1] = uint32_t(s.alpha_comp0 & 7) | uint32_t(s.alpha_comp1 & 7) << 3 | uint32_t(s.alpha_op & 3) << 6;
-    b.misc[2] = uint32_t(s.alpha_ref0) | uint32_t(s.alpha_ref1) << 8;
+    k.v[kSpecStages] = s.num_tev_stages;
+    k.v[kSpecAlphaCompare] = uint32_t(s.alpha_comp0 & 7) | uint32_t(s.alpha_comp1 & 7) << 3 | uint32_t(s.alpha_op & 3) << 6;
+    b.misc[0] = uint32_t(s.alpha_ref0) | uint32_t(s.alpha_ref1) << 8;
     // APPROX: destination alpha only where blending doesn't read the source's.
-    if (s.dst_alpha_enable && s.blend_type != 1) b.misc[3] = 1u | uint32_t(s.dst_alpha) << 8;
+    if (s.dst_alpha_enable && s.blend_type != 1) k.v[kSpecFlags] |= 1u, b.misc[1] = s.dst_alpha;
     // Fog (GXSetFog's start, end, near and far): with the depth zs from 0
     // at near to 1 at far, the distance into the fog (eye distance - start) /
     // (end - start) is A / (B - zs) - C in perspective (A = far * near /
@@ -1057,8 +1160,8 @@ void pack_draw(const State& s, DrawBlock& b) {
             unsupported("a fog type", s.fog_type);
         const float n = s.fog_near, fr = s.fog_far, range = s.fog_end - s.fog_start;
         if (range == 0.0f || fr == n) unsupported("fog with an empty range", 0);
-        b.fog[0] = s.fog_type;
-        b.fog[1] = uint32_t(s.fog_color.r) | uint32_t(s.fog_color.g) << 8 | uint32_t(s.fog_color.b) << 16;
+        k.v[kSpecFog] = s.fog_type;
+        b.misc[2] = uint32_t(s.fog_color.r) | uint32_t(s.fog_color.g) << 8 | uint32_t(s.fog_color.b) << 16;
         if (s.fog_type & 8) {
             b.fog_abc[0] = (fr - n) / range, b.fog_abc[2] = (s.fog_start - n) / range;
         } else {
@@ -1067,7 +1170,10 @@ void pack_draw(const State& s, DrawBlock& b) {
     }
     b.depth_range[0] = std::clamp(s.viewport[4], 0.0f, 1.0f), b.depth_range[1] = std::clamp(s.viewport[5], 0.0f, 1.0f);
     for (unsigned i = 0; i < 8; ++i)
-        if (s.tex_scale_manual[i]) b.tcscale[i][0] = 1, b.tcscale[i][1] = s.tex_scale_s[i], b.tcscale[i][2] = s.tex_scale_t[i];
+        if (s.tex_scale_manual[i]) {
+            k.v[kSpecFlags] |= 1u << (8 + i);
+            b.tcscale[i][1] = s.tex_scale_s[i], b.tcscale[i][2] = s.tex_scale_t[i];
+        }
     for (unsigned i = 0; i < s.num_tev_stages; ++i) {
         const TevStage& t = s.tev[i];
         // Indirect texturing changes a stage's coordinates only through a
@@ -1085,26 +1191,24 @@ void pack_draw(const State& s, DrawBlock& b) {
         if (t.kalpha_sel > 31 || (t.kalpha_sel >= 8 && t.kalpha_sel < 16)) unsupported("a TEV konst alpha selection", t.kalpha_sel);
         if (t.color_op > 15 || (t.color_op >= 2 && t.color_op < 8)) unsupported("a TEV colour op", t.color_op);
         if (t.alpha_op > 15 || (t.alpha_op >= 2 && t.alpha_op < 8)) unsupported("a TEV alpha op", t.alpha_op);
+        if (t.channel == 7 || t.channel == 8) unsupported("a bump alpha channel", t.channel);
         if (t.channel != 4 && t.channel != 5 && t.channel != 6 && t.channel != 0xFF) unsupported("a TEV raster channel", t.channel);
         if ((t.coord != 0xFF && t.coord >= 8) || (t.map != 0xFF && t.map >= 8)) unsupported("a TEV coordinate or map", t.coord);
         if (t.color_out > 3 || t.alpha_out > 3) unsupported("a TEV output register", t.color_out);
-        uint32_t* c = b.stages[i * 3];
-        uint32_t* a = b.stages[i * 3 + 1];
-        uint32_t* o = b.stages[i * 3 + 2];
-        c[0] = uint32_t(t.color_in[0]) | uint32_t(t.color_in[1]) << 4 | uint32_t(t.color_in[2]) << 8 | uint32_t(t.color_in[3]) << 12;
-        c[1] = uint32_t(t.color_op) | uint32_t(t.color_bias) << 4 | uint32_t(t.color_scale) << 6 |
-               uint32_t(t.color_clamp) << 8 | uint32_t(t.color_out) << 9;
-        c[2] = t.kcolor_sel, c[3] = uint32_t(t.ras_swap) | uint32_t(t.tex_swap) << 2;
-        a[0] = uint32_t(t.alpha_in[0]) | uint32_t(t.alpha_in[1]) << 4 | uint32_t(t.alpha_in[2]) << 8 | uint32_t(t.alpha_in[3]) << 12;
-        a[1] = uint32_t(t.alpha_op) | uint32_t(t.alpha_bias) << 4 | uint32_t(t.alpha_scale) << 6 |
-               uint32_t(t.alpha_clamp) << 8 | uint32_t(t.alpha_out) << 9;
+        const uint32_t color_op = uint32_t(t.color_op) | uint32_t(t.color_bias) << 4 | uint32_t(t.color_scale) << 6 |
+                                  uint32_t(t.color_clamp) << 8 | uint32_t(t.color_out) << 9;
+        const uint32_t alpha_op = uint32_t(t.alpha_op) | uint32_t(t.alpha_bias) << 4 | uint32_t(t.alpha_scale) << 6 |
+                                  uint32_t(t.alpha_clamp) << 8 | uint32_t(t.alpha_out) << 9;
         const bool textured = t.map != 0xFF && t.coord != 0xFF && !t.tex_disabled;
-        o[0] = textured ? (t.map & 7u) : 255u, o[1] = textured ? (t.coord & 7u) : 0u;
-        o[2] = t.channel, o[3] = t.kalpha_sel;
-        if (t.channel == 7 || t.channel == 8) unsupported("a bump alpha channel", t.channel);
+        uint32_t* w = &k.v[kSpecStage0 + 4 * i];
+        w[0] = uint32_t(t.color_in[0]) | uint32_t(t.color_in[1]) << 4 | uint32_t(t.color_in[2]) << 8 |
+               uint32_t(t.color_in[3]) << 12 | color_op << 16;
+        w[1] = uint32_t(t.alpha_in[0]) | uint32_t(t.alpha_in[1]) << 4 | uint32_t(t.alpha_in[2]) << 8 |
+               uint32_t(t.alpha_in[3]) << 12 | alpha_op << 16;
+        w[2] = (textured ? (t.map & 7u) : 255u) | (textured ? (t.coord & 7u) : 0u) << 8 | uint32_t(t.channel) << 16;
+        w[3] = uint32_t(t.kcolor_sel) | uint32_t(t.kalpha_sel) << 8 | uint32_t(t.ras_swap & 3) << 16 | uint32_t(t.tex_swap & 3) << 18;
     }
 }
-
 // ---- the sink ----
 class Renderer final : public Sink {
 public:
@@ -1263,8 +1367,9 @@ void Renderer::draw(const State& s, const Draw& d) {
     }
 
     DrawBlock block;
-    pack_draw(s, block);
-    const uint32_t key = pipeline_key(s);
+    PipelineKey key;
+    pack_draw(s, block, key.spec);
+    key.blend = pipeline_key(s);
     VkImageView views[8];
     VkSampler samps[8];
     for (unsigned m = 0; m < 8; ++m) views[m] = g.blank.view, samps[m] = sampler(0);
@@ -1389,6 +1494,10 @@ void Renderer::copy_display(const State& s, uint32_t, bool clear) {
         vkCmdCopyImageToBuffer(cb, g.efb_color.img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, f.readback.buf, 1, &region);
     }
     if (clear) clear_efb(s, s.disp_src);
+    if (g.timestamps) {
+        vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, g.timestamps, g.frame * 2 + 1);
+        f.timed = true;
+    }
     vk_check(vkEndCommandBuffer(cb), "vkEndCommandBuffer");
     VkCommandBufferSubmitInfo cbi = vk_struct<VkCommandBufferSubmitInfo>(VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO);
     cbi.commandBuffer = cb;
@@ -1432,6 +1541,7 @@ void Renderer::copy_display(const State& s, uint32_t, bool clear) {
     }
     g.frame = (g.frame + 1) % kFrames;
     ++g.frame_number;
+    if (g.frame_number % 300 == 0) save_pipeline_cache();  // every 5 s, when there are new pipelines
 }
 
 // ---- start-up ----
@@ -1544,7 +1654,22 @@ bool create_resources() {
     vk_check(vkCreatePipelineLayout(g.device, &pl, nullptr, &g.layout), "vkCreatePipelineLayout");
     g.vert = shader(k_gx_vert, sizeof k_gx_vert);
     g.frag = shader(k_gx_frag, sizeof k_gx_frag);
+    create_pipeline_cache();
     create_copy_pipeline();
+    if (profiling()) {  // GPU time per frame, where the queue can stamp time
+        uint32_t qn = 0;
+        vkGetPhysicalDeviceQueueFamilyProperties(g.gpu, &qn, nullptr);
+        std::vector<VkQueueFamilyProperties> qs(qn);
+        vkGetPhysicalDeviceQueueFamilyProperties(g.gpu, &qn, qs.data());
+        VkPhysicalDeviceProperties props;
+        vkGetPhysicalDeviceProperties(g.gpu, &props);
+        if (qs[g.family].timestampValidBits >= 32 && props.limits.timestampPeriod > 0) {
+            VkQueryPoolCreateInfo qi = vk_struct<VkQueryPoolCreateInfo>(VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO);
+            qi.queryType = VK_QUERY_TYPE_TIMESTAMP, qi.queryCount = 2 * kFrames;
+            vk_check(vkCreateQueryPool(g.device, &qi, nullptr, &g.timestamps), "vkCreateQueryPool");
+            g.timestamp_ns = props.limits.timestampPeriod;
+        }
+    }
 
     // The first frame: the EFB starts black (what GX's memory holds after
     // the SDK's start-up clears is the game's business), the blank texture

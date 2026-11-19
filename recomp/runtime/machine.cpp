@@ -1,6 +1,7 @@
 #include "machine.hpp"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 #if defined(_WIN32)
@@ -18,6 +19,19 @@ void fine_timers() {
     // audio clock needs 3 ms (the setting lasts until the process exits).
     timeBeginPeriod(1);
 #endif
+}
+
+std::filesystem::path user_data_dir() {
+    const std::filesystem::path app = "BeatTheBeat-QilinComp";
+#if defined(_WIN32)
+    if (const char* p = std::getenv("LOCALAPPDATA"); p && *p) return std::filesystem::path(p) / app;
+#elif defined(__APPLE__)
+    if (const char* p = std::getenv("HOME"); p && *p) return std::filesystem::path(p) / "Library" / "Application Support" / app;
+#else
+    if (const char* p = std::getenv("XDG_DATA_HOME"); p && *p) return std::filesystem::path(p) / app;
+    if (const char* p = std::getenv("HOME"); p && *p) return std::filesystem::path(p) / ".local" / "share" / app;
+#endif
+    return {};
 }
 
 bool map_guest_memory() {
