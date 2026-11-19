@@ -208,8 +208,10 @@ void report_stats() {
                  s.switches, s.threads_started, s.interrupts, s.decrementer, s.files_opened, s.bytes_read);
     std::fprintf(stderr,
                  "qilin_run:          %" PRIu64 " draws (%" PRIu64 " vertices), %" PRIu64 " frames copied out, %" PRIu64
-                 " copies to textures, %" PRIu64 " retraces, %" PRIu64 " audio frames\n",
-                 s.draws, s.vertices, s.display_copies, s.texture_copies, s.retraces, s.audio_frames);
+                 " copies to textures, %" PRIu64 " retraces, %" PRIu64 " audio frames (%" PRIu64
+                 " voice frames mixed), %" PRIu64 " remotes connected\n",
+                 s.draws, s.vertices, s.display_copies, s.texture_copies, s.retraces, s.audio_frames, s.voice_frames,
+                 s.remotes_connected);
     std::fprintf(stderr,
                  "qilin_run:          %" PRIu64 " periodic interrupts dropped (late by a period); deliveries: %" PRIu64
                  " when idle, %" PRIu64 " in running code\n",

@@ -13,6 +13,7 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ### Added
 - **A scripted Wii Remote** (`QILIN_INPUT`, `recomp/runtime/input.*`): a virtual remote on channel 0 presses buttons on a schedule for headless, repeatable runs. WPAD drives KPAD as KPAD's code expects (connect callback, then sampling callbacks at the report rate, `WPADRead`'s status), with the data format, pointer control and the remote speaker's control protocol; no motion or pointer data is made up. With it, A at the title takes the game to its first sound.
+- **The DSP mixer** (`recomp/runtime/audio.cpp`): AX's command list carried out in full, read from AX's and NW4R's code. Exact where game logic looks (play positions, loops and ends, DSP-ADPCM with its loop context, envelope and mix ramps, aux round trips, the write-back AX reads); approximations marked in the code (the polyphase resampler, the compressor); unsupported features stop. `QILIN_AUDIO_DUMP=<file.wav>` records what AI plays.
 
 ## [0.15.0] - 2026-11-19
 The game runs: it initialises completely, saves on first boot, reaches its title scene and keeps running, a frame copied out on every retrace, with the audio clock at the console's rate. Nothing is shown or heard yet (headless GX; the DSP stops at the first voice), and with no remote connected the game waits at its title.
