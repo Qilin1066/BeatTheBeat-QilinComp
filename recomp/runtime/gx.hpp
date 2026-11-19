@@ -160,7 +160,6 @@ struct State {
     uint8_t line_tex_offset = 0, point_tex_offset = 0;
     // textures
     std::array<TexMap, 8> tex{};
-    uint64_t tex_loads = 0;  // texture and TLUT loads and invalidations so far: the renderer re-checks after one
     std::array<Tlut, 20> tlut{};
     // copies
     Color clear_color;

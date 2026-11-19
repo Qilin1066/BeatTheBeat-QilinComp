@@ -14,6 +14,7 @@
 #include <map>
 #include <string>
 
+#include "coherence.hpp"
 #include "interrupts.hpp"
 #include "native.hpp"
 
@@ -171,6 +172,7 @@ QILIN_NATIVE(NANDRead) {
     require_guest_range(c.r[4], c.r[5], c.lr - 4, "NANDRead's buffer");
     f->stream.clear();
     f->stream.read(reinterpret_cast<char*>(g_mem + c.r[4]), c.r[5]);
+    note_guest_write(c.r[4], c.r[5]);  // DMA (IOS writes memory directly)
     const auto n = static_cast<uint32_t>(f->stream.gcount());
     f->stream.clear();
     c.r[3] = n;

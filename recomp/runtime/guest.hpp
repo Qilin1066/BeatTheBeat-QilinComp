@@ -524,6 +524,10 @@ inline bool poll_due() {
 // nothing (the differential test). The lifter stores the loop's stack
 // pointer first, so handlers build their frames below it.
 void poll(Context& c);
+// dcbf and dcbst: a cache line written back to memory, which the GPU may
+// now read (the runtime records it for the renderer's caches,
+// coherence.hpp; the differential test does nothing).
+void cache_store(uint32_t ea);
 // Call the lifted function at a guest address (bctrl, bctr, blrl). Unknown
 // targets stop with BadJump.
 void call(Context& c, uint32_t target, uint32_t from);

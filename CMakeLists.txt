@@ -143,7 +143,14 @@ if(QILIN_RUNTIME_GEN_DIR)
     target_include_directories(qilin_gen_runtime PUBLIC "${QILIN_RUNTIME_GEN_DIR}")
     # QILIN_APPROX_ESTIMATES: frsqrte/fres approximated where Broadway's table
     # is needed (guest.hpp); the difftest's build keeps stopping there.
-    target_compile_definitions(qilin_gen_runtime PUBLIC QILIN_CHECKED_MEMORY QILIN_APPROX_ESTIMATES)
+    target_compile_definitions(qilin_gen_runtime PUBLIC QILIN_APPROX_ESTIMATES)
+    # Checked memory: every lifted load and store tested against the regions
+    # lifted code may use, stopping with the address and the instruction.
+    # For bring-up (the default); OFF for speed once a run is known good.
+    option(QILIN_RUNTIME_CHECKED "Check every guest memory access of lifted code (bring-up)" ON)
+    if(QILIN_RUNTIME_CHECKED)
+        target_compile_definitions(qilin_gen_runtime PUBLIC QILIN_CHECKED_MEMORY)
+    endif()
     target_link_libraries(qilin_gen_runtime PUBLIC qilin_runtime PRIVATE qilin_warnings)
     if(MSVC)
         target_compile_options(qilin_gen_runtime PRIVATE /wd4702)  # as for qilin_gen_checked
@@ -165,10 +172,24 @@ if(QILIN_RUNTIME_GEN_DIR)
         recomp/runtime/input.cpp
         recomp/runtime/audio.cpp
         recomp/runtime/nand.cpp
+        recomp/runtime/profile.cpp
+        recomp/runtime/coherence.cpp
     )
     target_link_libraries(qilin_run PRIVATE qilin_gen_runtime qilin_dol qilin_warnings)
     if(WIN32)
         target_link_libraries(qilin_run PRIVATE winmm)  # timeBeginPeriod: 1 ms timers for the audio clock
+    endif()
+    # Link-time optimisation: lifted functions call each other across the
+    # generated files; LTO lets the compiler inline across them. Slower to
+    # build.
+    option(QILIN_LTO "Link-time optimisation for the game's code" OFF)
+    if(QILIN_LTO)
+        include(CheckIPOSupported)
+        check_ipo_supported(RESULT qilin_ipo OUTPUT qilin_ipo_why)
+        if(NOT qilin_ipo)
+            message(FATAL_ERROR "QILIN_LTO: this toolchain can't do link-time optimisation: ${qilin_ipo_why}")
+        endif()
+        set_property(TARGET qilin_gen_runtime qilin_run PROPERTY INTERPROCEDURAL_OPTIMIZATION ON)
     endif()
 
     # The host side: a window, Vulkan, audio and the keyboard. Third-party
@@ -259,7 +280,7 @@ endif()
 # ---- Tests (no game files needed) ----
 enable_testing()
 add_executable(qilin_tests recomp/tests/tests.cpp recomp/runtime/native.cpp recomp/runtime/interrupts.cpp recomp/runtime/timebase.cpp
-    recomp/runtime/gx_texture.cpp recomp/runtime/input.cpp)
+    recomp/runtime/gx_texture.cpp recomp/runtime/input.cpp recomp/runtime/profile.cpp)
 target_link_libraries(qilin_tests PRIVATE qilin_core qilin_runtime qilin_warnings)
 target_compile_definitions(qilin_tests PRIVATE QILIN_HEADLESS_ONLY)  # input.cpp without the host side
 qilin_tool(qilin_tests)

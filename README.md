@@ -114,6 +114,9 @@ Saves go to a per-user folder (`%LOCALAPPDATA%`, `~/Library/Application Support`
 | `QILIN_RUN_SECONDS=N` | end after N seconds, with counters and each thread's state (exit status 3) |
 | `QILIN_AUDIO_DUMP=out.wav` | record what the console would play |
 | `QILIN_FRAME_STATS=N` | numbers about every Nth frame (coverage, mean colour) |
+| `QILIN_PROFILE=1` | where the CPU time goes, and the renderer's memory use |
+
+**On low-end hardware** (a Raspberry Pi 4–class board), configure the runtime with `-DQILIN_RUNTIME_CHECKED=OFF`: the default checks every guest memory access for bring-up, which costs about half of the game code's time (`docs/runtime.md`, Efficiency).
 
 ### Decoder check
 

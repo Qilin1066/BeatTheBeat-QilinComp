@@ -2,6 +2,7 @@
 #include "native.hpp"
 
 #include "interrupts.hpp"
+#include "profile.hpp"
 
 #include <algorithm>
 #include <cinttypes>
@@ -216,6 +217,7 @@ void report_stats() {
                  "qilin_run:          host: %" PRIu64 " frames presented, %" PRIu64 " texture uploads, %" PRIu64
                  " audio frames dropped (output behind)\n",
                  s.frames_presented, s.textures_uploaded, s.audio_frames_dropped);
+    report_profile();
     std::fprintf(stderr,
                  "qilin_run:          %" PRIu64 " periodic interrupts dropped (late by a period); deliveries: %" PRIu64
                  " when idle, %" PRIu64 " in running code\n",

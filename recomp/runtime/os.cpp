@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <vector>
 
+#include "coherence.hpp"
 #include "dvd.hpp"
 #include "interrupts.hpp"
 #include "machine.hpp"
@@ -131,13 +132,15 @@ QILIN_NATIVE(OSSetArenaLo) { os.mem1_lo = c.r[3]; }
 QILIN_NATIVE(OSSetArenaHi) { os.mem1_hi = c.r[3]; }
 
 // ---- caches ----
-// Guest memory has no caches behind it, so storing, flushing and
-// invalidating ranges have nothing to do (as dcbf and icbi in lifted code).
-QILIN_NATIVE(DCStoreRange) {}
-QILIN_NATIVE(DCFlushRange) {}
+// Guest memory has no caches behind it, so there is nothing to write back
+// or invalidate. A store or flush still marks the range: on the console it
+// is what makes the CPU's writes visible to the GPU, and the renderer
+// re-checks its textures there (coherence.hpp). (start, bytes)
+QILIN_NATIVE(DCStoreRange) { note_guest_write(c.r[3], c.r[4]); }
+QILIN_NATIVE(DCFlushRange) { note_guest_write(c.r[3], c.r[4]); }
+QILIN_NATIVE(DCFlushRangeNoSync) { note_guest_write(c.r[3], c.r[4]); }
 QILIN_NATIVE(DCInvalidateRange) {}
 QILIN_NATIVE(ICInvalidateRange) {}
-QILIN_NATIVE(DCFlushRangeNoSync) {}
 
 // ---- the locked cache ----
 // A 16 KB scratchpad at 0xE0000000 that DMA fills and empties. NW4R turns it

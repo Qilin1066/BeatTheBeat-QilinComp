@@ -16,6 +16,7 @@
 #include <string>
 #include <vector>
 
+#include "coherence.hpp"
 #include "interrupts.hpp"
 #include "native.hpp"
 
@@ -129,6 +130,7 @@ bool read(uint32_t fi, uint32_t addr, uint32_t length, uint32_t offset) {
         return false;
     }
     std::memset(g_mem + addr, 0, length);
+    note_guest_write(addr, length);  // DMA: the GPU sees it without a flush
     if (offset >= e.size) return true;
     const uint32_t n = std::min(length, e.size - offset);
     std::ifstream f(disc.root / "files" / std::filesystem::path(e.path), std::ios::binary);

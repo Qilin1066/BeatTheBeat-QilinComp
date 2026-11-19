@@ -375,6 +375,12 @@ void Emitter::instruction(uint32_t pc, const Insn& in) {
         break;
     case Op::dcbf:
     case Op::dcbst:
+        // A line written back: the GPU may read it now (rt::cache_store
+        // tells the renderer's caches; the differential test ignores it).
+        use(rb);
+        if (ra) use(ra);
+        line(std::format("rt::cache_store({});", ea_x(in)));
+        break;
     case Op::dcbt:
     case Op::dcbtst:
     case Op::icbi:

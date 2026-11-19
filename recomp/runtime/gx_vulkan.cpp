@@ -36,10 +36,12 @@
 #include <unordered_map>
 #include <vector>
 
+#include "coherence.hpp"
 #include "console.hpp"
 #include "gx.hpp"
 #include "machine.hpp"
 #include "native.hpp"
+#include "profile.hpp"
 
 #include "copy_frag.h"
 #include "copy_vert.h"
@@ -72,7 +74,7 @@ namespace {
     X(vkCmdBindVertexBuffers) X(vkCmdDraw) X(vkCmdSetViewport) X(vkCmdSetScissor) X(vkCmdSetCullMode)               \
     X(vkCmdSetFrontFace) X(vkCmdSetDepthTestEnable) X(vkCmdSetDepthWriteEnable) X(vkCmdSetDepthCompareOp)           \
     X(vkCmdBlitImage) X(vkCmdCopyBufferToImage) X(vkCmdClearAttachments) X(vkCmdClearColorImage) X(vkCmdPushConstants)    \
-    X(vkCmdClearDepthStencilImage)                                                                                   \
+    X(vkCmdClearDepthStencilImage) X(vkDestroyBuffer)                                                                \
     X(vkCmdCopyImageToBuffer)
 
 PFN_vkGetInstanceProcAddr vkGetInstanceProcAddr = nullptr;
@@ -104,8 +106,11 @@ void vk_check(VkResult r, const char* what) {
 constexpr uint32_t kEfbWidth = 640, kEfbHeight = 528;
 constexpr VkFormat kEfbColor = VK_FORMAT_R8G8B8A8_UNORM, kEfbDepth = VK_FORMAT_D32_SFLOAT;
 constexpr unsigned kFrames = 2;
-constexpr VkDeviceSize kVertexBytes = 32u << 20, kUniformBytes = 8u << 20, kUploadBytes = 64u << 20;
-constexpr uint32_t kSetsPerFrame = 16384;
+// Starting sizes, per frame in flight. Measured at the title: 111 KB of
+// vertices, 164 KB of uniforms, 4 MB of uploads (start-up's textures), 132
+// descriptor sets; heavier scenes grow them (Ring, the pools).
+constexpr VkDeviceSize kVertexBytes = 1u << 20, kUniformBytes = 1u << 20, kUploadBytes = 8u << 20;
+constexpr uint32_t kSetsPerPool = 1024;
 
 // What the vertex shader gets (shaders/gx.vert).
 struct GpuVertex {
@@ -135,6 +140,23 @@ struct Buffer {
     VkBuffer buf = VK_NULL_HANDLE;
     VkDeviceMemory mem = VK_NULL_HANDLE;
     uint8_t* map = nullptr;
+    VkDeviceSize size = 0;
+};
+// A frame's stream of one kind of data (vertices, uniforms, texture
+// uploads): small to start with (memory is shared with the CPU on the
+// low-end boards), spilling into extra buffers when a frame needs more, and
+// replaced by one buffer of the size that frame needed when the frame slot
+// comes round again. It never stops a frame for want of space.
+struct Ring {
+    Buffer buf;
+    std::vector<Buffer> spill;  // this frame's overflow, newest last
+    VkDeviceSize used = 0, demand = 0;
+    VkBufferUsageFlags usage = 0;
+};
+struct Slice {
+    VkBuffer buf;
+    VkDeviceSize offset;
+    uint8_t* ptr;
 };
 struct Image {
     VkImage img = VK_NULL_HANDLE;
@@ -147,16 +169,18 @@ struct Frame {
     VkCommandBuffer cb = VK_NULL_HANDLE;
     VkFence fence = VK_NULL_HANDLE;
     VkSemaphore acquired = VK_NULL_HANDLE;
-    VkDescriptorPool pool = VK_NULL_HANDLE;
-    Buffer vtx, ubo, upload, readback;
-    VkDeviceSize vtx_used = 0, ubo_used = 0, upload_used = 0;
+    std::vector<VkDescriptorPool> pools;  // more are added when a frame needs them
+    size_t pool = 0;                      // the one sets come from now
+    Ring vtx, ubo, upload;
+    Buffer readback;
     uint32_t sets = 0;
 };
-// A decoded texture: re-checked (hashed) at most once per frame and per
-// texture load (State::tex_loads), and evicted when unused for a while.
+// A decoded texture: valid while nothing was written over its bytes (or its
+// TLUT's) since `validated` (coherence.hpp); then hashed once, and decoded
+// again only if the bytes really changed. Evicted when unused for a while.
 struct Texture {
     Image image;
-    uint64_t hash = 0, frame_checked = ~0ull, loads_checked = ~0ull, last_used = 0;
+    uint64_t hash = 0, validated = 0, last_used = 0;
 };
 constexpr uint64_t kTextureIdleFrames = 600;  // 10 s at 60 Hz: a texture unused this long is freed
 
@@ -217,6 +241,7 @@ VkDeviceMemory allocate(VkMemoryRequirements req, VkMemoryPropertyFlags want) {
 }
 Buffer make_buffer(VkDeviceSize size, VkBufferUsageFlags usage) {
     Buffer b;
+    b.size = size;
     VkBufferCreateInfo bi = vk_struct<VkBufferCreateInfo>(VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO);
     bi.size = size, bi.usage = usage, bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     vk_check(vkCreateBuffer(g.device, &bi, nullptr, &b.buf), "vkCreateBuffer");
@@ -558,14 +583,17 @@ CopyFormat copy_format(uint32_t f) {
 
 // ---- frames ----
 Frame& cur() { return g.frames[g.frame]; }
+void reset(Ring& r);
 
 void begin_frame() {
     if (g.recording) return;
     Frame& f = cur();
     vk_check(vkWaitForFences(g.device, 1, &f.fence, VK_TRUE, UINT64_MAX), "vkWaitForFences");
     vk_check(vkResetFences(g.device, 1, &f.fence), "vkResetFences");
-    vk_check(vkResetDescriptorPool(g.device, f.pool, 0), "vkResetDescriptorPool");
-    f.vtx_used = f.ubo_used = f.upload_used = 0, f.sets = 0;
+    for (VkDescriptorPool p : f.pools) vk_check(vkResetDescriptorPool(g.device, p, 0), "vkResetDescriptorPool");
+    note_ring_peaks(f.vtx.demand, f.ubo.demand, f.upload.demand, f.sets);
+    reset(f.vtx), reset(f.ubo), reset(f.upload);
+    f.pool = 0, f.sets = 0;
     // Images retired two frames ago are no longer in use.
     std::erase_if(g.garbage, [](auto& e) {
         if (e.first + kFrames > g.frame_number) return false;
@@ -611,14 +639,70 @@ void begin_rendering() {
     g.rendering = true;
 }
 
-// Space in one of the frame's rings; running out stops (the sizes are generous).
-VkDeviceSize take(Frame& f, VkDeviceSize& used, VkDeviceSize limit, VkDeviceSize bytes, VkDeviceSize align,
-                  const char* what) {
-    const VkDeviceSize at = (used + align - 1) / align * align;
-    if (at + bytes > limit) unsupported(what, static_cast<uint32_t>(bytes));
-    used = at + bytes;
-    (void)f;
-    return at;
+// Space in one of the frame's rings: in its buffer, or in a spill buffer
+// when the frame needs more than it holds.
+Slice take(Ring& r, VkDeviceSize bytes, VkDeviceSize align) {
+    r.demand += bytes + align;
+    Buffer& b = r.spill.empty() ? r.buf : r.spill.back();
+    const VkDeviceSize at = (r.used + align - 1) / align * align;
+    if (at + bytes <= b.size) {
+        r.used = at + bytes;
+        return {b.buf, at, b.map + at};
+    }
+    r.spill.push_back(make_buffer(std::max(bytes, r.buf.size), r.usage));
+    r.used = bytes;
+    return {r.spill.back().buf, 0, r.spill.back().map};
+}
+
+void free_buffer(Buffer& b) {
+    if (b.buf) vkDestroyBuffer(g.device, b.buf, nullptr);
+    if (b.mem) vkFreeMemory(g.device, b.mem, nullptr);
+    b = Buffer{};
+}
+
+// A ring at the start of its frame (that frame's GPU work is done): if the
+// last frame spilled, one buffer as big as it needed, with a quarter more.
+void reset(Ring& r) {
+    if (!r.spill.empty()) {
+        const VkDeviceSize size = (r.demand + r.demand / 4 + 0xFFFFF) & ~VkDeviceSize(0xFFFFF);  // whole MB
+        for (Buffer& b : r.spill) free_buffer(b);
+        r.spill.clear();
+        free_buffer(r.buf);
+        r.buf = make_buffer(size, r.usage);
+    }
+    r.used = 0, r.demand = 0;
+}
+
+Ring make_ring(VkDeviceSize size, VkBufferUsageFlags usage) {
+    Ring r;
+    r.usage = usage, r.buf = make_buffer(size, usage);
+    return r;
+}
+
+VkDescriptorPool make_pool() {
+    const VkDescriptorPoolSize sizes[2] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, kSetsPerPool},
+                                           {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kSetsPerPool * 8}};
+    VkDescriptorPoolCreateInfo dp = vk_struct<VkDescriptorPoolCreateInfo>(VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO);
+    dp.maxSets = kSetsPerPool, dp.poolSizeCount = 2, dp.pPoolSizes = sizes;
+    VkDescriptorPool p;
+    vk_check(vkCreateDescriptorPool(g.device, &dp, nullptr, &p), "vkCreateDescriptorPool");
+    return p;
+}
+
+// A descriptor set for this frame, from its pools: a full pool hands over
+// to the next one, made when a frame first needs it.
+VkDescriptorSet allocate_set(Frame& f, VkDescriptorSetLayout layout) {
+    ++f.sets;
+    for (;;) {
+        if (f.pool == f.pools.size()) f.pools.push_back(make_pool());
+        VkDescriptorSetAllocateInfo ai = vk_struct<VkDescriptorSetAllocateInfo>(VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO);
+        ai.descriptorPool = f.pools[f.pool], ai.descriptorSetCount = 1, ai.pSetLayouts = &layout;
+        VkDescriptorSet set;
+        const VkResult r = vkAllocateDescriptorSets(g.device, &ai, &set);
+        if (r == VK_SUCCESS) return set;
+        if (r != VK_ERROR_OUT_OF_POOL_MEMORY && r != VK_ERROR_FRAGMENTED_POOL) vk_check(r, "vkAllocateDescriptorSets");
+        ++f.pool;
+    }
 }
 
 // ---- textures ----
@@ -652,9 +736,8 @@ uint32_t norm_addr(uint32_t a) { return (a & 0x1FFFFFFFu) | 0x80000000u; }
 struct EfbCopy {
     Image image;
     uint32_t width = 0, height = 0, format = 0;
-    uint32_t guest_bytes = 0;  // the copy's size in guest memory, which guest_hash covers
-    uint64_t guest_hash = 0;
-    uint64_t frame_checked = ~0ull, loads_checked = ~0ull;  // as Texture's
+    uint32_t guest_bytes = 0;  // the copy's size in guest memory
+    uint64_t made = 0;         // the write generation when it was made: a newer write there replaces it
 };
 std::unordered_map<uint32_t, EfbCopy> g_copies;
 
@@ -665,20 +748,14 @@ void require_texture_memory(uint32_t addr, uint32_t bytes, const char* what) {
 // The texture a map holds, decoded and uploaded when it's new or its bytes
 // (or its TLUT's) changed since it was last checked; or an EFB copy there.
 const Image& texture(const State& s, const TexMap& t) {
+    const Timed timed(Section::Texture);
     const uint32_t levels = texture_levels(t);
     uint32_t bytes = 0;
     for (uint32_t l = 0; l < levels; ++l) bytes += texture_bytes(t.format, std::max(1u, uint32_t(t.width) >> l), std::max(1u, uint32_t(t.height) >> l));
     if (!bytes) unsupported("texture format", t.format);
     if (auto it = g_copies.find(norm_addr(t.image)); it != g_copies.end()) {
         EfbCopy& c = it->second;
-        if (c.width == t.width && c.height == t.height) {
-            if (c.frame_checked == g.frame_number && c.loads_checked == s.tex_loads) return c.image;
-            require_texture_memory(t.image, c.guest_bytes, "a texture copy's memory outside MEM1 and MEM2");
-            if (hash_bytes(g_mem + t.image, c.guest_bytes, 0) == c.guest_hash) {
-                c.frame_checked = g.frame_number, c.loads_checked = s.tex_loads;
-                return c.image;
-            }
-        }
+        if (c.width == t.width && c.height == t.height && newest_write(t.image, c.guest_bytes) <= c.made) return c.image;
         g.garbage.emplace_back(g.frame_number, c.image);  // the CPU rewrote it, or it's read as something else
         g_copies.erase(it);
     }
@@ -696,11 +773,12 @@ const Image& texture(const State& s, const TexMap& t) {
     key = hash_bytes(reinterpret_cast<const uint8_t*>(id), sizeof id, key);
     Texture& tex = g.textures[key];
     tex.last_used = g.frame_number;
-    if (tex.image.img && tex.frame_checked == g.frame_number && tex.loads_checked == s.tex_loads) return tex.image;
-    tex.frame_checked = g.frame_number, tex.loads_checked = s.tex_loads;
+    const uint64_t written = std::max(newest_write(t.image, bytes), tlut ? newest_write(tlut->data, 2u * tlut->entries) : 0);
+    if (tex.image.img && written <= tex.validated) return tex.image;
+    tex.validated = write_generation();
     uint64_t h = hash_bytes(g_mem + t.image, bytes, 0);
     if (tlut) h = hash_bytes(g_mem + tlut->data, 2u * tlut->entries, h);
-    if (tex.image.img && tex.hash == h) return tex.image;
+    if (tex.image.img && tex.hash == h) return tex.image;  // written, but to the same bytes
     tex.hash = h;
 
     if (!tex.image.img)
@@ -713,14 +791,14 @@ const Image& texture(const State& s, const TexMap& t) {
     for (uint32_t l = 0; l < levels; ++l) {
         const uint32_t w = std::max(1u, uint32_t(t.width) >> l), hgt = std::max(1u, uint32_t(t.height) >> l);
         const VkDeviceSize n = VkDeviceSize(w) * hgt * 4;
-        const VkDeviceSize at = take(f, f.upload_used, kUploadBytes, n, 16, "texture uploads in one frame (bytes)");
-        decode_texture(t.format, src, w, hgt, tlut, f.upload.map + at);
+        const Slice up = take(f.upload, n, 16);
+        decode_texture(t.format, src, w, hgt, tlut, up.ptr);
         src += texture_bytes(t.format, w, hgt);
         VkBufferImageCopy copy{};
-        copy.bufferOffset = at;
+        copy.bufferOffset = up.offset;
         copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, l, 0, 1};
         copy.imageExtent = {w, hgt, 1};
-        vkCmdCopyBufferToImage(f.cb, f.upload.buf, tex.image.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+        vkCmdCopyBufferToImage(f.cb, up.buf, tex.image.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
     }
     transition(f.cb, tex.image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
     ++stats().textures_uploaded;
@@ -1072,15 +1150,11 @@ void Renderer::copy_texture(const State& s, uint32_t dest, bool clear) {
                              VK_IMAGE_ASPECT_COLOR_BIT);
     c.width = w, c.height = h, c.format = s.tex_dst_format;
     c.guest_bytes = texture_bytes(cf.mem_format, w, h);
-    c.guest_hash = hash_bytes(g_mem + norm_addr(dest), c.guest_bytes, 0);
+    c.made = write_generation();
 
     transition(f.cb, g.efb_color, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
     transition(f.cb, c.image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
-    if (++f.sets > kSetsPerFrame) unsupported("draws in one frame", f.sets);
-    VkDescriptorSetAllocateInfo ai = vk_struct<VkDescriptorSetAllocateInfo>(VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO);
-    ai.descriptorPool = f.pool, ai.descriptorSetCount = 1, ai.pSetLayouts = &g.copy_set_layout;
-    VkDescriptorSet set;
-    vk_check(vkAllocateDescriptorSets(g.device, &ai, &set), "vkAllocateDescriptorSets");
+    const VkDescriptorSet set = allocate_set(f, g.copy_set_layout);
     VkDescriptorImageInfo ii{g.efb_sampler, g.efb_color.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
     VkWriteDescriptorSet wr = vk_struct<VkWriteDescriptorSet>(VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET);
     wr.dstSet = set, wr.descriptorCount = 1, wr.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, wr.pImageInfo = &ii;
@@ -1108,6 +1182,7 @@ void Renderer::copy_texture(const State& s, uint32_t dest, bool clear) {
 }
 
 void Renderer::draw(const State& s, const Draw& d) {
+    const Timed timed(Section::Draw);
     ++stats().draws;
     stats().vertices += d.count;
     const uint8_t prim = d.primitive;
@@ -1207,18 +1282,14 @@ void Renderer::draw(const State& s, const Draw& d) {
     begin_rendering();
     Frame& f = cur();
     const VkDeviceSize vbytes = order.size() * sizeof(GpuVertex);
-    const VkDeviceSize vat = take(f, f.vtx_used, kVertexBytes, vbytes, 16, "vertices in one frame (bytes)");
-    auto* dst = reinterpret_cast<GpuVertex*>(f.vtx.map + vat);
+    const Slice vs = take(f.vtx, vbytes, 16);
+    auto* dst = reinterpret_cast<GpuVertex*>(vs.ptr);
     for (size_t i = 0; i < order.size(); ++i) dst[i] = v[order[i]];
-    const VkDeviceSize uat = take(f, f.ubo_used, kUniformBytes, sizeof block, g.ubo_align, "draws in one frame");
-    std::memcpy(f.ubo.map + uat, &block, sizeof block);
+    const Slice us = take(f.ubo, sizeof block, g.ubo_align);
+    std::memcpy(us.ptr, &block, sizeof block);
 
-    if (++f.sets > kSetsPerFrame) unsupported("draws in one frame", f.sets);
-    VkDescriptorSetAllocateInfo ai = vk_struct<VkDescriptorSetAllocateInfo>(VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO);
-    ai.descriptorPool = f.pool, ai.descriptorSetCount = 1, ai.pSetLayouts = &g.set_layout;
-    VkDescriptorSet set;
-    vk_check(vkAllocateDescriptorSets(g.device, &ai, &set), "vkAllocateDescriptorSets");
-    VkDescriptorBufferInfo bi{f.ubo.buf, uat, sizeof block};
+    const VkDescriptorSet set = allocate_set(f, g.set_layout);
+    VkDescriptorBufferInfo bi{us.buf, us.offset, sizeof block};
     VkDescriptorImageInfo ii[8];
     for (unsigned m = 0; m < 8; ++m) ii[m] = {samps[m], views[m], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
     VkWriteDescriptorSet w[2]{};
@@ -1232,7 +1303,7 @@ void Renderer::draw(const State& s, const Draw& d) {
     VkCommandBuffer cb = f.cb;
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline(key));
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g.layout, 0, 1, &set, 0, nullptr);
-    vkCmdBindVertexBuffers(cb, 0, 1, &f.vtx.buf, &vat);
+    vkCmdBindVertexBuffers(cb, 0, 1, &vs.buf, &vs.offset);
     VkViewport vp{s.viewport[0], s.viewport[1], s.viewport[2], s.viewport[3], s.viewport[4], s.viewport[5]};
     vp.minDepth = std::clamp(vp.minDepth, 0.0f, 1.0f), vp.maxDepth = std::clamp(vp.maxDepth, 0.0f, 1.0f);
     vkCmdSetViewport(cb, 0, 1, &vp);
@@ -1257,6 +1328,7 @@ void Renderer::draw(const State& s, const Draw& d) {
 // (keeping the console's aspect: 16:9 with its widescreen setting), then the
 // EFB is cleared there if asked.
 void Renderer::copy_display(const State& s, uint32_t, bool clear) {
+    const Timed timed(Section::Present);
     ++stats().display_copies;
     if (s.disp_src[2] == 0 || s.disp_src[3] == 0 || uint32_t(s.disp_src[0]) + s.disp_src[2] > kEfbWidth ||
         uint32_t(s.disp_src[1]) + s.disp_src[3] > kEfbHeight)
@@ -1444,14 +1516,10 @@ bool create_resources() {
         vk_check(vkCreateFence(g.device, &fi, nullptr, &f.fence), "vkCreateFence");
         VkSemaphoreCreateInfo si = vk_struct<VkSemaphoreCreateInfo>(VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO);
         vk_check(vkCreateSemaphore(g.device, &si, nullptr, &f.acquired), "vkCreateSemaphore");
-        const VkDescriptorPoolSize sizes[2] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, kSetsPerFrame},
-                                               {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kSetsPerFrame * 8}};
-        VkDescriptorPoolCreateInfo dp = vk_struct<VkDescriptorPoolCreateInfo>(VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO);
-        dp.maxSets = kSetsPerFrame, dp.poolSizeCount = 2, dp.pPoolSizes = sizes;
-        vk_check(vkCreateDescriptorPool(g.device, &dp, nullptr, &f.pool), "vkCreateDescriptorPool");
-        f.vtx = make_buffer(kVertexBytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
-        f.ubo = make_buffer(kUniformBytes, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
-        f.upload = make_buffer(kUploadBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+        f.pools.push_back(make_pool());
+        f.vtx = make_ring(kVertexBytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+        f.ubo = make_ring(kUniformBytes, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+        f.upload = make_ring(kUploadBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
         f.readback = make_buffer(VkDeviceSize(kEfbWidth) * kEfbHeight * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
     }
     g.efb_color = make_image(kEfbWidth, kEfbHeight, kEfbColor,

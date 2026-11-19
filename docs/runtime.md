@@ -128,6 +128,22 @@ GX is replaced at its API, as the roadmap says: its own code drives the GPU's re
 - **Keyboard as the Wii Remote** (held upright): A = X or Space, B = Z or Left Shift, 1, 2, + = Enter, − = Backspace, Home = H, the D-pad = arrows. A remote is connected whenever there is a window (or a `QILIN_INPUT` script); the two add up.
 - **First run** (GTX 1080 Ti, Windows): 60 s windowed with A pressed from 24 s: 3,581 frames presented, the title's music and voices through the speakers, no stop.
 
+## Efficiency (after v0.16.0)
+
+`QILIN_PROFILE=1` reports the process's CPU time against the wall clock, the time in draws (texture checks included), presenting frames and the mixer, what's left (lifted code, the OS), and each renderer ring's peak use in a frame. Measured at the title (45 s, A pressed four times; Windows, a desktop CPU and a GTX 1080 Ti):
+
+| Build | Windowed | Headless |
+|---|---|---|
+| Checked memory (the default, for bring-up) | 16% of one core | 15% |
+| `-DQILIN_RUNTIME_CHECKED=OFF` | 12% | 8% |
+| `-DQILIN_LTO=ON` as well | no measurable change | no measurable change |
+
+- **Textures follow the console's coherency rule** (`coherence.*`). The GPU sees what the CPU wrote only once the game flushes or stores the range (`DCFlushRange`, `DCStoreRange`, lifted `dcbf`/`dcbst` through `rt::cache_store`) or DMA writes it (disc and NAND reads). Each such write stamps the 4 KB pages it covers with a generation; a texture or EFB copy is re-checked only when a page under it has a newer stamp, then hashed once, and decoded again only if its bytes really changed. A game that skips the flush gets stale data on the console too. Before, textures were re-hashed every draw: 102 µs a draw, 61% of a core in all; now 0.3 µs.
+- **The renderer's rings grow instead of being sized for the worst case:** vertices, uniforms and uploads start at 1, 1 and 8 MB per frame in flight, with 1,024 descriptor sets a pool; a frame that needs more spills into extra buffers and pools, and its slot gets one buffer of the size it needed when it comes round again. Peaks at the title: 113 KB of vertices, 181 KB of uniforms, 4 MB of uploads (start-up's textures), 132 sets. Host-visible memory reserved: about 20 MB, from about 210 MB; it matters on boards whose GPU shares the CPU's memory.
+- **Lifted loops** take the slow path only when an interrupt is due now, not whenever an I/O completion is queued (v0.16.0's fixes).
+- **Players on low-end hardware** should build with `-DQILIN_RUNTIME_CHECKED=OFF`: checked memory is for bring-up (its stops name each unexpected access) and costs about half the lifted code's time. Unchecked, an access outside guest memory faults instead of stopping with a report.
+- Not measured yet: the GPU on a Pi 4-class board (the TEV shader interprets up to 16 stages per pixel; specialising pipelines per TEV configuration is the roadmap's next step for it).
+
 ## The runtime's to-do list from its own lift (after v0.15.0)
 
 Lifted code reaches a replaced function only through its generated stub (`fn_ADDR` calling `rt::native`), so `gen-rt` lists exactly which replaced functions the game can call: 260. Of those, 40 had no native code (each would stop when first reached); now:

@@ -28,6 +28,7 @@
 #include "host.hpp"
 #include "interrupts.hpp"
 #include "native.hpp"
+#include "profile.hpp"
 
 namespace {
 
@@ -349,6 +350,7 @@ uint32_t list_addr(uint32_t at, uint32_t list) {
 //   11 output: master volume, mix buffer, the AI buffer | 12 the same, DPL2
 //   13 the four remote speakers' buffers | 14 end
 void run_frame(uint32_t list) {
+    const Timed timed(Section::Mixer);
     Bus buses[kBuses] = {};
     uint32_t aux_in[kBuses] = {}, aux_out[kBuses] = {};
     uint16_t aux_volume[kBuses] = {};
