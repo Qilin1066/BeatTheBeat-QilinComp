@@ -1208,7 +1208,7 @@ void test_settings() {
                          BadFile{"[display]\nvsync = yes\n", 2}, BadFile{"[nowhere]\n", 1}, BadFile{"[display]\npreset = fast\n", 2},
                          BadFile{"[display]\nnot_a_key = 1\n", 2}, BadFile{"[display]\nfullscreen\n", 2},
                          BadFile{"[console]\nlanguage = -1\n", 2}, BadFile{"[display\n", 1}, BadFile{"[console]\nsound_mode = 3\n", 2},
-                         BadFile{"[audio]\nlatency_ms = 10\n", 2}, BadFile{"[audio]\nlatency_ms = 201\n", 2},
+                         BadFile{"[audio]\nlatency_ms = 4\n", 2}, BadFile{"[audio]\nlatency_ms = 201\n", 2},
                          BadFile{"[display]\nlatency_ms = 30\n", 2}, BadFile{"[display]\nlock_to_display = 1\n", 2}}) {
         CHECK(!parse(b.text, s, error, line) && line == b.line && !error.empty());
     }

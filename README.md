@@ -115,12 +115,12 @@ The Wii Remote is played upright, by a controller or the keyboard (both at once 
 
 | Wii Remote | Controller (any SDL knows) | Keyboard |
 |---|---|---|
-| A | south face button (Xbox A, PlayStation ✕), right shoulder | Space, K or X |
-| B (the trigger) | east face button, left shoulder, right trigger | L, Z or Left Shift |
-| 1, 2 | west, north face buttons | 1 or J, 2 or I |
+| A | south face button (Xbox A, PlayStation ✕), right shoulder | A, Right Shift, Right arrow or Space |
+| B (the trigger) | east face button, left shoulder, right trigger | B, Left Shift or Left arrow |
+| 1, 2 | west, north face buttons | 1, 2 |
 | +, − | Start, Back | Enter, Backspace or Tab |
 | Home | Guide | H |
-| D-pad | d-pad or left stick | arrow keys |
+| D-pad | d-pad or left stick | I, J, K, L, or the Up and Down arrows |
 
 The first controller connected plays the remote (another takes over if it's unplugged); the game's rumble reaches it.
 

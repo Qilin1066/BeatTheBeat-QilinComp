@@ -44,14 +44,14 @@ struct Binding {
     const char *button, *keys, *pad;
 };
 constexpr Binding kBindings[] = {
-    {"A", "Space, K, X", "South (A / Cross), right shoulder"},
-    {"B", "L, Z, Left Shift", "East (B / Circle), left shoulder, right trigger"},
-    {"1", "1, J", "West (X / Square)"},
-    {"2", "2, I", "North (Y / Triangle)"},
+    {"A", "A, Right Shift, Right arrow, Space", "South (A / Cross), right shoulder"},
+    {"B", "B, Left Shift, Left arrow", "East (B / Circle), left shoulder, right trigger"},
+    {"1", "1", "West (X / Square)"},
+    {"2", "2", "North (Y / Triangle)"},
     {"+", "Enter", "Start"},
     {"-", "Backspace, Tab", "Back"},
     {"Home", "H", "Guide"},
-    {"D-pad", "Arrow keys", "D-pad, left stick"},
+    {"D-pad", "I, J, K, L; Up and Down arrows", "D-pad, left stick"},
 };
 
 constexpr const char* kLanguages[] = {"Japanese", "English", "German", "French", "Spanish", "Italian"};
@@ -379,9 +379,9 @@ void Menu::display_page() {
     ImGui::Checkbox("Fullscreen at 60/120 Hz when the desktop's refresh doesn't suit (from the next start)", &s.match_refresh);
     ImGui::EndDisabled();
     int latency = int(s.audio_latency_ms);
-    if (ImGui::SliderInt("Sound latency", &latency, 20, 200, "%d ms", ImGuiSliderFlags_AlwaysClamp))
+    if (ImGui::SliderInt("Sound latency", &latency, 5, 200, "%d ms", ImGuiSliderFlags_AlwaysClamp))
         s.audio_latency_ms = uint32_t(latency);
-    ImGui::TextDisabled("Lower: less lag between a press and its sound. Raise it if the sound crackles.");
+    ImGui::TextDisabled("Lower: less lag between a press and its sound (held no lower than the device can keep up). Raise it if the sound crackles.");
 
     ImGui::SeparatorText("Enhancements");
     static constexpr const char* kPresets[] = {"original", "low-end", "desktop"};

@@ -76,7 +76,7 @@ std::string settings_text(const Settings& s) {
     line("");
     line("[audio]");
     line("# Milliseconds of sound queued ahead of the speakers, held there by resampling a little.");
-    line("# Lower is less lag between a press and its sound; raise it if the sound crackles (20-200).");
+    line("# Lower is less lag between a press and its sound (5-200); a value below what the sound device can keep up is raised to it (said at start). Raise it if the sound crackles.");
     line("latency_ms = " + std::to_string(s.audio_latency_ms));
     line("");
     line("[controls]");
@@ -193,7 +193,7 @@ bool parse_settings(std::istream& in, Settings& s, std::string& error, unsigned&
         } else if (section == "display" && key == "match_refresh") {
             boolean(s.match_refresh);
         } else if (section == "audio" && key == "latency_ms") {
-            s.audio_latency_ms = number(20, 200);  // under 20, a 10 ms device period empties the queue each time it reads
+            s.audio_latency_ms = number(5, 200);  // raised to what the device can keep up (host.cpp)
         } else if (section == "console" && key == "language") {
             s.language = static_cast<uint8_t>(number(0, 6));
         } else if (section == "console" && key == "sixty_hz") {

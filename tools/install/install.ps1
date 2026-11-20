@@ -240,7 +240,7 @@ if ($made.Count) {
     $where = 'the Start menu'; if (-not $NoDesktop) { $where = 'the Start menu or the desktop' }
     Say ("  Start it from $where (""$ShortcutName"").")
 } else { Say ("  Start it with:  ""$(Join-Path $InstallDir 'Play.cmd')""") }
-Say '  Keys: A = Space or K, B = L, + = Enter, - = Backspace, Home = H, arrows; A and B together on the title.'
+Say '  Keys: A = A, Right Shift or Right arrow; B = B, Left Shift or Left arrow; + = Enter, - = Backspace, Home = H, d-pad = I J K L; A and B together on the title.'
 Say '  F1 or Esc opens the settings; a controller plays too (any gamepad).'
 Say '  The disc folder must stay where it is: the game reads its files from it.'
 if ($Portable) { Say '  To remove it: Uninstall.cmd in its folder.' }

@@ -35,6 +35,7 @@ SDL_Window* g_window = nullptr;
 // Opened by the main thread (open_audio, again later if the device couldn't
 // be opened at start), used by the game's (play_audio).
 std::atomic<SDL_AudioStream*> g_audio{nullptr};
+std::atomic<int> g_floor_ms{0};  // the least latency the open device can be held at (open_audio)
 std::vector<SDL_Gamepad*> g_pads;  // every connected gamepad: any of them plays the Wii Remote
 std::atomic<uint16_t> g_keys{0}, g_pad_buttons{0};
 std::atomic<bool> g_rumble{false};
@@ -64,20 +65,23 @@ struct AudioClock {
 
 bool hidden();
 
-// The keyboard as a Wii Remote held upright. The other Qilin recomps' keys
-// (Space or K for the main button, L for the second, Enter Start, Backspace
-// or Tab Back) and this one's first ones (X, Z) both work.
+// The keyboard as a Wii Remote held upright.
 struct Key {
     SDL_Scancode code;
     uint16_t button;
 };
+// The owner's layout (2026-11-20): A and B on their own letters, and in
+// pairs for two hands, right A and left B as on a controller's shoulders:
+// the shift keys, and the left and right arrows. Space is A too. The d-pad
+// moves to I, J, K, L (with the up and down arrows).
 constexpr Key kKeys[] = {
-    {SDL_SCANCODE_SPACE, kButtonA},  {SDL_SCANCODE_K, kButtonA},         {SDL_SCANCODE_X, kButtonA},
-    {SDL_SCANCODE_L, kButtonB},      {SDL_SCANCODE_Z, kButtonB},         {SDL_SCANCODE_LSHIFT, kButtonB},
-    {SDL_SCANCODE_1, kButton1},      {SDL_SCANCODE_J, kButton1},         {SDL_SCANCODE_2, kButton2},
-    {SDL_SCANCODE_I, kButton2},      {SDL_SCANCODE_RETURN, kButtonPlus}, {SDL_SCANCODE_BACKSPACE, kButtonMinus},
-    {SDL_SCANCODE_TAB, kButtonMinus}, {SDL_SCANCODE_H, kButtonHome},     {SDL_SCANCODE_UP, kButtonUp},
-    {SDL_SCANCODE_DOWN, kButtonDown}, {SDL_SCANCODE_LEFT, kButtonLeft},  {SDL_SCANCODE_RIGHT, kButtonRight},
+    {SDL_SCANCODE_A, kButtonA},      {SDL_SCANCODE_RSHIFT, kButtonA},    {SDL_SCANCODE_RIGHT, kButtonA},
+    {SDL_SCANCODE_SPACE, kButtonA},  {SDL_SCANCODE_B, kButtonB},         {SDL_SCANCODE_LSHIFT, kButtonB},
+    {SDL_SCANCODE_LEFT, kButtonB},   {SDL_SCANCODE_1, kButton1},         {SDL_SCANCODE_2, kButton2},
+    {SDL_SCANCODE_RETURN, kButtonPlus}, {SDL_SCANCODE_BACKSPACE, kButtonMinus}, {SDL_SCANCODE_TAB, kButtonMinus},
+    {SDL_SCANCODE_H, kButtonHome},   {SDL_SCANCODE_UP, kButtonUp},       {SDL_SCANCODE_DOWN, kButtonDown},
+    {SDL_SCANCODE_I, kButtonUp},     {SDL_SCANCODE_K, kButtonDown},      {SDL_SCANCODE_J, kButtonLeft},
+    {SDL_SCANCODE_L, kButtonRight},
 };
 
 void update_keys() {
@@ -188,9 +192,10 @@ void apply_rumble() {
 // the main loop tries again every 2 s, so sound comes when the device does.
 bool open_audio(bool retry = false) {
     // A small device buffer: the latency is the queue (held at the target)
-    // plus this. Backends with a fixed period (WASAPI's shared mode: 10 ms)
-    // keep their own.
-    SDL_SetHint(SDL_HINT_AUDIO_DEVICE_SAMPLE_FRAMES, "256");
+    // plus this. SDL asks WASAPI for its low-latency shared mode with it
+    // (IAudioClient3), which a driver grants down to its own minimum (a
+    // Scarlett Solo: 7 ms; Windows' own HD Audio driver: about 3 ms).
+    SDL_SetHint(SDL_HINT_AUDIO_DEVICE_SAMPLE_FRAMES, "128");
     const SDL_AudioSpec spec{SDL_AUDIO_S16, 2, kSampleRate};
     SDL_AudioStream* stream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, nullptr, nullptr);
     if (!stream) {
@@ -211,6 +216,19 @@ bool open_audio(bool retry = false) {
     if (SDL_GetAudioDeviceFormat(SDL_GetAudioStreamDevice(stream), &out, &frames) && out.freq > 0)
         std::fprintf(stderr, "qilin_run: audio%s: %d Hz, a %d-sample device buffer (%.1f ms), %u ms queued ahead\n",
                      retry ? " (the device is back)" : "", out.freq, frames, 1000.0 * frames / out.freq, settings().audio_latency_ms);
+    // The least the queue can be held at for this device: the device takes a
+    // whole period at each read, so just before one the queue must hold a
+    // period, and the game's frames come 3 ms at a time with a little
+    // jitter; the queue's average is about half a period above its low point.
+    // So a period plus 4 ms (11 ms with a 7 ms period). A lower setting is
+    // raised to it, and said.
+    if (out.freq > 0 && frames > 0) {
+        const int floor_ms = int(std::ceil(1000.0 * frames / out.freq)) + 4;
+        g_floor_ms.store(floor_ms, std::memory_order_relaxed);
+        if (int(settings().audio_latency_ms) < floor_ms)
+            std::fprintf(stderr, "qilin_run: audio: %u ms is below what this device can keep up (%d ms); holding at %d ms\n",
+                         settings().audio_latency_ms, floor_ms, floor_ms);
+    }
     g_audio.store(stream, std::memory_order_release);
     return true;
 }
@@ -344,7 +362,8 @@ void play_audio(const int16_t* lr, uint32_t frames) {
     SDL_AudioStream* const audio = g_audio.load(std::memory_order_acquire);
     if (!audio) return;
     Stats& st = stats();
-    const int target = int(settings().audio_latency_ms) * kBytesPerMs, bytes = int(frames * 4);
+    const int target_ms = std::max(int(settings().audio_latency_ms), g_floor_ms.load(std::memory_order_relaxed));
+    const int target = target_ms * kBytesPerMs, bytes = int(frames * 4);
     int queued = SDL_GetAudioStreamQueued(audio);
     if (queued < 0) return;  // the device is gone
     if (queued > target + kMaxExtraBytes) {
@@ -462,8 +481,8 @@ bool run(const std::function<void()>& game) {
     attach_connected();
     std::fprintf(stderr,
                  "qilin_run: settings: %s (preset %s, %ux internal resolution, %ux anisotropic filtering)\n"
-                 "qilin_run: keys: A = Space, K or X; B = L, Z or Left Shift; 1 = 1 or J; 2 = 2 or I; + = Enter; "
-                 "- = Backspace or Tab; Home = H; the d-pad = arrows; F11 or Alt+Enter: fullscreen\n",
+                 "qilin_run: keys: A = A, Right Shift, Right arrow or Space; B = B, Left Shift or Left arrow; 1, 2; "
+                 "+ = Enter; - = Backspace or Tab; Home = H; the d-pad = I J K L or Up/Down; F11 or Alt+Enter: fullscreen\n",
                  settings_path().string().c_str(), settings().preset.c_str(), settings().internal_scale, settings().anisotropy);
 
     choose_fullscreen_mode();
