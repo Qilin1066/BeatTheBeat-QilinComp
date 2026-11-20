@@ -97,6 +97,7 @@ struct Stats {
     uint64_t periods_dropped = 0, idle_deliveries = 0, running_deliveries = 0;
     uint64_t remotes_connected = 0, remote_reports = 0, voice_frames = 0, audio_frames_dropped = 0;
     uint64_t textures_uploaded = 0, frames_presented = 0;
+    uint64_t draw_batches = 0;  // the renderer's vkCmdDraws: consecutive draws alike become one
     // The audio output's queue (host.cpp): how often it ran dry, and its
     // depth when each frame was queued (sum and count for the mean, in bytes
     // of 32 kHz stereo: 128 a millisecond).

@@ -951,15 +951,77 @@ void begin_frame() {
     }
 }
 
+// ---- batching draws ----
+// Consecutive draws with the same pipeline, textures, uniform block and
+// dynamic state, whose vertices land next to each other in the vertex ring,
+// become one vkCmdDraw: text is drawn a glyph at a time and a layout a pane
+// at a time, and each draw used to cost a descriptor set, a uniform block
+// and a dozen commands. Blending and depth within one draw follow the
+// primitives' order, as separate draws do, so the picture is the same. The
+// batch waits open until a draw that differs or anything else recorded: it
+// is flushed in end_rendering (texture uploads, copies and the frame's end
+// all pass through it) and before an EFB clear. Within a rendering pass,
+// state the command buffer already has isn't set again.
+struct Batch {
+    bool open = false;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    DrawBlock block{};
+    VkImageView views[8]{};
+    VkSampler samps[8]{};
+    VkViewport vp{};
+    VkRect2D sc{};
+    VkCullModeFlags cull = 0;
+    VkBool32 ztest = VK_FALSE, zwrite = VK_FALSE;
+    VkCompareOp zop = VK_COMPARE_OP_NEVER;
+    VkBuffer vbuf = VK_NULL_HANDLE;
+    VkDeviceSize voffset = 0;
+    uint32_t count = 0;
+} g_batch;
+struct Recorded {  // what this rendering pass has bound and set
+    bool valid = false;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    VkViewport vp{};
+    VkRect2D sc{};
+    VkCullModeFlags cull = 0;
+    VkBool32 ztest = VK_FALSE, zwrite = VK_FALSE;
+    VkCompareOp zop = VK_COMPARE_OP_NEVER;
+} g_rec;
+
+void flush_batch() {
+    if (!g_batch.open) return;
+    g_batch.open = false;
+    ++stats().draw_batches;
+    const Batch& b = g_batch;
+    VkCommandBuffer cb = cur().cb;
+    const bool all = !g_rec.valid;
+    if (all || g_rec.pipeline != b.pipeline) vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, b.pipeline);
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g.layout, 0, 1, &b.set, 0, nullptr);
+    vkCmdBindVertexBuffers(cb, 0, 1, &b.vbuf, &b.voffset);
+    if (all || std::memcmp(&g_rec.vp, &b.vp, sizeof b.vp) != 0) vkCmdSetViewport(cb, 0, 1, &b.vp);
+    if (all || std::memcmp(&g_rec.sc, &b.sc, sizeof b.sc) != 0) vkCmdSetScissor(cb, 0, 1, &b.sc);
+    if (all || g_rec.cull != b.cull) vkCmdSetCullMode(cb, b.cull);
+    if (all) vkCmdSetFrontFace(cb, VK_FRONT_FACE_CLOCKWISE);  // GX's front faces are clockwise in Vulkan's framebuffer space
+    if (all || g_rec.ztest != b.ztest) vkCmdSetDepthTestEnable(cb, b.ztest);
+    if (all || g_rec.zwrite != b.zwrite) vkCmdSetDepthWriteEnable(cb, b.zwrite);
+    if (all || g_rec.zop != b.zop) vkCmdSetDepthCompareOp(cb, b.zop);
+    vkCmdDraw(cb, b.count, 1, 0, 0);
+    g_rec.valid = true, g_rec.pipeline = b.pipeline, g_rec.vp = b.vp, g_rec.sc = b.sc, g_rec.cull = b.cull;
+    g_rec.ztest = b.ztest, g_rec.zwrite = b.zwrite, g_rec.zop = b.zop;
+}
+
 void end_rendering() {
     if (!g.rendering) return;
+    flush_batch();
     vkCmdEndRendering(cur().cb);
     g.rendering = false;
+    g_rec.valid = false;
 }
 
 void begin_rendering() {
     begin_frame();
     if (g.rendering) return;
+    g_rec.valid = false;  // a new pass: everything is set again
     VkCommandBuffer cb = cur().cb;
     transition(cb, g.efb_color, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
     transition(cb, g.efb_depth, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT);
@@ -1459,6 +1521,7 @@ public:
 // copy with its clear flag does.
 void clear_efb(const State& s, const uint16_t rect[4]) {
     begin_rendering();
+    flush_batch();  // the draws before the clear are recorded before it
     VkClearAttachment ca[2]{};
     ca[0].aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     ca[0].clearValue.color = {{s.clear_color.r / 255.0f, s.clear_color.g / 255.0f, s.clear_color.b / 255.0f, s.clear_color.a / 255.0f}};
@@ -1540,15 +1603,16 @@ void Renderer::draw(const State& s, const Draw& d) {
     if (s.scissor_offset[0] != 0 || s.scissor_offset[1] != 0) unsupported("a scissor box offset", s.scissor_offset[0]);
     if (!(s.viewport[2] > 0) || !(s.viewport[3] > 0)) unsupported("a viewport without a positive size", 0);
 
-    // vertices, transformed
-    std::vector<GpuVertex> v(d.count);
+    // vertices, transformed (into buffers kept from draw to draw: no
+    // allocation per draw)
+    static std::vector<GpuVertex> v, wide;  // wide: lines and points become quads in screen space
+    static std::vector<uint32_t> order;
+    v.resize(d.count), wide.clear(), order.clear();
     for (uint32_t i = 0; i < d.count; ++i) {
         InVertex in;
         read_vertex(s, d, d.vertices.data() + size_t(i) * d.vertex_size, in);
         transform(s, in, v[i]);
     }
-    std::vector<uint32_t> order;
-    std::vector<GpuVertex> wide;  // lines and points become quads in screen space
     switch (prim) {
     case kQuads:
     case kQuads2:
@@ -1603,19 +1667,18 @@ void Renderer::draw(const State& s, const Draw& d) {
     }
     }
     if (order.empty() && wide.empty()) return;
-    if (!wide.empty()) {
-        v = std::move(wide);
-        order.resize(v.size());
-        for (uint32_t i = 0; i < order.size(); ++i) order[i] = i;
-    }
+    const bool use_wide = !wide.empty();
+    const std::vector<GpuVertex>& src = use_wide ? wide : v;
+    const uint32_t n = static_cast<uint32_t>(use_wide ? wide.size() : order.size());
 
-    DrawBlock block;
+    DrawBlock block{};  // whole, so two blocks compare by their bytes
     PipelineKey key;
     pack_draw(s, block, key.spec);
     key.blend = pipeline_key(s);
+    const VkSampler plain = sampler(0);  // looked up once (the menu remakes samplers: not kept across draws)
     VkImageView views[8];
     VkSampler samps[8];
-    for (unsigned m = 0; m < 8; ++m) views[m] = g.blank.view, samps[m] = sampler(0);
+    for (unsigned m = 0; m < 8; ++m) views[m] = g.blank.view, samps[m] = plain;
     for (unsigned i = 0; i < s.num_tev_stages; ++i) {
         const TevStage& t = s.tev[i];
         if (t.map == 0xFF || t.coord == 0xFF || t.tex_disabled) continue;
@@ -1629,13 +1692,48 @@ void Renderer::draw(const State& s, const Draw& d) {
 
     begin_rendering();
     Frame& f = cur();
-    const VkDeviceSize vbytes = order.size() * sizeof(GpuVertex);
-    const Slice vs = take(f.vtx, vbytes, 16);
+    // The pipeline: the last draw's, if the key is the same (a compare is
+    // cheaper than the map's hash).
+    static PipelineKey last_key;
+    static VkPipeline last_pipe = VK_NULL_HANDLE;
+    if (!last_pipe || !(key == last_key)) last_key = key, last_pipe = pipeline(key);
+    const VkPipeline pipe = last_pipe;
+    // GX's viewport and scissor are in EFB pixels: times the internal scale.
+    const float k = float(g.scale);
+    VkViewport vp{s.viewport[0] * k, s.viewport[1] * k, s.viewport[2] * k, s.viewport[3] * k, s.viewport[4], s.viewport[5]};
+    vp.minDepth = std::clamp(vp.minDepth, 0.0f, 1.0f), vp.maxDepth = std::clamp(vp.maxDepth, 0.0f, 1.0f);
+    const uint32_t sx = std::min(s.scissor[0], kEfbWidth), sy = std::min(s.scissor[1], kEfbHeight);
+    const VkRect2D sc{{int32_t(sx * g.scale), int32_t(sy * g.scale)},
+                      {std::min(s.scissor[2], kEfbWidth - sx) * g.scale, std::min(s.scissor[3], kEfbHeight - sy) * g.scale}};
+    // GX culls by its screen-space winding: front faces are clockwise there,
+    // as in Vulkan's framebuffer space (both y down). GX culls triangles only.
+    const VkCullModeFlags cull = lines || points ? VK_CULL_MODE_NONE
+                                 : s.cull == 1   ? VK_CULL_MODE_FRONT_BIT
+                                 : s.cull == 2   ? VK_CULL_MODE_BACK_BIT
+                                                 : VK_CULL_MODE_NONE;
+    const VkBool32 ztest = s.z_enable ? VK_TRUE : VK_FALSE, zwrite = s.z_enable && s.z_update ? VK_TRUE : VK_FALSE;
+    const auto zop = static_cast<VkCompareOp>(s.z_func & 7);  // GX's order is Vulkan's
+
+    const Slice vs = take(f.vtx, VkDeviceSize(n) * sizeof(GpuVertex), 16);
     auto* dst = reinterpret_cast<GpuVertex*>(vs.ptr);
-    for (size_t i = 0; i < order.size(); ++i) dst[i] = v[order[i]];
+    if (use_wide) std::memcpy(dst, src.data(), size_t(n) * sizeof(GpuVertex));
+    else
+        for (uint32_t i = 0; i < n; ++i) dst[i] = src[order[i]];
+
+    // The same as the open batch, its vertices right after the batch's: one
+    // draw longer.
+    Batch& b = g_batch;
+    if (b.open && b.pipeline == pipe && b.vbuf == vs.buf && vs.offset == b.voffset + VkDeviceSize(b.count) * sizeof(GpuVertex) &&
+        b.cull == cull && b.ztest == ztest && b.zwrite == zwrite && b.zop == zop && std::memcmp(&b.vp, &vp, sizeof vp) == 0 &&
+        std::memcmp(&b.sc, &sc, sizeof sc) == 0 && std::memcmp(b.views, views, sizeof views) == 0 &&
+        std::memcmp(b.samps, samps, sizeof samps) == 0 && std::memcmp(&b.block, &block, sizeof block) == 0) {
+        b.count += n;
+        return;
+    }
+    flush_batch();
+
     const Slice us = take(f.ubo, sizeof block, g.ubo_align);
     std::memcpy(us.ptr, &block, sizeof block);
-
     const VkDescriptorSet set = allocate_set(f, g.set_layout);
     VkDescriptorBufferInfo bi{us.buf, us.offset, sizeof block};
     VkDescriptorImageInfo ii[8];
@@ -1648,30 +1746,10 @@ void Renderer::draw(const State& s, const Draw& d) {
     w[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, w[1].pImageInfo = ii;
     vkUpdateDescriptorSets(g.device, 2, w, 0, nullptr);
 
-    VkCommandBuffer cb = f.cb;
-    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline(key));
-    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g.layout, 0, 1, &set, 0, nullptr);
-    vkCmdBindVertexBuffers(cb, 0, 1, &vs.buf, &vs.offset);
-    // GX's viewport and scissor are in EFB pixels: times the internal scale.
-    const float k = float(g.scale);
-    VkViewport vp{s.viewport[0] * k, s.viewport[1] * k, s.viewport[2] * k, s.viewport[3] * k, s.viewport[4], s.viewport[5]};
-    vp.minDepth = std::clamp(vp.minDepth, 0.0f, 1.0f), vp.maxDepth = std::clamp(vp.maxDepth, 0.0f, 1.0f);
-    vkCmdSetViewport(cb, 0, 1, &vp);
-    const uint32_t sx = std::min(s.scissor[0], kEfbWidth), sy = std::min(s.scissor[1], kEfbHeight);
-    VkRect2D sc{{int32_t(sx * g.scale), int32_t(sy * g.scale)},
-                {std::min(s.scissor[2], kEfbWidth - sx) * g.scale, std::min(s.scissor[3], kEfbHeight - sy) * g.scale}};
-    vkCmdSetScissor(cb, 0, 1, &sc);
-    // GX culls by its screen-space winding: front faces are clockwise there,
-    // as in Vulkan's framebuffer space (both y down).
-    vkCmdSetCullMode(cb, lines || points ? VK_CULL_MODE_NONE  // GX culls triangles only
-                         : s.cull == 1   ? VK_CULL_MODE_FRONT_BIT
-                         : s.cull == 2   ? VK_CULL_MODE_BACK_BIT
-                                         : VK_CULL_MODE_NONE);
-    vkCmdSetFrontFace(cb, VK_FRONT_FACE_CLOCKWISE);
-    vkCmdSetDepthTestEnable(cb, s.z_enable ? VK_TRUE : VK_FALSE);
-    vkCmdSetDepthWriteEnable(cb, s.z_enable && s.z_update ? VK_TRUE : VK_FALSE);
-    vkCmdSetDepthCompareOp(cb, static_cast<VkCompareOp>(s.z_func & 7));  // GX's order is Vulkan's
-    vkCmdDraw(cb, static_cast<uint32_t>(order.size()), 1, 0, 0);
+    b.open = true, b.pipeline = pipe, b.set = set, b.block = block, b.vp = vp, b.sc = sc, b.cull = cull;
+    b.ztest = ztest, b.zwrite = zwrite, b.zop = zop, b.vbuf = vs.buf, b.voffset = vs.offset, b.count = n;
+    std::memcpy(b.views, views, sizeof views);
+    std::memcpy(b.samps, samps, sizeof samps);
 }
 
 // A frame (RGBA rows, top first) as a 24-bit BMP (bottom-up BGR rows, each

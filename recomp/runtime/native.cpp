@@ -218,8 +218,8 @@ void report_stats() {
                  s.voice_frames, s.remotes_connected, s.remote_reports);
     std::fprintf(stderr,
                  "qilin_run:          host: %" PRIu64 " frames presented, %" PRIu64 " texture uploads, %" PRIu64
-                 " audio frames dropped (output behind)\n",
-                 s.frames_presented, s.textures_uploaded, s.audio_frames_dropped);
+                 " audio frames dropped (output behind), the draws in %" PRIu64 " batches\n",
+                 s.frames_presented, s.textures_uploaded, s.audio_frames_dropped, s.draw_batches);
     if (s.audio_queue_count)
         std::fprintf(stderr,
                      "qilin_run:          audio out: queued %.1f ms on average (%.1f-%.1f), %" PRIu64
