@@ -19,6 +19,7 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 - **Windows:** the idle wait sleeps on a high-resolution waitable timer and wakes at once when something is posted (a condition variable's wait rounds to the timer period, and Windows 11 ignores `timeBeginPeriod` for a window that isn't visible); the process opts out of power throttling (EcoQoS and the ignored timer request); the game's threads join the multimedia scheduler's "Games" class.
 - **The installer builds without checked memory by default** (about twice as fast in the game's code); `-Checked` builds with it, for reporting a crash. `-Unchecked` is still accepted.
 - **A sound device that can't be opened is tried again every 2 s** (a USB interface's driver stuck: WASAPI's "can't initialize audio client"), so sound starts once it works, rather than the whole session being silent; a driver that refuses the small buffer gets its own.
+- **The controller's shoulder buttons play A (right) and B (left)**, beside the face buttons and the right trigger.
 - **`QILIN_AUDIO_DUMP` says where its time 0 is** against `QILIN_INPUT`'s: 0.605 s after the start, which was all of the "0.6 s from a press to its sound" seen before. The game itself adds no such lag.
 
 ### Added

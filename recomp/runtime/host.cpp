@@ -89,7 +89,8 @@ void update_keys() {
 }
 
 // Controllers as the Wii Remote held upright: the south face button is A,
-// the east one and the right trigger B (the remote's trigger), west 1,
+// the east one, the left shoulder and the right trigger B (the remote's
+// trigger), the right shoulder A as well, west 1,
 // north 2, Start +, Back -, Guide Home; the d-pad and the left stick the
 // remote's d-pad.
 //
@@ -101,8 +102,11 @@ void update_keys() {
 uint16_t pad_buttons(SDL_Gamepad* pad) {
     uint16_t held = 0;
     auto button = [pad](SDL_GamepadButton b) { return SDL_GetGamepadButton(pad, b); };
-    if (button(SDL_GAMEPAD_BUTTON_SOUTH)) held |= kButtonA;
-    if (button(SDL_GAMEPAD_BUTTON_EAST) || SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) > 16000) held |= kButtonB;
+    // The shoulder buttons too (right A, left B): a hand each, for play.
+    if (button(SDL_GAMEPAD_BUTTON_SOUTH) || button(SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER)) held |= kButtonA;
+    if (button(SDL_GAMEPAD_BUTTON_EAST) || button(SDL_GAMEPAD_BUTTON_LEFT_SHOULDER) ||
+        SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) > 16000)
+        held |= kButtonB;
     if (button(SDL_GAMEPAD_BUTTON_WEST)) held |= kButton1;
     if (button(SDL_GAMEPAD_BUTTON_NORTH)) held |= kButton2;
     if (button(SDL_GAMEPAD_BUTTON_START)) held |= kButtonPlus;

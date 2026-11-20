@@ -115,8 +115,8 @@ The Wii Remote is played upright, by a controller or the keyboard (both at once 
 
 | Wii Remote | Controller (any SDL knows) | Keyboard |
 |---|---|---|
-| A | south face button (Xbox A, PlayStation ✕) | Space, K or X |
-| B (the trigger) | east face button, right trigger | L, Z or Left Shift |
+| A | south face button (Xbox A, PlayStation ✕), right shoulder | Space, K or X |
+| B (the trigger) | east face button, left shoulder, right trigger | L, Z or Left Shift |
 | 1, 2 | west, north face buttons | 1 or J, 2 or I |
 | +, − | Start, Back | Enter, Backspace or Tab |
 | Home | Guide | H |

@@ -44,8 +44,8 @@ struct Binding {
     const char *button, *keys, *pad;
 };
 constexpr Binding kBindings[] = {
-    {"A", "Space, K, X", "South (A / Cross)"},
-    {"B", "L, Z, Left Shift", "East (B / Circle), right trigger"},
+    {"A", "Space, K, X", "South (A / Cross), right shoulder"},
+    {"B", "L, Z, Left Shift", "East (B / Circle), left shoulder, right trigger"},
     {"1", "1, J", "West (X / Square)"},
     {"2", "2, I", "North (Y / Triangle)"},
     {"+", "Enter", "Start"},
