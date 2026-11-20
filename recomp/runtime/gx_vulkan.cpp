@@ -34,6 +34,9 @@
 #include <bit>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
+#include <exception>
+#include <utility>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -846,8 +849,9 @@ CopyFormat copy_format(uint32_t f) {
 }
 
 // ---- frames ----
-Frame& cur() { return g.frames[g.frame]; }
+Frame& cur() { return g.frames[g.frame]; }  // the game side's frame slot (its rings)
 void reset(Ring& r);
+VkDescriptorSet allocate_set(Frame& f, VkDescriptorSetLayout layout);
 
 // QILIN_FRAME_STATS=N: every Nth frame's picture read back and summed up
 // (numbers only), to tell a drawn frame from an empty one without looking at
@@ -896,48 +900,134 @@ void sample_frame(Frame& f) {  // its fence has signalled
     if (dump_dir() && f.sample_number >= dump_from) write_bmp(dump_dir(), f.sample_number, f.readback.map, rw, rh);
 }
 
-void begin_frame() {
-    if (g.recording) return;
-    Frame& f = cur();
-    vk_check(vkWaitForFences(g.device, 1, &f.fence, VK_TRUE, UINT64_MAX), "vkWaitForFences");
-    vk_check(vkResetFences(g.device, 1, &f.fence), "vkResetFences");
-    if (f.sampled) sample_frame(f);
-    for (VkDescriptorPool p : f.pools) vk_check(vkResetDescriptorPool(g.device, p, 0), "vkResetDescriptorPool");
-    if (f.timed) {  // that frame's GPU work is done (its fence): read how long it took
-        uint64_t ts[2] = {};
-        if (vkGetQueryPoolResults(g.device, g.timestamps, g.frame * 2, 2, sizeof ts, ts, sizeof ts[0], VK_QUERY_RESULT_64_BIT) ==
-            VK_SUCCESS)
-            note_gpu_frame(static_cast<uint64_t>(double(ts[1] - ts[0]) * g.timestamp_ns));
-        f.timed = false;
+// ---- the render thread ----
+// The game's thread (GX's calls) decides everything and fills the frame's
+// buffers: vertices transformed, uniform blocks, textures checked against
+// guest memory and decoded into the upload ring, images made, pipelines
+// chosen, draws batched. Everything that records or submits GPU commands
+// runs on the render thread, from a queue of commands in the order the
+// game's thread made them: descriptor sets, draws, uploads' copies, clears,
+// the EFB's copies, then acquire, submit and present (and the vblank lock).
+// So the driver's work, the costliest part of a draw, runs beside the
+// game's code rather than in it.
+//
+// Ownership: the rings, the texture and copy maps, images' creation, the
+// garbage list and the samplers are the game side's; command buffers,
+// descriptor pools, the rendering state and the swapchain the render
+// thread's (`r_` functions). Before reusing a frame slot the game side waits
+// until the render thread has submitted that slot's last frame, then its
+// fence. Before the menu parks the game, and before the main thread draws
+// the paused picture or changes the display, the queue is drained. A
+// failure on the render thread (a Vulkan call) is handed to the next call on
+// the game side, which stops with it.
+using Command = std::function<void()>;
+struct RenderQueue {
+    std::mutex m;
+    std::condition_variable work, done;
+    std::vector<Command> queued;     // published, not yet run
+    bool busy = false;               // the render thread is running commands
+    uint64_t frames_submitted = 0;   // frames whose end it has run
+    std::exception_ptr error;        // what stopped it
+} g_rq;
+std::vector<Command> g_pending;          // the producing side's, not yet published
+std::atomic<uint64_t> g_presented{0};    // frames presented (the render thread's count)
+constexpr size_t kPublishEvery = 64;     // commands handed over at a time (and at each frame's end)
+
+void publish() {
+    if (g_pending.empty()) return;
+    {
+        std::lock_guard l(g_rq.m);
+        if (g_rq.error) std::rethrow_exception(g_rq.error);
+        for (Command& c : g_pending) g_rq.queued.push_back(std::move(c));
     }
-    note_ring_peaks(f.vtx.demand, f.ubo.demand, f.upload.demand, f.sets);
-    reset(f.vtx), reset(f.ubo), reset(f.upload);
+    g_pending.clear();
+    g_rq.work.notify_one();
+}
+void record(Command c) {
+    g_pending.push_back(std::move(c));
+    if (g_pending.size() >= kPublishEvery) publish();
+}
+// Everything handed over has run.
+void drain() {
+    publish();
+    std::unique_lock l(g_rq.m);
+    g_rq.done.wait(l, [] { return g_rq.error || (g_rq.queued.empty() && !g_rq.busy); });
+    if (g_rq.error) std::rethrow_exception(g_rq.error);
+}
+// The render thread has run the end of `frames` frames.
+void wait_submitted(uint64_t frames) {
+    publish();
+    std::unique_lock l(g_rq.m);
+    g_rq.done.wait(l, [frames] { return g_rq.error || g_rq.frames_submitted >= frames; });
+    if (g_rq.error) std::rethrow_exception(g_rq.error);
+}
+void note_frame_submitted() {
+    {
+        std::lock_guard l(g_rq.m);
+        ++g_rq.frames_submitted;
+    }
+    g_rq.done.notify_all();
+}
+
+void render_loop() {
+    // The game's threads' scheduling class: it presents, and the vblank
+    // lock times its presents (at normal priority their spread went from
+    // 0.2 to 2 ms and frames missed their vblanks).
+    game_thread_started();
+    std::vector<Command> work;
+    for (;;) {
+        {
+            std::unique_lock l(g_rq.m);
+            g_rq.busy = false;
+            g_rq.done.notify_all();
+            g_rq.work.wait(l, [] { return !g_rq.queued.empty(); });
+            work.swap(g_rq.queued);
+            g_rq.busy = true;
+        }
+        try {
+            for (Command& c : work) c();
+        } catch (...) {
+            {
+                std::lock_guard l(g_rq.m);
+                g_rq.error = std::current_exception();
+                g_rq.busy = false;
+            }
+            g_rq.done.notify_all();
+            return;  // nothing more is run; the game side stops with the error
+        }
+        work.clear();
+    }
+}
+
+// ---- the render thread's side ----
+unsigned g_rslot = 0;      // the frame slot being recorded
+bool g_rendering = false;  // inside a rendering pass on the EFB
+struct Recorded {          // what this rendering pass has bound and set
+    bool valid = false;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    VkViewport vp{};
+    VkRect2D sc{};
+    VkCullModeFlags cull = 0;
+    VkBool32 ztest = VK_FALSE, zwrite = VK_FALSE;
+    VkCompareOp zop = VK_COMPARE_OP_NEVER;
+} g_rec;
+Frame& rcur() { return g.frames[g_rslot]; }
+
+void r_begin_frame(unsigned slot, bool fresh) {
+    g_rslot = slot;
+    Frame& f = rcur();
+    for (VkDescriptorPool p : f.pools) vk_check(vkResetDescriptorPool(g.device, p, 0), "vkResetDescriptorPool");
     f.pool = 0, f.sets = 0;
-    // Images retired two frames ago are no longer in use.
-    std::erase_if(g.garbage, [](auto& e) {
-        if (e.first + kFrames > g.frame_number) return false;
-        free_image(e.second);
-        return true;
-    });
-    // Textures unused for a while go (scenes load into new places; keeping
-    // them all would grow without bound): retired like any other image.
-    if (g.frame_number % 60 == 0)
-        std::erase_if(g.textures, [](auto& e) {
-            if (e.second.last_used + kTextureIdleFrames > g.frame_number) return false;
-            if (e.second.image.img) g.garbage.emplace_back(g.frame_number, e.second.image);
-            return true;
-        });
     VkCommandBufferBeginInfo bi = vk_struct<VkCommandBufferBeginInfo>(VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO);
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vk_check(vkResetCommandBuffer(f.cb, 0), "vkResetCommandBuffer");
     vk_check(vkBeginCommandBuffer(f.cb, &bi), "vkBeginCommandBuffer");
-    g.recording = true;
+    g_rendering = false, g_rec.valid = false;
     if (g.timestamps) {
-        vkCmdResetQueryPool(f.cb, g.timestamps, g.frame * 2, 2);
-        vkCmdWriteTimestamp2(f.cb, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, g.timestamps, g.frame * 2);
+        vkCmdResetQueryPool(f.cb, g.timestamps, slot * 2, 2);
+        vkCmdWriteTimestamp2(f.cb, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, g.timestamps, slot * 2);
     }
-    if (g.efb_fresh) {  // new EFB images: black, depth at the far plane (GX's clear Z default)
-        g.efb_fresh = false;
+    if (fresh) {  // new EFB images: black, depth at the far plane (GX's clear Z default)
         const VkClearColorValue black{};
         const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
         transition(f.cb, g.efb_color, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
@@ -951,6 +1041,70 @@ void begin_frame() {
     }
 }
 
+void r_end_rendering() {
+    if (!g_rendering) return;
+    vkCmdEndRendering(rcur().cb);
+    g_rendering = false;
+    g_rec.valid = false;
+}
+
+void r_begin_rendering() {
+    if (g_rendering) return;
+    g_rec.valid = false;  // a new pass: everything is set again
+    VkCommandBuffer cb = rcur().cb;
+    transition(cb, g.efb_color, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
+    transition(cb, g.efb_depth, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT);
+    VkRenderingAttachmentInfo color = vk_struct<VkRenderingAttachmentInfo>(VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO);
+    color.imageView = g.efb_color.view, color.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    color.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD, color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    VkRenderingAttachmentInfo depth = color;
+    depth.imageView = g.efb_depth.view, depth.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+    VkRenderingInfo ri = vk_struct<VkRenderingInfo>(VK_STRUCTURE_TYPE_RENDERING_INFO);
+    ri.renderArea = {{0, 0}, {kEfbWidth * g.scale, kEfbHeight * g.scale}}, ri.layerCount = 1;
+    ri.colorAttachmentCount = 1, ri.pColorAttachments = &color, ri.pDepthAttachment = &depth;
+    vkCmdBeginRendering(cb, &ri);
+    g_rendering = true;
+}
+
+// ---- the game's side of a frame ----
+void begin_frame() {
+    if (g.recording) return;
+    Frame& f = cur();
+    const unsigned slot = g.frame;
+    // This slot's last frame (kFrames ago) has been submitted, then done.
+    if (g.frame_number >= kFrames) wait_submitted(g.frame_number - kFrames + 1);
+    vk_check(vkWaitForFences(g.device, 1, &f.fence, VK_TRUE, UINT64_MAX), "vkWaitForFences");
+    vk_check(vkResetFences(g.device, 1, &f.fence), "vkResetFences");
+    if (f.sampled) sample_frame(f);
+    if (f.timed) {  // that frame's GPU work is done (its fence): read how long it took
+        uint64_t ts[2] = {};
+        if (vkGetQueryPoolResults(g.device, g.timestamps, slot * 2, 2, sizeof ts, ts, sizeof ts[0], VK_QUERY_RESULT_64_BIT) ==
+            VK_SUCCESS)
+            note_gpu_frame(static_cast<uint64_t>(double(ts[1] - ts[0]) * g.timestamp_ns));
+        f.timed = false;
+    }
+    note_ring_peaks(f.vtx.demand, f.ubo.demand, f.upload.demand, f.sets);
+    reset(f.vtx), reset(f.ubo), reset(f.upload);
+    // Images retired two frames ago are no longer in use (their frame was
+    // recorded, submitted and done).
+    std::erase_if(g.garbage, [](auto& e) {
+        if (e.first + kFrames > g.frame_number) return false;
+        free_image(e.second);
+        return true;
+    });
+    // Textures unused for a while go (scenes load into new places; keeping
+    // them all would grow without bound): retired like any other image.
+    if (g.frame_number % 60 == 0)
+        std::erase_if(g.textures, [](auto& e) {
+            if (e.second.last_used + kTextureIdleFrames > g.frame_number) return false;
+            if (e.second.image.img) g.garbage.emplace_back(g.frame_number, e.second.image);
+            return true;
+        });
+    g.recording = true;
+    const bool fresh = std::exchange(g.efb_fresh, false);
+    record([slot, fresh] { r_begin_frame(slot, fresh); });
+}
+
 // ---- batching draws ----
 // Consecutive draws with the same pipeline, textures, uniform block and
 // dynamic state, whose vertices land next to each other in the vertex ring,
@@ -961,11 +1115,13 @@ void begin_frame() {
 // batch waits open until a draw that differs or anything else recorded: it
 // is flushed in end_rendering (texture uploads, copies and the frame's end
 // all pass through it) and before an EFB clear. Within a rendering pass,
-// state the command buffer already has isn't set again.
+// state the command buffer already has isn't set again (the render
+// thread's g_rec).
 struct Batch {
     bool open = false;
     VkPipeline pipeline = VK_NULL_HANDLE;
-    VkDescriptorSet set = VK_NULL_HANDLE;
+    VkBuffer ubo = VK_NULL_HANDLE;  // the uniform block, written by the game side
+    VkDeviceSize ubo_offset = 0;
     DrawBlock block{};
     VkImageView views[8]{};
     VkSampler samps[8]{};
@@ -978,25 +1134,42 @@ struct Batch {
     VkDeviceSize voffset = 0;
     uint32_t count = 0;
 } g_batch;
-struct Recorded {  // what this rendering pass has bound and set
-    bool valid = false;
-    VkPipeline pipeline = VK_NULL_HANDLE;
-    VkViewport vp{};
-    VkRect2D sc{};
-    VkCullModeFlags cull = 0;
-    VkBool32 ztest = VK_FALSE, zwrite = VK_FALSE;
-    VkCompareOp zop = VK_COMPARE_OP_NEVER;
-} g_rec;
 
-void flush_batch() {
-    if (!g_batch.open) return;
-    g_batch.open = false;
-    ++stats().draw_batches;
-    const Batch& b = g_batch;
-    VkCommandBuffer cb = cur().cb;
+// What a batch's draw needs on the render thread (the block is in the ring).
+struct BatchDraw {
+    VkPipeline pipeline;
+    VkBuffer ubo;
+    VkDeviceSize ubo_offset;
+    VkImageView views[8];
+    VkSampler samps[8];
+    VkViewport vp;
+    VkRect2D sc;
+    VkCullModeFlags cull;
+    VkBool32 ztest, zwrite;
+    VkCompareOp zop;
+    VkBuffer vbuf;
+    VkDeviceSize voffset;
+    uint32_t count;
+};
+
+void r_draw(const BatchDraw& b) {
+    r_begin_rendering();
+    Frame& f = rcur();
+    const VkDescriptorSet set = allocate_set(f, g.set_layout);
+    VkDescriptorBufferInfo bi{b.ubo, b.ubo_offset, sizeof(DrawBlock)};
+    VkDescriptorImageInfo ii[8];
+    for (unsigned m = 0; m < 8; ++m) ii[m] = {b.samps[m], b.views[m], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+    VkWriteDescriptorSet w[2]{};
+    w[0].sType = w[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    w[0].dstSet = set, w[0].dstBinding = 0, w[0].descriptorCount = 1;
+    w[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, w[0].pBufferInfo = &bi;
+    w[1].dstSet = set, w[1].dstBinding = 1, w[1].descriptorCount = 8;
+    w[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, w[1].pImageInfo = ii;
+    vkUpdateDescriptorSets(g.device, 2, w, 0, nullptr);
+    VkCommandBuffer cb = f.cb;
     const bool all = !g_rec.valid;
     if (all || g_rec.pipeline != b.pipeline) vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, b.pipeline);
-    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g.layout, 0, 1, &b.set, 0, nullptr);
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g.layout, 0, 1, &set, 0, nullptr);
     vkCmdBindVertexBuffers(cb, 0, 1, &b.vbuf, &b.voffset);
     if (all || std::memcmp(&g_rec.vp, &b.vp, sizeof b.vp) != 0) vkCmdSetViewport(cb, 0, 1, &b.vp);
     if (all || std::memcmp(&g_rec.sc, &b.sc, sizeof b.sc) != 0) vkCmdSetScissor(cb, 0, 1, &b.sc);
@@ -1010,32 +1183,26 @@ void flush_batch() {
     g_rec.ztest = b.ztest, g_rec.zwrite = b.zwrite, g_rec.zop = b.zop;
 }
 
-void end_rendering() {
-    if (!g.rendering) return;
-    flush_batch();
-    vkCmdEndRendering(cur().cb);
-    g.rendering = false;
-    g_rec.valid = false;
+void flush_batch() {
+    if (!g_batch.open) return;
+    g_batch.open = false;
+    ++stats().draw_batches;
+    const Batch& b = g_batch;
+    BatchDraw d{b.pipeline, b.ubo, b.ubo_offset, {}, {}, b.vp, b.sc, b.cull, b.ztest, b.zwrite, b.zop, b.vbuf, b.voffset, b.count};
+    std::memcpy(d.views, b.views, sizeof d.views);
+    std::memcpy(d.samps, b.samps, sizeof d.samps);
+    record([d] { r_draw(d); });
 }
 
-void begin_rendering() {
-    begin_frame();
-    if (g.rendering) return;
-    g_rec.valid = false;  // a new pass: everything is set again
-    VkCommandBuffer cb = cur().cb;
-    transition(cb, g.efb_color, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
-    transition(cb, g.efb_depth, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT);
-    VkRenderingAttachmentInfo color = vk_struct<VkRenderingAttachmentInfo>(VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO);
-    color.imageView = g.efb_color.view, color.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    color.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD, color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-    VkRenderingAttachmentInfo depth = color;
-    depth.imageView = g.efb_depth.view, depth.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
-    VkRenderingInfo ri = vk_struct<VkRenderingInfo>(VK_STRUCTURE_TYPE_RENDERING_INFO);
-    ri.renderArea = {{0, 0}, {kEfbWidth * g.scale, kEfbHeight * g.scale}}, ri.layerCount = 1;
-    ri.colorAttachmentCount = 1, ri.pColorAttachments = &color, ri.pDepthAttachment = &depth;
-    vkCmdBeginRendering(cb, &ri);
-    g.rendering = true;
+// The game side's end of a rendering pass: the open batch, then the end.
+void end_rendering() {
+    flush_batch();
+    record([] { r_end_rendering(); });
 }
+
+// The game side makes sure a frame is open; the pass itself is begun by the
+// render thread when a draw or clear needs it.
+void begin_rendering() { begin_frame(); }
 
 // Space in one of the frame's rings: in its buffer, or in a spill buffer
 // when the frame needs more than it holds.
@@ -1183,9 +1350,18 @@ const Image& texture(const State& s, const TexMap& t) {
     if (!tex.image.img)
         tex.image = make_image(t.width, t.height, VK_FORMAT_R8G8B8A8_UNORM,
                                VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_COLOR_BIT, levels);
+    // Decoded here, from guest memory as it is now, into the upload ring;
+    // the render thread records the copies. Every level is written, so the
+    // image's old contents (UNDEFINED) don't matter, and the barrier still
+    // orders the copies after this frame's earlier reads of it.
     Frame& f = cur();
     end_rendering();
-    transition(f.cb, tex.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
+    struct Level {
+        VkBuffer buf;
+        VkBufferImageCopy copy;
+    };
+    std::vector<Level> regions;
+    regions.reserve(levels);
     uint32_t src = t.image;
     for (uint32_t l = 0; l < levels; ++l) {
         const uint32_t w = std::max(1u, uint32_t(t.width) >> l), hgt = std::max(1u, uint32_t(t.height) >> l);
@@ -1197,9 +1373,17 @@ const Image& texture(const State& s, const TexMap& t) {
         copy.bufferOffset = up.offset;
         copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, l, 0, 1};
         copy.imageExtent = {w, hgt, 1};
-        vkCmdCopyBufferToImage(f.cb, up.buf, tex.image.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+        regions.push_back({up.buf, copy});
     }
-    transition(f.cb, tex.image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
+    record([img = tex.image.img, levels, regions = std::move(regions)] {
+        r_end_rendering();
+        VkCommandBuffer cb = rcur().cb;
+        transition(cb, img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT, levels);
+        for (const Level& r : regions)
+            vkCmdCopyBufferToImage(cb, r.buf, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r.copy);
+        transition(cb, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                   VK_IMAGE_ASPECT_COLOR_BIT, levels);
+    });
     ++stats().textures_uploaded;
     return tex.image;
 }
@@ -1528,11 +1712,16 @@ void clear_efb(const State& s, const uint16_t rect[4]) {
     ca[1].aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
     ca[1].clearValue.depthStencil = {float(s.clear_z) / float(0xFFFFFF), 0};
     const uint32_t x = std::min<uint32_t>(rect[0], kEfbWidth), y = std::min<uint32_t>(rect[1], kEfbHeight);
-    VkClearRect r{{{int32_t(x * g.scale), int32_t(y * g.scale)},
-                   {std::min<uint32_t>(rect[2], kEfbWidth - x) * g.scale, std::min<uint32_t>(rect[3], kEfbHeight - y) * g.scale}},
-                  0, 1};
-    if (r.rect.extent.width && r.rect.extent.height) vkCmdClearAttachments(cur().cb, 2, ca, 1, &r);
-    end_rendering();
+    const VkClearRect r{{{int32_t(x * g.scale), int32_t(y * g.scale)},
+                         {std::min<uint32_t>(rect[2], kEfbWidth - x) * g.scale, std::min<uint32_t>(rect[3], kEfbHeight - y) * g.scale}},
+                        0, 1};
+    if (!r.rect.extent.width || !r.rect.extent.height) return;
+    record([c0 = ca[0], c1 = ca[1], r] {
+        r_begin_rendering();
+        const VkClearAttachment both[2] = {c0, c1};
+        vkCmdClearAttachments(rcur().cb, 2, both, 1, &r);
+        r_end_rendering();
+    });
 }
 
 // GXCopyTex: the EFB's source rectangle into a texture image the later
@@ -1549,45 +1738,50 @@ void Renderer::copy_texture(const State& s, uint32_t dest, bool clear) {
     if (s.tex_dst_mipmap && (2 * w > s.tex_src[2] || 2 * h > s.tex_src[3])) unsupported("a halving copy larger than its source", w);
     begin_frame();
     end_rendering();
-    Frame& f = cur();
     EfbCopy& c = g_copies[norm_addr(dest)];
     if (c.image.img && (c.width != w || c.height != h || c.scale != g.scale))  // (the menu can change the scale)
         g.garbage.emplace_back(g.frame_number, c.image), c.image = Image{};
     c.scale = g.scale;
-    if (!c.image.img)
+    const bool fresh = !c.image.img;  // a new image: nothing in it yet; else it was left ready to sample
+    if (fresh)
         c.image = make_image(w * g.scale, h * g.scale, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
                              VK_IMAGE_ASPECT_COLOR_BIT);
     c.width = w, c.height = h, c.format = s.tex_dst_format;
     c.guest_bytes = texture_bytes(cf.mem_format, w, h);
     c.made = write_generation();
 
-    transition(f.cb, g.efb_color, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
-    transition(f.cb, c.image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
-    const VkDescriptorSet set = allocate_set(f, g.copy_set_layout);
-    VkDescriptorImageInfo ii{g.efb_sampler, g.efb_color.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
-    VkWriteDescriptorSet wr = vk_struct<VkWriteDescriptorSet>(VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET);
-    wr.dstSet = set, wr.descriptorCount = 1, wr.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, wr.pImageInfo = &ii;
-    vkUpdateDescriptorSets(g.device, 1, &wr, 0, nullptr);
-
-    VkRenderingAttachmentInfo color = vk_struct<VkRenderingAttachmentInfo>(VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO);
-    color.imageView = c.image.view, color.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    color.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE, color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-    VkRenderingInfo ri = vk_struct<VkRenderingInfo>(VK_STRUCTURE_TYPE_RENDERING_INFO);
-    ri.renderArea = {{0, 0}, {w * g.scale, h * g.scale}}, ri.layerCount = 1, ri.colorAttachmentCount = 1, ri.pColorAttachments = &color;
-    vkCmdBeginRendering(f.cb, &ri);
-    vkCmdBindPipeline(f.cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g.copy_pipeline);
-    vkCmdBindDescriptorSets(f.cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g.copy_layout, 0, 1, &set, 0, nullptr);
-    const VkViewport vp{0, 0, float(w * g.scale), float(h * g.scale), 0, 1};
-    const VkRect2D sc{{0, 0}, {w * g.scale, h * g.scale}};
-    vkCmdSetViewport(f.cb, 0, 1, &vp);
-    vkCmdSetScissor(f.cb, 0, 1, &sc);
-    const float k = float(g.scale);  // the copy keeps the internal resolution
-    const CopyBlock pc{{float(s.tex_src[0]) * k, float(s.tex_src[1]) * k, float(s.tex_src[2]) * k, float(s.tex_src[3]) * k},
+    const uint32_t k = g.scale;  // the copy keeps the internal resolution
+    const CopyBlock pc{{float(s.tex_src[0] * k), float(s.tex_src[1] * k), float(s.tex_src[2] * k), float(s.tex_src[3] * k)},
                        {cf.mode, s.tex_dst_mipmap ? 1u : 0u, 0, 0}};
-    vkCmdPushConstants(f.cb, g.copy_layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof pc, &pc);
-    vkCmdDraw(f.cb, 3, 1, 0, 0);
-    vkCmdEndRendering(f.cb);
-    transition(f.cb, c.image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
+    record([img = c.image.img, view = c.image.view, fresh, w = w * k, h = h * k, pc] {
+        r_end_rendering();
+        Frame& f = rcur();
+        transition(f.cb, g.efb_color, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
+        transition(f.cb, img, fresh ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                   VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
+        const VkDescriptorSet set = allocate_set(f, g.copy_set_layout);
+        VkDescriptorImageInfo ii{g.efb_sampler, g.efb_color.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+        VkWriteDescriptorSet wr = vk_struct<VkWriteDescriptorSet>(VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET);
+        wr.dstSet = set, wr.descriptorCount = 1, wr.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, wr.pImageInfo = &ii;
+        vkUpdateDescriptorSets(g.device, 1, &wr, 0, nullptr);
+        VkRenderingAttachmentInfo color = vk_struct<VkRenderingAttachmentInfo>(VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO);
+        color.imageView = view, color.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        color.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE, color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        VkRenderingInfo ri = vk_struct<VkRenderingInfo>(VK_STRUCTURE_TYPE_RENDERING_INFO);
+        ri.renderArea = {{0, 0}, {w, h}}, ri.layerCount = 1, ri.colorAttachmentCount = 1, ri.pColorAttachments = &color;
+        vkCmdBeginRendering(f.cb, &ri);
+        vkCmdBindPipeline(f.cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g.copy_pipeline);
+        vkCmdBindDescriptorSets(f.cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g.copy_layout, 0, 1, &set, 0, nullptr);
+        const VkViewport vp{0, 0, float(w), float(h), 0, 1};
+        const VkRect2D sc{{0, 0}, {w, h}};
+        vkCmdSetViewport(f.cb, 0, 1, &vp);
+        vkCmdSetScissor(f.cb, 0, 1, &sc);
+        vkCmdPushConstants(f.cb, g.copy_layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof pc, &pc);
+        vkCmdDraw(f.cb, 3, 1, 0, 0);
+        vkCmdEndRendering(f.cb);
+        transition(f.cb, img, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
+        g_rec.valid = false;  // the copy's pipeline and state replaced the draws'
+    });
     if (clear) clear_efb(s, s.tex_src);
 }
 
@@ -1732,21 +1926,9 @@ void Renderer::draw(const State& s, const Draw& d) {
     }
     flush_batch();
 
-    const Slice us = take(f.ubo, sizeof block, g.ubo_align);
+    const Slice us = take(f.ubo, sizeof block, g.ubo_align);  // the render thread makes the descriptor set
     std::memcpy(us.ptr, &block, sizeof block);
-    const VkDescriptorSet set = allocate_set(f, g.set_layout);
-    VkDescriptorBufferInfo bi{us.buf, us.offset, sizeof block};
-    VkDescriptorImageInfo ii[8];
-    for (unsigned m = 0; m < 8; ++m) ii[m] = {samps[m], views[m], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
-    VkWriteDescriptorSet w[2]{};
-    w[0].sType = w[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    w[0].dstSet = set, w[0].dstBinding = 0, w[0].descriptorCount = 1;
-    w[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, w[0].pBufferInfo = &bi;
-    w[1].dstSet = set, w[1].dstBinding = 1, w[1].descriptorCount = 8;
-    w[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, w[1].pImageInfo = ii;
-    vkUpdateDescriptorSets(g.device, 2, w, 0, nullptr);
-
-    b.open = true, b.pipeline = pipe, b.set = set, b.block = block, b.vp = vp, b.sc = sc, b.cull = cull;
+    b.open = true, b.pipeline = pipe, b.ubo = us.buf, b.ubo_offset = us.offset, b.block = block, b.vp = vp, b.sc = sc, b.cull = cull;
     b.ztest = ztest, b.zwrite = zwrite, b.zop = zop, b.vbuf = vs.buf, b.voffset = vs.offset, b.count = n;
     std::memcpy(b.views, views, sizeof views);
     std::memcpy(b.samps, samps, sizeof samps);
@@ -1855,7 +2037,7 @@ void finish_frame(Frame& f) {
         }
     }
     if (g.timestamps) {
-        vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, g.timestamps, g.frame * 2 + 1);
+        vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, g.timestamps, g_rslot * 2 + 1);
         f.timed = true;
     }
     vk_check(vkEndCommandBuffer(cb), "vkEndCommandBuffer");
@@ -1872,7 +2054,6 @@ void finish_frame(Frame& f) {
         si.signalSemaphoreInfoCount = 1, si.pSignalSemaphoreInfos = &signal;
     }
     vk_check(vkQueueSubmit2(g.queue, 1, &si, f.fence), "vkQueueSubmit2");
-    g.recording = false;
     if (image != UINT32_MAX) {
         VkPresentInfoKHR pi = vk_struct<VkPresentInfoKHR>(VK_STRUCTURE_TYPE_PRESENT_INFO_KHR);
         pi.waitSemaphoreCount = 1, pi.pWaitSemaphores = &g.rendered[image];
@@ -1880,7 +2061,7 @@ void finish_frame(Frame& f) {
         const VkResult r = vkQueuePresentKHR(g.queue, &pi);
         if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) g.resized = true;
         else vk_check(r, "vkQueuePresentKHR");
-        ++stats().frames_presented;
+        g_presented.fetch_add(1, std::memory_order_relaxed);
     }
 }
 
@@ -1968,35 +2149,50 @@ void Renderer::copy_display(const State& s, uint32_t, bool clear) {
         begin_frame();
         end_rendering();
         Frame& f = cur();
-        VkCommandBuffer cb = f.cb;
+        const unsigned slot = g.frame;
         const uint32_t rw = s.disp_src[2] * g.scale, rh = s.disp_src[3] * g.scale;
-        transition(cb, g.efb_color, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
-        transition(cb, g.last_frame, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
         VkImageCopy region{};
         region.srcSubresource = region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
         region.srcOffset = {int32_t(s.disp_src[0] * g.scale), int32_t(s.disp_src[1] * g.scale), 0};
         region.extent = {rw, rh, 1};
-        vkCmdCopyImage(cb, g.efb_color.img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g.last_frame.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                       1, &region);
-        g.last_w = rw, g.last_h = rh;
         // QILIN_FRAME_STATS / QILIN_FRAME_DUMP: the picture read back with
         // the frame, looked at when its fence is next waited on (sample_frame).
         const bool sampled = sample_every() && g.frame_number % sample_every() == 0;
-        if (sampled || bot::active()) {  // the lockstep bot sees every frame
-            VkBufferImageCopy back{};
-            back.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-            back.imageOffset = region.srcOffset;
-            back.imageExtent = {rw, rh, 1};
-            vkCmdCopyImageToBuffer(cb, g.efb_color.img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, f.readback.buf, 1, &back);
-            if (sampled) f.sampled = true, f.sample_w = rw, f.sample_h = rh, f.sample_number = g.frame_number;
-        }
+        const bool readback = sampled || bot::active();  // the lockstep bot sees every frame
+        if (sampled) f.sampled = true, f.sample_w = rw, f.sample_h = rh, f.sample_number = g.frame_number;
+        record([slot, region, rw, rh, readback] {
+            r_end_rendering();
+            Frame& rf = g.frames[slot];
+            VkCommandBuffer cb = rf.cb;
+            transition(cb, g.efb_color, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
+            transition(cb, g.last_frame, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
+            vkCmdCopyImage(cb, g.efb_color.img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g.last_frame.img,
+                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+            g.last_w = rw, g.last_h = rh;
+            if (readback) {
+                VkBufferImageCopy back{};
+                back.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                back.imageOffset = region.srcOffset;
+                back.imageExtent = {rw, rh, 1};
+                vkCmdCopyImageToBuffer(cb, g.efb_color.img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, rf.readback.buf, 1, &back);
+            }
+        });
         if (clear) clear_efb(s, s.disp_src);
-        finish_frame(f);
-        steer_to_vblank();
+        flush_batch();
+        record([slot] {
+            r_end_rendering();
+            finish_frame(g.frames[slot]);
+            steer_to_vblank();
+            note_frame_submitted();
+        });
+        publish();  // the frame goes at once: the render thread records its end while the game goes on
+        g.recording = false;
+        stats().frames_presented = g_presented.load(std::memory_order_relaxed);
         if (bot::active()) {
             // The game's clock stops from here until the bot has answered:
             // the wait for the picture and the bot's thinking aren't the game's.
             const uint64_t stopped = time_base_unpaused();
+            wait_submitted(g.frame_number + 1);
             vk_check(vkWaitForFences(g.device, 1, &f.fence, VK_TRUE, UINT64_MAX), "vkWaitForFences");
             bot::frame(g.frame_number, f.readback.map, rw, rh);
             skip_time_base(time_base_unpaused() - stopped);
@@ -2008,7 +2204,10 @@ void Renderer::copy_display(const State& s, uint32_t, bool clear) {
             save_pipeline_cache();
         }
     }
-    park_if_requested();  // the settings menu: nothing is being recorded now
+    // The settings menu: the render thread finishes what it was given, then
+    // the main thread has the renderer while the game is parked.
+    if (pause_requested()) drain();
+    park_if_requested();
 }
 // ---- start-up ----
 bool fail(const char* what) {
@@ -2173,12 +2372,14 @@ bool create_resources() {
     // The first frame clears the EFB (begin_frame), and the blank texture
     // is transparent black.
     begin_frame();
-    Frame& f = cur();
-    const VkClearColorValue black{};
-    const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    transition(f.cb, g.blank, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
-    vkCmdClearColorImage(f.cb, g.blank.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &range);
-    transition(f.cb, g.blank, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
+    record([] {
+        VkCommandBuffer cb = rcur().cb;
+        const VkClearColorValue black{};
+        const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        transition(cb, g.blank, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
+        vkCmdClearColorImage(cb, g.blank.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &range);
+        transition(cb, g.blank, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
+    });
     return true;
 }
 
@@ -2222,16 +2423,28 @@ void set_overlay(std::function<void(void* command_buffer)> draw) {
     else g.overlay = [draw = std::move(draw)](VkCommandBuffer cb) { draw(cb); };
 }
 
+// While the game is parked the main thread produces the frames (the game's
+// thread is still, so the queue has one producer still); each is run to the
+// end before the next.
 void present_paused() {
     begin_frame();
     end_rendering();
-    finish_frame(cur());
+    const unsigned slot = g.frame;
+    record([slot] {
+        r_end_rendering();
+        finish_frame(g.frames[slot]);
+        note_frame_submitted();
+    });
+    g.recording = false;
+    drain();
+    stats().frames_presented = g_presented.load(std::memory_order_relaxed);
     g.frame = (g.frame + 1) % kFrames;
     ++g.frame_number;
 }
 
 void apply_display_settings() {
     const Settings& s = settings();
+    drain();  // nothing in hand on the render thread while images and samplers are remade
     vk_check(vkDeviceWaitIdle(g.device), "vkDeviceWaitIdle");
     if (s.internal_scale != g.scale) {  // new EFB images (copies already made stay: they're textures at any size)
         g.scale = s.internal_scale;
@@ -2294,6 +2507,7 @@ bool init_vulkan(SDL_Window* window) {
     } catch (const Stop&) {
         return false;
     }
+    std::thread(render_loop).detach();  // runs what create_resources queued, then the game's frames
     set_sink(&g_renderer);
     return true;
 }

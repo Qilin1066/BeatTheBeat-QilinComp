@@ -16,5 +16,7 @@ void request_pause(bool on);
 bool game_parked();
 // The game's thread, at the end of each frame: parks while a pause is asked for.
 void park_if_requested();
+// Whether a pause is asked for (the renderer drains its queue before parking).
+bool pause_requested();
 
 }  // namespace qilin::rt

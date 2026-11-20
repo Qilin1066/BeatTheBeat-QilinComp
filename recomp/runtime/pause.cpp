@@ -27,6 +27,8 @@ void request_pause(bool on) {
     g_changed.notify_all();
 }
 
+bool pause_requested() { return g_requested_fast.load(std::memory_order_acquire); }
+
 bool game_parked() {
     std::lock_guard l(g_mutex);
     return g_parked;
