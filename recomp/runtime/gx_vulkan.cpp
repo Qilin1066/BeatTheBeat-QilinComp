@@ -61,6 +61,8 @@
 
 #include "copy_frag.h"
 #include "copy_vert.h"
+#include "crt_frag.h"
+#include "present_vert.h"
 #include "gx_frag.h"
 #include "gx_vert.h"
 
@@ -121,6 +123,7 @@ void vk_check(VkResult r, const char* what) {
 }
 
 constexpr uint32_t kEfbWidth = 640, kEfbHeight = 528;
+constexpr size_t kFrameTimeWindow = 1200;  // the F3 readout's frames: 20 s at 60 a second
 constexpr VkFormat kEfbColor = VK_FORMAT_R8G8B8A8_UNORM, kEfbDepth = VK_FORMAT_D32_SFLOAT;
 constexpr unsigned kFrames = 2;
 // Starting sizes, per frame in flight. Measured at the title: 111 KB of
@@ -1985,6 +1988,135 @@ VkRect2D picture_rect() {
     return {{int32_t((W - w) / 2), int32_t((H - h) / 2)}, {uint32_t(w), uint32_t(h)}};
 }
 
+// The internal resolution for a setting: as set, or for 0 the whole number of
+// times the console's 480 lines fit the display's height in pixels (3x on a
+// 1440-line display, 2x at 1080, 4x at 2160), 1-8.
+uint32_t resolve_scale(uint32_t setting) {
+    if (setting) return setting;
+    const SDL_DisplayMode* m = g.window ? SDL_GetDesktopDisplayMode(SDL_GetDisplayForWindow(g.window)) : nullptr;
+    const double h = m ? double(m->h) * double(m->pixel_density > 0 ? m->pixel_density : 1.0f) : 480.0;
+    return std::clamp(uint32_t(h / 480.0), 1u, 8u);
+}
+
+// ---- the CRT look (settings: look = crt; shaders/crt.frag) ----
+// The picture drawn into the window's image through the CRT shader instead
+// of blitted: made on first use, for the window's format (made again if that
+// changes). The render thread's.
+struct CrtPass {
+    VkFormat format = VK_FORMAT_UNDEFINED;
+    VkDescriptorSetLayout set_layout = VK_NULL_HANDLE;
+    VkPipelineLayout layout = VK_NULL_HANDLE;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    VkSampler sampler = VK_NULL_HANDLE;
+    VkShaderModule vert = VK_NULL_HANDLE, frag = VK_NULL_HANDLE;
+} g_crt;
+struct CrtPush {
+    float uv_scale[2];
+    float lines, scanlines, mask;
+};
+
+void make_crt_pass() {
+    if (g_crt.pipeline && g_crt.format == g.swap_format) return;
+    if (!g_crt.set_layout) {
+        VkDescriptorSetLayoutBinding b{};
+        b.binding = 0, b.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, b.descriptorCount = 1;
+        b.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        VkDescriptorSetLayoutCreateInfo li = vk_struct<VkDescriptorSetLayoutCreateInfo>(VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO);
+        li.bindingCount = 1, li.pBindings = &b;
+        vk_check(vkCreateDescriptorSetLayout(g.device, &li, nullptr, &g_crt.set_layout), "vkCreateDescriptorSetLayout");
+        const VkPushConstantRange pr{VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(CrtPush)};
+        VkPipelineLayoutCreateInfo pl = vk_struct<VkPipelineLayoutCreateInfo>(VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO);
+        pl.setLayoutCount = 1, pl.pSetLayouts = &g_crt.set_layout, pl.pushConstantRangeCount = 1, pl.pPushConstantRanges = &pr;
+        vk_check(vkCreatePipelineLayout(g.device, &pl, nullptr, &g_crt.layout), "vkCreatePipelineLayout");
+        VkSamplerCreateInfo si = vk_struct<VkSamplerCreateInfo>(VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO);
+        si.magFilter = si.minFilter = VK_FILTER_LINEAR;  // along a line: the frame's own detail
+        si.addressModeU = si.addressModeV = si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        vk_check(vkCreateSampler(g.device, &si, nullptr, &g_crt.sampler), "vkCreateSampler");
+        g_crt.vert = shader(k_present_vert, sizeof k_present_vert);
+        g_crt.frag = shader(k_crt_frag, sizeof k_crt_frag);
+    }
+    if (g_crt.pipeline) vkDestroyPipeline(g.device, g_crt.pipeline, nullptr);  // the window's format changed (the GPU is idle then)
+    VkPipelineShaderStageCreateInfo stages[2]{};
+    stages[0].sType = stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT, stages[0].module = g_crt.vert, stages[0].pName = "main";
+    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT, stages[1].module = g_crt.frag, stages[1].pName = "main";
+    VkPipelineVertexInputStateCreateInfo vin = vk_struct<VkPipelineVertexInputStateCreateInfo>(VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO);
+    VkPipelineInputAssemblyStateCreateInfo ia = vk_struct<VkPipelineInputAssemblyStateCreateInfo>(VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO);
+    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    VkPipelineViewportStateCreateInfo vp = vk_struct<VkPipelineViewportStateCreateInfo>(VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO);
+    vp.viewportCount = 1, vp.scissorCount = 1;
+    VkPipelineRasterizationStateCreateInfo rs = vk_struct<VkPipelineRasterizationStateCreateInfo>(VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO);
+    rs.polygonMode = VK_POLYGON_MODE_FILL, rs.cullMode = VK_CULL_MODE_NONE, rs.lineWidth = 1.0f;
+    VkPipelineMultisampleStateCreateInfo ms = vk_struct<VkPipelineMultisampleStateCreateInfo>(VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO);
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    VkPipelineColorBlendAttachmentState att{};
+    att.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    VkPipelineColorBlendStateCreateInfo cb = vk_struct<VkPipelineColorBlendStateCreateInfo>(VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO);
+    cb.attachmentCount = 1, cb.pAttachments = &att;
+    const VkDynamicState dyn[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dy = vk_struct<VkPipelineDynamicStateCreateInfo>(VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO);
+    dy.dynamicStateCount = 2, dy.pDynamicStates = dyn;
+    VkPipelineRenderingCreateInfo ri = vk_struct<VkPipelineRenderingCreateInfo>(VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO);
+    ri.colorAttachmentCount = 1, ri.pColorAttachmentFormats = &g.swap_format;
+    VkGraphicsPipelineCreateInfo pi = vk_struct<VkGraphicsPipelineCreateInfo>(VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO);
+    pi.pNext = &ri, pi.stageCount = 2, pi.pStages = stages, pi.pVertexInputState = &vin, pi.pInputAssemblyState = &ia;
+    pi.pViewportState = &vp, pi.pRasterizationState = &rs, pi.pMultisampleState = &ms, pi.pColorBlendState = &cb;
+    pi.pDynamicState = &dy, pi.layout = g_crt.layout;
+    vk_check(vkCreateGraphicsPipelines(g.device, g.pipeline_cache, 1, &pi, nullptr, &g_crt.pipeline), "vkCreateGraphicsPipelines");
+    g_crt.format = g.swap_format;
+}
+
+// The last picture through the CRT shader into the window's image `image`
+// (its layout TRANSFER_DST before and after), within `r`.
+void crt_pass(Frame& f, VkCommandBuffer cb, uint32_t image, const VkRect2D& r) {
+    make_crt_pass();
+    const VkImage dst = g.swap_images[image];
+    transition(cb, g.last_frame, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
+    transition(cb, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
+    const VkDescriptorSet set = allocate_set(f, g_crt.set_layout);
+    const VkDescriptorImageInfo ii{g_crt.sampler, g.last_frame.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+    VkWriteDescriptorSet w = vk_struct<VkWriteDescriptorSet>(VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET);
+    w.dstSet = set, w.descriptorCount = 1, w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, w.pImageInfo = &ii;
+    vkUpdateDescriptorSets(g.device, 1, &w, 0, nullptr);
+    VkRenderingAttachmentInfo color = vk_struct<VkRenderingAttachmentInfo>(VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO);
+    color.imageView = g.swap_views[image], color.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    color.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD, color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;  // the bars around it stay black
+    VkRenderingInfo ri = vk_struct<VkRenderingInfo>(VK_STRUCTURE_TYPE_RENDERING_INFO);
+    ri.renderArea = {{0, 0}, g.extent}, ri.layerCount = 1, ri.colorAttachmentCount = 1, ri.pColorAttachments = &color;
+    vkCmdBeginRendering(cb, &ri);
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g_crt.pipeline);
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g_crt.layout, 0, 1, &set, 0, nullptr);
+    const VkViewport vp{float(r.offset.x), float(r.offset.y), float(r.extent.width), float(r.extent.height), 0, 1};
+    vkCmdSetViewport(cb, 0, 1, &vp);
+    vkCmdSetScissor(cb, 0, 1, &r);
+    const Settings& s = settings();
+    const CrtPush push{{float(g.last_w) / float(g.last_frame.w), float(g.last_h) / float(g.last_frame.h)},
+                       float(g.last_h) / float(g.scale), float(s.scanlines) / 100.0f, float(s.mask) / 100.0f};
+    vkCmdPushConstants(cb, g_crt.layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof push, &push);
+    vkCmdDraw(cb, 3, 1, 0, 0);
+    vkCmdEndRendering(cb);
+    transition(cb, dst, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
+}
+
+// ---- frame times (the F3 readout) ----
+// The time between presents, over the last 20 s at 60 frames a second: the
+// render thread adds, the main thread reads, under a lock (once a frame).
+std::mutex g_ft_lock;
+std::array<float, kFrameTimeWindow> g_ft{};
+size_t g_ft_next = 0, g_ft_count = 0;
+uint64_t g_ft_last = 0;  // the render thread's: the last present (steady ns)
+
+void note_frame_time() {
+    const auto now = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+    const uint64_t last = std::exchange(g_ft_last, now);
+    if (!last) return;
+    std::lock_guard l(g_ft_lock);
+    g_ft[g_ft_next] = float(double(now - last) / 1e6);
+    g_ft_next = (g_ft_next + 1) % kFrameTimeWindow;
+    if (g_ft_count < kFrameTimeWindow) ++g_ft_count;
+}
+
 // The end of a frame: a window image gets the last picture (and the menu
 // over it, if one is open), then the frame is submitted and presented.
 void finish_frame(Frame& f) {
@@ -2005,7 +2137,9 @@ void finish_frame(Frame& f) {
         const VkClearColorValue black{};
         const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
         vkCmdClearColorImage(cb, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &range);
-        if (g.last_w && g.last_h) {
+        if (g.last_w && g.last_h && settings().look == Look::crt && g.swap_drawable) {
+            crt_pass(f, cb, image, picture_rect());
+        } else if (g.last_w && g.last_h) {
             transition(cb, g.last_frame, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
             const VkRect2D r = picture_rect();
             VkImageBlit blit{};
@@ -2062,6 +2196,7 @@ void finish_frame(Frame& f) {
         if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) g.resized = true;
         else vk_check(r, "vkQueuePresentKHR");
         g_presented.fetch_add(1, std::memory_order_relaxed);
+        note_frame_time();
     }
 }
 
@@ -2080,9 +2215,12 @@ void finish_frame(Frame& f) {
 // the GPU and the compositor's latch: at 2.5 ms about one frame in 500 just
 // missed its vblank, measured at 120 Hz on a GTX 1080 Ti). Windows only
 // (the compositor's vblank times); elsewhere the display lock alone.
+// Switched by the main thread (lock_frames_to_vblank, whenever the display
+// changes); the rest is the render thread's.
+std::atomic<double> g_vbl_base{0.0};  // the display lock's speed; 0: off
+std::atomic<double> g_vbl_last_slack{0.0};  // ms before the vblank, averaged (the F3 readout)
 struct VblankLock {
-    bool on = false;
-    double base = 1.0;                // the display lock's speed
+    double base = 0;                  // the speed the averages below are for (a new one starts them again)
     double mean = 0, var = 0;         // the slack's error from the target (ns), averaged
     double integral = 0, delta = 0;   // the loop's state; the speed is base * (1 + delta)
     uint64_t last = 0, frames = 0, skipped = 0;
@@ -2091,7 +2229,11 @@ struct VblankLock {
 } g_vbl;
 
 void steer_to_vblank() {
-    if (!g_vbl.on) return;
+    const double base = g_vbl_base.load(std::memory_order_relaxed);
+    if (base == 0) return;
+    if (base != g_vbl.base) {  // a new lock: start again
+        g_vbl.base = base, g_vbl.frames = 0, g_vbl.integral = 0, g_vbl.delta = 0, g_vbl.last = 0;
+    }
     uint64_t vblank = 0, period = 0;
     if (!display_vblank(vblank, period)) return;
     const auto now = static_cast<uint64_t>(
@@ -2127,13 +2269,16 @@ void steer_to_vblank() {
     g_vbl.var = (1 - a) * (g_vbl.var + a * d * d);
     if (g_vbl.frames < 16) return;  // the averages settle first
     g_vbl.slack_sum += slack, ++g_vbl.slack_count;
+    g_vbl_last_slack.store((g_vbl.target + g_vbl.mean) / 1e6, std::memory_order_relaxed);  // the F3 readout
     // PI: presenting early (slack above the target) slows the game a little,
     // so its frames come later. Gains for a well-damped loop that settles in
     // about 10 s: Kp 1/s, Ki 0.25/s^2 (e in seconds).
     const double es = g_vbl.mean / 1e9, dts = dt / 1e9;
     g_vbl.integral = std::clamp(g_vbl.integral + 0.25 * es * dts, -0.001, 0.001);
     g_vbl.delta = std::clamp(-(1.0 * es + g_vbl.integral), -0.002, 0.002);
-    if (g_vbl.frames % 4 == 0) set_time_base_speed(g_vbl.base * (1.0 + g_vbl.delta));
+    // Only while this lock still holds (the main thread may have changed it).
+    if (g_vbl.frames % 4 == 0 && g_vbl_base.load(std::memory_order_relaxed) == base)
+        set_time_base_speed(base * (1.0 + g_vbl.delta));
 }
 
 // GXCopyDisp: the frame. The EFB's source rectangle becomes the picture
@@ -2311,7 +2456,8 @@ void create_efb_images() {
     g.efb_depth = make_image(kEfbWidth * g.scale, kEfbHeight * g.scale, kEfbDepth,
                              VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_DEPTH_BIT);
     g.last_frame = make_image(kEfbWidth * g.scale, kEfbHeight * g.scale, kEfbColor,
-                              VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_COLOR_BIT);
+                              VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                              VK_IMAGE_ASPECT_COLOR_BIT);  // sampled by the CRT look
     g.last_w = g.last_h = 0;
     g.efb_fresh = true;
 }
@@ -2389,15 +2535,58 @@ void window_resized() { g.resized = true; }
 
 void lock_frames_to_vblank(double speed) {
     uint64_t vblank = 0, period = 0;
-    if (!display_vblank(vblank, period)) {
-        std::fprintf(stderr, "qilin_run: no vblank times on this platform: frames follow the display's rate, not its vblanks\n");
+    if (speed != 0 && !display_vblank(vblank, period)) {
+        static bool said = false;
+        if (!said) std::fprintf(stderr, "qilin_run: no vblank times on this platform: frames follow the display's rate, not its vblanks\n");
+        said = true;
         return;
     }
-    g_vbl.on = true, g_vbl.base = speed;
+    g_vbl_base.store(speed, std::memory_order_relaxed);
 }
 
+double vblank_slack_ms() {  // the main thread's readout; 0 without a lock
+    const double base = g_vbl_base.load(std::memory_order_relaxed);
+    return base != 0 ? g_vbl_last_slack.load(std::memory_order_relaxed) : 0.0;
+}
+
+FrameTimeSummary frame_time_summary() {
+    std::vector<float> t;
+    {
+        std::lock_guard l(g_ft_lock);
+        t.assign(g_ft.begin(), g_ft.begin() + std::ptrdiff_t(g_ft_count));
+    }
+    FrameTimeSummary s;
+    s.frames = t.size();
+    if (t.empty()) return s;
+    double sum = 0;
+    for (float v : t) sum += v;
+    s.average_ms = sum / double(t.size());
+    s.fps = s.average_ms > 0 ? 1000.0 / s.average_ms : 0;
+    std::sort(t.begin(), t.end(), std::greater<float>());
+    s.worst_ms = t[0];
+    auto low = [&](size_t per_thousand) {
+        const size_t n = std::max<size_t>(1, t.size() * per_thousand / 1000);
+        double w = 0;
+        for (size_t i = 0; i < n; ++i) w += t[i];
+        w /= double(n);
+        return w > 0 ? 1000.0 / w : 0.0;
+    };
+    s.low1_fps = low(10), s.low01_fps = low(1);
+    return s;
+}
+
+std::vector<float> recent_frame_times(size_t n) {
+    std::lock_guard l(g_ft_lock);
+    n = std::min(n, g_ft_count);
+    std::vector<float> out(n);
+    for (size_t i = 0; i < n; ++i) out[i] = g_ft[(g_ft_next + kFrameTimeWindow - n + i) % kFrameTimeWindow];
+    return out;
+}
+
+uint32_t internal_scale() { return g.scale; }
+
 std::string vblank_report() {
-    if (!g_vbl.on || !g_vbl.slack_count) return {};
+    if (!g_vbl.slack_count) return {};
     char line[256];
     std::snprintf(line, sizeof line,
                   "vblank lock: each frame presented %.2f ms before its vblank on average (target %.2f ms, spread %.2f ms), "
@@ -2446,8 +2635,8 @@ void apply_display_settings() {
     const Settings& s = settings();
     drain();  // nothing in hand on the render thread while images and samplers are remade
     vk_check(vkDeviceWaitIdle(g.device), "vkDeviceWaitIdle");
-    if (s.internal_scale != g.scale) {  // new EFB images (copies already made stay: they're textures at any size)
-        g.scale = s.internal_scale;
+    if (resolve_scale(s.internal_scale) != g.scale) {  // new EFB images (copies already made stay: they're textures at any size)
+        g.scale = resolve_scale(s.internal_scale);
         create_efb_images();
     }
     const float aniso = std::min(float(s.anisotropy), g.anisotropy_limit);
@@ -2469,7 +2658,7 @@ float anisotropy_limit() { return g.anisotropy_limit; }
 
 bool init_vulkan(SDL_Window* window) {
     g.window = window;
-    g.scale = settings().internal_scale;
+    g.scale = resolve_scale(settings().internal_scale);
     vkGetInstanceProcAddr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(SDL_Vulkan_GetVkGetInstanceProcAddr());
     if (!vkGetInstanceProcAddr) return fail("no Vulkan loader");
 #define QILIN_VK_LOAD_GLOBAL(f) f = reinterpret_cast<PFN_##f>(vkGetInstanceProcAddr(nullptr, #f));

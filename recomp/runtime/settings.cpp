@@ -1,9 +1,13 @@
 // The settings file (settings.hpp). Runtime code: no std::format.
 #include "settings.hpp"
 
+#include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+
+#include "input.hpp"
 
 namespace qilin::rt {
 
@@ -18,6 +22,136 @@ std::filesystem::path user_data_base() {
 #endif
     return {};
 }
+
+// ---- controls ----
+namespace {
+
+constexpr const char* kControlNames[kControlCount] = {"a", "b", "one", "two", "plus", "minus", "home", "up", "down", "left", "right"};
+constexpr const char* kControlLabels[kControlCount] = {"A", "B (the trigger)", "1", "2", "+", "-", "Home",
+                                                       "D-pad up", "D-pad down", "D-pad left", "D-pad right"};
+struct PadName {
+    const char* name;   // in the file
+    const char* label;  // in the menu
+    uint32_t bit;
+};
+constexpr PadName kPadNames[] = {
+    {"Up", "Pad Up", kPadUp},       {"Down", "Pad Down", kPadDown},   {"Left", "Pad Left", kPadLeft},
+    {"Right", "Pad Right", kPadRight}, {"A", "Pad A", kPadA},         {"B", "Pad B", kPadB},
+    {"X", "Pad X", kPadX},          {"Y", "Pad Y", kPadY},            {"Start", "Pad Start", kPadStart},
+    {"Back", "Pad Back", kPadBack}, {"Guide", "Pad Guide", kPadGuide}, {"LB", "Pad LB", kPadLB},
+    {"RB", "Pad RB", kPadRB},       {"LT", "Pad LT", kPadLT},         {"RT", "Pad RT", kPadRT},
+    {"L3", "Pad L3", kPadL3},       {"R3", "Pad R3", kPadR3},
+};
+
+std::string lower(std::string s) {
+    for (char& ch : s) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    return s;
+}
+Binding pad(uint32_t bit) { return {Binding::kPad, bit, {}}; }
+Binding key(const char* name) { return {Binding::kKey, 0, name}; }
+
+}  // namespace
+
+const char* control_name(Control c) { return kControlNames[c]; }
+const char* control_label(Control c) { return kControlLabels[c]; }
+uint16_t control_button(Control c) {
+    static constexpr uint16_t kButtons[kControlCount] = {kButtonA,    kButtonB,     kButton1,  kButton2,
+                                                         kButtonPlus, kButtonMinus, kButtonHome, kButtonUp,
+                                                         kButtonDown, kButtonLeft,  kButtonRight};
+    return kButtons[c];
+}
+
+const char* pad_button_name(uint32_t bit) {
+    for (const PadName& p : kPadNames)
+        if (p.bit == bit) return p.name;
+    return nullptr;
+}
+
+bool key_reserved(const std::string& name) {
+    const std::string l = lower(name);
+    return l == "escape" || l == "f1" || l == "f3" || l == "f11";
+}
+
+std::string binding_text(const Binding& b) {
+    switch (b.kind) {
+    case Binding::kMouse: return "mouse";
+    case Binding::kKey: return "key:" + b.key;
+    case Binding::kPad:
+        if (const char* n = pad_button_name(b.pad)) return std::string("pad:") + n;
+        break;
+    }
+    return "?";
+}
+
+std::string binding_label(const Binding& b) {
+    switch (b.kind) {
+    case Binding::kMouse: return "Mouse";
+    case Binding::kKey: return b.key;
+    case Binding::kPad:
+        for (const PadName& p : kPadNames)
+            if (p.bit == b.pad) return p.label;
+        break;
+    }
+    return "?";
+}
+
+// The owner's layout (2026-11-20): A and B on their letters and in pairs for
+// two hands, right A and left B as on the controller's shoulders.
+Controls default_controls() {
+    Controls c;
+    c[kCtlA] = {pad(kPadA), pad(kPadRB), key("A"), key("Right Shift"), key("Right"), key("Space")};
+    c[kCtlB] = {pad(kPadB), pad(kPadLB), pad(kPadRT), key("B"), key("Left Shift"), key("Left")};
+    c[kCtlOne] = {pad(kPadX), key("1")};
+    c[kCtlTwo] = {pad(kPadY), key("2")};
+    c[kCtlPlus] = {pad(kPadStart), key("Return")};
+    c[kCtlMinus] = {pad(kPadBack), key("Backspace"), key("Tab")};
+    c[kCtlHome] = {pad(kPadGuide), key("H")};
+    c[kCtlUp] = {pad(kPadUp), key("Up"), key("I")};
+    c[kCtlDown] = {pad(kPadDown), key("Down"), key("K")};
+    c[kCtlLeft] = {pad(kPadLeft), key("J")};
+    c[kCtlRight] = {pad(kPadRight), key("L")};
+    return c;
+}
+
+namespace {
+// "pad:RB", "key:Space" or "mouse"; false with the reason.
+bool parse_binding(const std::string& text, Binding& b, std::string& why) {
+    const std::string l = lower(text);
+    if (l == "mouse") {
+        b = {Binding::kMouse, 0, {}};
+        return true;
+    }
+    const size_t colon = text.find(':');
+    if (colon == std::string::npos) {
+        why = "'" + text + "' isn't an input: write pad:<button>, key:<key> or mouse";
+        return false;
+    }
+    const std::string kind = lower(text.substr(0, colon)), name = text.substr(colon + 1);
+    if (kind == "pad") {
+        for (const PadName& p : kPadNames)
+            if (lower(name) == lower(p.name)) {
+                b = pad(p.bit);
+                return true;
+            }
+        why = "'" + name + "' isn't a pad button (Up Down Left Right A B X Y Start Back Guide LB RB LT RT L3 R3)";
+        return false;
+    }
+    if (kind == "key") {
+        if (name.empty()) {
+            why = "key: needs a key's name";
+            return false;
+        }
+        if (key_reserved(name)) {
+            why = "key:" + name + " is kept for the program (Escape and F1: the menu, F3: frame times, F11: full screen)";
+            return false;
+        }
+        b = {Binding::kKey, 0, name};
+        return true;
+    }
+    why = "'" + kind + "' isn't a kind of input (pad, key, mouse)";
+    return false;
+}
+}  // namespace
 
 // The presets: what each sets before the file's own keys.
 bool apply_preset(Settings& s, const std::string& name) {
@@ -58,7 +192,15 @@ std::string settings_text(const Settings& s) {
     line(std::string("scaling = ") + scaling_name(s.scaling));
     line("# Smooth (filtered) at sizes that aren't whole multiples; false: sharp.");
     line(std::string("smooth = ") + b(s.smooth));
-    line("# The frame buffer at 1-8x the console's 640x528 (more is sharper, and more work for the GPU).");
+    line("# plain, or crt: a CRT television's raster lines and phosphor stripes (best at whole multiples or a large window).");
+    line(std::string("look = ") + (s.look == Look::crt ? "crt" : "plain"));
+    line("# CRT: how dark the gaps between the raster lines are, and the phosphor stripes' strength (0-100).");
+    line("scanlines = " + std::to_string(s.scanlines));
+    line("mask = " + std::to_string(s.mask));
+    line("# The frame rate, its 1% and 0.1% lows and the frame times in a corner (F3 switches it).");
+    line(std::string("performance_overlay = ") + b(s.performance_overlay));
+    line("# The frame buffer at 1-8x the console's 640x528 (more is sharper, and more work for the GPU);");
+    line("# 0: from the screen's height (3x on a 1440-line screen).");
     line("internal_scale = " + std::to_string(s.internal_scale));
     line("# Texture filtering: 1 (the console's), 2, 4, 8 or 16.");
     line("anisotropy = " + std::to_string(s.anisotropy));
@@ -91,6 +233,15 @@ std::string settings_text(const Settings& s) {
     line("[controls]");
     line("# The Wii Remote's rumble on the controller.");
     line(std::string("rumble = ") + b(s.rumble));
+    line("# What presses each of the Wii Remote's buttons, held upright: any of the inputs listed.");
+    line("# pad:<button> (Up Down Left Right A B X Y Start Back Guide LB RB LT RT L3 R3, by an Xbox pad's");
+    line("# names), key:<key> (as SDL names keys: Space, Right Shift, Return, A) or mouse (its left button).");
+    line("# Escape, F1, F3 and F11 are kept for the program. The settings menu sets these by pressing them.");
+    for (unsigned c = 0; c < kControlCount; ++c) {
+        std::string l = std::string(control_name(Control(c))) + " =";
+        for (size_t i = 0; i < s.controls[c].size(); ++i) l += (i ? ", " : " ") + binding_text(s.controls[c][i]);
+        line(l);
+    }
     line("");
     line("[console]");
     line("# What the game reads as the Wii's own settings (read when the game starts).");
@@ -114,6 +265,13 @@ namespace {
 std::string trim(const std::string& s) {
     const size_t a = s.find_first_not_of(" \t\r"), b = s.find_last_not_of(" \t\r");
     return a == std::string::npos ? std::string() : s.substr(a, b - a + 1);
+}
+
+// A control by the file's name; kControlCount if it isn't one.
+unsigned control_of(const std::string& name) {
+    for (unsigned c = 0; c < kControlCount; ++c)
+        if (name == kControlNames[c]) return c;
+    return kControlCount;
 }
 
 Settings load() {
@@ -178,7 +336,17 @@ bool parse_settings(std::istream& in, Settings& s, std::string& error, unsigned&
         } else if (section == "display" && key == "fullscreen") {
             boolean(s.fullscreen);
         } else if (section == "display" && key == "internal_scale") {
-            s.internal_scale = number(1, 8);
+            s.internal_scale = number(0, 8);
+        } else if (section == "display" && key == "look") {
+            if (value == "plain") s.look = Look::plain;
+            else if (value == "crt") s.look = Look::crt;
+            else return bad("look is plain or crt");
+        } else if (section == "display" && key == "scanlines") {
+            s.scanlines = number(0, 100);
+        } else if (section == "display" && key == "mask") {
+            s.mask = number(0, 100);
+        } else if (section == "display" && key == "performance_overlay") {
+            boolean(s.performance_overlay);
         } else if (section == "display" && key == "anisotropy") {
             s.anisotropy = number(1, 16);
             if (ok && (s.anisotropy & (s.anisotropy - 1))) return bad("anisotropy is 1, 2, 4, 8 or 16");
@@ -195,6 +363,23 @@ bool parse_settings(std::istream& in, Settings& s, std::string& error, unsigned&
             boolean(s.smooth);
         } else if (section == "controls" && key == "rumble") {
             boolean(s.rumble);
+        } else if (section == "controls" && control_of(key) < kControlCount) {
+            // A comma-separated list; empty: nothing presses it.
+            auto& list = s.controls[control_of(key)];
+            list.clear();
+            for (size_t at = 0; at <= value.size();) {
+                const size_t comma = std::min(value.find(',', at), value.size());
+                const std::string item = trim(value.substr(at, comma - at));
+                at = comma + 1;
+                if (item.empty()) {
+                    if (comma == value.size()) break;
+                    return bad("an empty input in " + key + "'s list");
+                }
+                Binding bd;
+                std::string why;
+                if (!parse_binding(item, bd, why)) return bad(why);
+                if (std::find(list.begin(), list.end(), bd) == list.end()) list.push_back(bd);
+            }
         } else if (section == "display" && key == "vsync") {
             boolean(s.vsync);
         } else if (section == "display" && key == "lock_to_display") {

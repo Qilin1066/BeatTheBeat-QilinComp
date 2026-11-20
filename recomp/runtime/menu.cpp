@@ -7,24 +7,32 @@
 #include <imgui_impl_vulkan.h>
 
 #include <algorithm>
+#include <bit>
+#include <cmath>
 #include <cstdio>
 #include <mutex>
 #include <string>
 #include <vector>
 
 #include "gx_vulkan.hpp"
+#include "host.hpp"
 #include "pause.hpp"
 #include "settings.hpp"
+
+#ifndef QILIN_VERSION
+#define QILIN_VERSION "?"
+#endif
 
 namespace qilin::rt {
 
 namespace {
 
-constexpr uint64_t kHintMs = 8000;  // how long the hint shows at the start
+constexpr uint64_t kHintMs = 8000;     // how long the hint shows at the start
+constexpr uint64_t kCaptureMs = 6000;  // how long a control waits to be pressed
 constexpr const char* kHint = "F1 or Esc (controller: Back + Start): settings";
 
 // ImGui's frame is built on the main thread and drawn by whichever thread
-// owns the renderer at the time (the game's frames, or the main thread's
+// records the window's frames (the renderer's thread, or the main thread's
 // while the game is parked): the lock keeps the two apart.
 std::mutex g_draw_lock;
 bool g_has_draw = false;  // under g_draw_lock: ImGui's draw data is a whole frame
@@ -37,22 +45,6 @@ PFN_vkVoidFunction load(const char* name, void*) { return g_gipa(g_instance, nam
 void check(VkResult r) {
     if (r < 0) std::fprintf(stderr, "qilin_run: settings menu: Vulkan error %d\n", int(r));
 }
-
-// The Wii Remote's buttons as the keyboard and a controller play them
-// (host.cpp's tables), for the controls page.
-struct Binding {
-    const char *button, *keys, *pad;
-};
-constexpr Binding kBindings[] = {
-    {"A", "A, Right Shift, Right arrow, Space", "South (A / Cross), right shoulder"},
-    {"B", "B, Left Shift, Left arrow", "East (B / Circle), left shoulder, right trigger"},
-    {"1", "1", "West (X / Square)"},
-    {"2", "2", "North (Y / Triangle)"},
-    {"+", "Enter", "Start"},
-    {"-", "Backspace, Tab", "Back"},
-    {"Home", "H", "Guide"},
-    {"D-pad", "I, J, K, L; Up and Down arrows", "D-pad, left stick"},
-};
 
 constexpr const char* kLanguages[] = {"Japanese", "English", "German", "French", "Spanish", "Italian"};
 
@@ -68,6 +60,15 @@ void move_to_display(SDL_Window* w, SDL_DisplayID id) {
     const int at = int(SDL_WINDOWPOS_CENTERED_DISPLAY(id));
     SDL_SetWindowPosition(w, at, at);
     if (full) SDL_SetWindowFullscreen(w, true);
+}
+
+uint32_t lowest_bit(uint32_t v) { return v & (~v + 1); }
+
+// The mouse and the pad's navigation are the control's while one is being set.
+void menu_navigation(bool on) {
+    ImGuiIO& io = ImGui::GetIO();
+    if (on) io.ConfigFlags = (io.ConfigFlags | ImGuiConfigFlags_NavEnableGamepad) & ~ImGuiConfigFlags_NoMouse;
+    else io.ConfigFlags = (io.ConfigFlags & ~ImGuiConfigFlags_NavEnableGamepad) | ImGuiConfigFlags_NoMouse;
 }
 
 }  // namespace
@@ -155,8 +156,30 @@ Menu::~Menu() {
     if (ImGui::GetCurrentContext()) ImGui::DestroyContext();
 }
 
+void Menu::save() {
+    settings().fullscreen = (SDL_GetWindowFlags(window_) & SDL_WINDOW_FULLSCREEN) != 0;
+    if (!save_settings()) std::fprintf(stderr, "qilin_run: the settings can't be saved to %s\n", settings_path().string().c_str());
+}
+
 bool Menu::handle(const SDL_Event& e) {
     if (!ok_) return false;
+    // Looking at the picture: any key or button brings the menu back.
+    if (peek_ && (e.type == SDL_EVENT_KEY_DOWN || e.type == SDL_EVENT_MOUSE_BUTTON_DOWN || e.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN)) {
+        peek_ = false;
+        return true;
+    }
+    // Setting a control: the key pressed (controller buttons and clicks are read in tick).
+    if (capture_ >= 0 && e.type == SDL_EVENT_KEY_DOWN) {
+        if (!e.key.repeat) {
+            const char* name = SDL_GetScancodeName(e.key.scancode);
+            if (e.key.scancode == SDL_SCANCODE_ESCAPE) {
+                capture_ = -1, wait_release_ = true, note_ = "Cancelled: unchanged.";
+            } else if (name && *name && !key_reserved(name)) {
+                bind(capture_, Binding::kKey, 0, name);
+            }
+        }
+        return true;
+    }
     const bool shown = open_ || opening_;
     switch (e.type) {
     case SDL_EVENT_KEY_DOWN:
@@ -165,8 +188,14 @@ bool Menu::handle(const SDL_Event& e) {
             toggle();
             return true;
         }
+        if (!e.key.repeat && e.key.key == SDLK_F3) {  // the frame times, kept in the settings
+            settings().performance_overlay = !settings().performance_overlay;
+            if (!open_) save();
+            return true;
+        }
         break;
     case SDL_EVENT_GAMEPAD_BUTTON_DOWN: {
+        if (capture_ >= 0) break;
         // Back and Start together (alone they're the remote's - and +);
         // with the menu open, Start alone closes it too.
         SDL_Gamepad* pad = SDL_GetGamepadFromID(e.gbutton.which);
@@ -208,15 +237,37 @@ void Menu::toggle() {
 
 void Menu::close() {
     if (open_) {
-        if (!save_settings()) std::fprintf(stderr, "qilin_run: the settings can't be saved to %s\n", settings_path().string().c_str());
+        save();
         gx::apply_display_settings();  // the game is still parked: the renderer is ours
     }
-    open_ = opening_ = false;
+    open_ = opening_ = peek_ = false;
+    capture_ = -1;
+    wait_release_ = false;
+    menu_navigation(true);
     {
         std::lock_guard l(g_draw_lock);
         g_has_draw = false;
     }
     request_pause(false);
+}
+
+// An input pressed while setting `control`: it presses that control now,
+// and is taken from any other it pressed.
+void Menu::bind(int control, unsigned kind, uint32_t pad, const std::string& key) {
+    Binding b;
+    b.kind = Binding::Kind(kind), b.pad = pad, b.key = key;
+    Controls& all = settings().controls;
+    note_.clear();
+    for (unsigned c = 0; c < kControlCount; ++c) {
+        const auto it = std::find(all[c].begin(), all[c].end(), b);
+        if (it == all[c].end()) continue;
+        if (int(c) != control) note_ = binding_label(b) + " moved here from " + control_label(Control(c)) + ".";
+        all[c].erase(it);
+    }
+    all[control].push_back(b);
+    host::controls_changed();
+    capture_ = -1;
+    wait_release_ = true;
 }
 
 void Menu::tick() {
@@ -225,41 +276,61 @@ void Menu::tick() {
         opening_ = false, open_ = true, hint_ = false;
         ImGui::GetIO().ClearInputKeys();
     }
+    if (open_ && capture_ >= 0) {
+        // A controller's button or a click pressed since it began sets the control.
+        const uint32_t held = host::pad_bits_held();
+        const uint32_t fresh = held & ~capture_held_;
+        capture_held_ &= held;  // let go, a button counts again
+        if (fresh) {
+            const uint32_t bit = lowest_bit(fresh);
+            if (bit == kPadClick) bind(capture_, Binding::kMouse, 0, {});
+            else bind(capture_, Binding::kPad, bit, {});
+        } else if (SDL_GetTicks() >= capture_until_) {
+            capture_ = -1, wait_release_ = true;
+            note_ = "Nothing was pressed: unchanged.";
+        }
+    }
+    // The mouse and the pad's navigation come back once the press that set a control is let go.
+    if (wait_release_ && host::pad_bits_held() == 0) {
+        menu_navigation(true);
+        wait_release_ = false;
+    }
     if (open_) {
         {
             std::lock_guard l(g_draw_lock);
             ImGui_ImplVulkan_NewFrame();
             ImGui_ImplSDL3_NewFrame();
             ImGui::NewFrame();
-            draw_menu();
+            if (!peek_) draw_menu();
+            if (peek_ && settings().performance_overlay) build_frame_times();
             ImGui::Render();
             g_has_draw = true;
         }
         if (close_asked_ || quit_) {
             close_asked_ = false;
-            if (!quit_) close();
+            if (quit_) save();
+            else close();
             return;
         }
         gx::present_paused();
         return;
     }
-    if (hint_) {
-        std::lock_guard l(g_draw_lock);
-        if (SDL_GetTicks() >= hint_until_) {
-            hint_ = false;
-            g_has_draw = false;
-            return;
-        }
-        ImGui_ImplVulkan_NewFrame();
-        ImGui_ImplSDL3_NewFrame();
-        ImGui::NewFrame();
-        build_hint();
-        ImGui::Render();
-        g_has_draw = true;
+    if (hint_ && SDL_GetTicks() >= hint_until_) hint_ = false;
+    std::lock_guard l(g_draw_lock);
+    if (!hint_ && !settings().performance_overlay) {
+        g_has_draw = false;
+        return;
     }
+    ImGui_ImplVulkan_NewFrame();
+    ImGui_ImplSDL3_NewFrame();
+    ImGui::NewFrame();
+    if (hint_) build_hint();
+    if (settings().performance_overlay) build_frame_times();
+    ImGui::Render();
+    g_has_draw = true;
 }
 
-bool Menu::busy() const { return open_ || opening_ || hint_; }
+bool Menu::busy() const { return open_ || opening_ || hint_ || settings().performance_overlay; }
 
 void Menu::build_hint() {
     const ImGuiViewport* vp = ImGui::GetMainViewport();
@@ -273,6 +344,40 @@ void Menu::build_hint() {
     ImGui::End();
 }
 
+// F3: how evenly frames reach the screen, top left. The lows are the frame
+// rates of the slowest 1% and 0.1% of frames over the last 20 s.
+void Menu::build_frame_times() {
+    const gx::FrameTimeSummary s = gx::frame_time_summary();
+    const ImGuiViewport* vp = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + 8.0f, vp->WorkPos.y + 8.0f), ImGuiCond_Always);
+    ImGui::SetNextWindowBgAlpha(0.55f);
+    ImGui::Begin("##frame times", nullptr,
+                 ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoInputs |
+                     ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoSavedSettings);
+    if (s.frames == 0) {
+        ImGui::TextUnformatted("frame times: waiting for frames");
+    } else {
+        ImGui::Text("%.1f fps  %.2f ms", s.fps, s.average_ms);
+        ImGui::Text("1%% low %.1f  0.1%% low %.1f", s.low1_fps, s.low01_fps);
+        ImGui::Text("worst %.1f ms", s.worst_ms);
+        // The game draws 60 frames a second, as on the Wii; a faster display
+        // shows each one more than once, with less wait before it's seen.
+        const double hz = host::display_hz();
+        if (hz > 0) {
+            const double k = hz / 60.0;
+            if (settings().variable_refresh) ImGui::Text("display up to %.0f Hz: variable refresh", hz);
+            else if (std::fabs(k - std::round(k)) * 60.0 > 0.3) ImGui::Text("display %.1f Hz: not a multiple of 60 (uneven)", hz);
+            else if (std::round(k) >= 2) ImGui::Text("display %.0f Hz: each frame shown %d times", hz, int(std::round(k)));
+            else ImGui::Text("display %.0f Hz", hz);
+        }
+        const std::vector<float> recent = gx::recent_frame_times(240);
+        ImGui::PlotLines("##ft", recent.data(), int(recent.size()), 0, nullptr, 0.0f, 50.0f, ImVec2(240.0f, 48.0f));
+    }
+    if (const double slack = gx::vblank_slack_ms(); slack > 0) ImGui::Text("presented %.1f ms before the vblank", slack);
+    ImGui::Text("sound: %.1f ms queued", host::audio_queued_ms());
+    ImGui::End();
+}
+
 void Menu::draw_menu() {
     const ImGuiViewport* vp = ImGui::GetMainViewport();
     ImGui::SetNextWindowPos(vp->WorkPos);
@@ -280,8 +385,13 @@ void Menu::draw_menu() {
     ImGui::SetNextWindowBgAlpha(0.88f);
     ImGui::Begin("Settings", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings);
     ImGui::TextUnformatted("Beat the Beat: Rhythm Paradise - settings (the game is paused)");
-    ImGui::SameLine(ImGui::GetContentRegionAvail().x - ImGui::CalcTextSize("Close (Esc)").x);
+    // Close and Quit, top right on every page.
+    const ImGuiStyle& st = ImGui::GetStyle();
+    const float buttons = ImGui::CalcTextSize("Close (Esc)").x + ImGui::CalcTextSize("Quit the game").x + 4 * st.FramePadding.x + st.ItemSpacing.x;
+    ImGui::SameLine(ImGui::GetContentRegionAvail().x - buttons + ImGui::GetCursorPosX());
     if (ImGui::Button("Close (Esc)")) close_asked_ = true;  // tick() closes it, outside the draw lock
+    ImGui::SameLine();
+    if (ImGui::Button("Quit the game")) quit_ = true;
     ImGui::Separator();
     if (ImGui::BeginTabBar("pages")) {
         if (ImGui::BeginTabItem("Controls")) {
@@ -306,28 +416,70 @@ void Menu::controls_page() {
     ImGui::SeparatorText("Controllers");
     int n = 0;
     SDL_JoystickID* ids = SDL_GetGamepads(&n);
-    if (n == 0) ImGui::TextDisabled("None connected: the keyboard plays the Wii Remote.");
+    if (n == 0) ImGui::TextDisabled("None connected: the keyboard and mouse play the Wii Remote.");
     for (int i = 0; i < n; ++i) {
         const char* name = SDL_GetGamepadNameForID(ids[i]);
         ImGui::BulletText("%s", name ? name : "A controller");  // each one plays the Wii Remote
     }
     SDL_free(ids);
     ImGui::Checkbox("Rumble", &s.rumble);
-    ImGui::SeparatorText("The Wii Remote's buttons");
+
+    ImGui::SeparatorText("The Wii Remote's buttons (held upright)");
     if (ImGui::BeginTable("bindings", 3, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
-        ImGui::TableSetupColumn("Button");
-        ImGui::TableSetupColumn("Keyboard");
-        ImGui::TableSetupColumn("Controller");
+        ImGui::TableSetupColumn("Button", ImGuiTableColumnFlags_WidthStretch, 0.22f);
+        ImGui::TableSetupColumn("Pressed by (click one to remove it)", ImGuiTableColumnFlags_WidthStretch, 0.63f);
+        ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthStretch, 0.15f);
         ImGui::TableHeadersRow();
-        for (const Binding& b : kBindings) {
+        for (unsigned c = 0; c < kControlCount; ++c) {
+            ImGui::PushID(int(c));
             ImGui::TableNextRow();
-            ImGui::TableNextColumn(), ImGui::TextUnformatted(b.button);
-            ImGui::TableNextColumn(), ImGui::TextUnformatted(b.keys);
-            ImGui::TableNextColumn(), ImGui::TextUnformatted(b.pad);
+            ImGui::TableNextColumn();
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextUnformatted(control_label(Control(c)));
+            ImGui::TableNextColumn();
+            if (capture_ == int(c)) {
+                const uint64_t now = SDL_GetTicks();
+                const uint64_t left = capture_until_ > now ? (capture_until_ - now + 999) / 1000 : 0;
+                ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.3f, 1.0f), "Press a key, a controller button or click... (Esc: cancel, %u s)",
+                                   unsigned(left));
+            } else {
+                auto& list = s.controls[c];
+                if (list.empty()) ImGui::TextDisabled("unused");
+                for (size_t i = 0; i < list.size(); ++i) {
+                    ImGui::PushID(int(i));
+                    if (i) ImGui::SameLine();
+                    if (ImGui::SmallButton(binding_label(list[i]).c_str())) {
+                        list.erase(list.begin() + std::ptrdiff_t(i));
+                        host::controls_changed();
+                        note_.clear();
+                        ImGui::PopID();
+                        break;
+                    }
+                    ImGui::PopID();
+                }
+            }
+            ImGui::TableNextColumn();
+            ImGui::BeginDisabled(capture_ >= 0);
+            if (ImGui::SmallButton("Add")) {
+                capture_ = int(c);
+                capture_until_ = SDL_GetTicks() + kCaptureMs;
+                capture_held_ = host::pad_bits_held();
+                note_.clear();
+                menu_navigation(false);  // the mouse and the pad's navigation are the control's to take until it's set
+            }
+            ImGui::EndDisabled();
+            ImGui::PopID();
         }
         ImGui::EndTable();
     }
-    ImGui::TextDisabled("F1 or Esc (controller: Back + Start): this menu. F11 or Alt+Enter: full screen.");
+    if (!note_.empty()) ImGui::TextUnformatted(note_.c_str());
+    if (ImGui::Button("Back to the defaults")) {
+        s.controls = default_controls();
+        host::controls_changed();
+        note_.clear();
+    }
+    ImGui::TextDisabled("An input added to one button moves there from another. Escape, F1, F3 and F11 are kept for the program.");
+    ImGui::TextDisabled("F1 or Esc (controller: Back + Start): this menu. F3: frame times. F11 or Alt+Enter: full screen.");
 }
 
 void Menu::display_page() {
@@ -369,18 +521,38 @@ void Menu::display_page() {
     ImGui::SameLine();
     ImGui::RadioButton("Fill the window", &mode, int(Scaling::stretch));
     s.scaling = Scaling(mode);
-    ImGui::Checkbox("Smooth", &s.smooth);
+    int look = int(s.look);
+    ImGui::RadioButton("Plain", &look, int(Look::plain));
     ImGui::SameLine();
+    ImGui::RadioButton("CRT television", &look, int(Look::crt));
+    s.look = Look(look);
+    if (s.look == Look::crt) {
+        int scan = int(s.scanlines), mask = int(s.mask);
+        if (ImGui::SliderInt("Scanlines", &scan, 0, 100, "%d%%", ImGuiSliderFlags_AlwaysClamp)) s.scanlines = uint32_t(scan);
+        if (ImGui::SliderInt("Phosphor stripes", &mask, 0, 100, "%d%%", ImGuiSliderFlags_AlwaysClamp)) s.mask = uint32_t(mask);
+        ImGui::TextDisabled("The raster is the console's own lines: it shows best at Whole multiples, or a large window.");
+    } else {
+        ImGui::Checkbox("Smooth", &s.smooth);
+        ImGui::SameLine();
+    }
     ImGui::Checkbox("Vsync", &s.vsync);
+    ImGui::Checkbox("Frame times (F3)", &s.performance_overlay);
+    if (ImGui::Button("Look at the picture")) peek_ = true;
+    ImGui::SameLine();
+    ImGui::TextDisabled("(any key or button comes back)");
 
-    ImGui::SeparatorText("Timing");
-    ImGui::BeginDisabled(!s.vsync);
-    ImGui::Checkbox("Variable refresh: G-Sync / FreeSync / VRR is on (from the next start)", &s.variable_refresh);
-    ImGui::BeginDisabled(s.variable_refresh);
-    ImGui::Checkbox("Lock the game to the display's refresh (from the next start)", &s.lock_to_display);
-    ImGui::Checkbox("Fullscreen at 60/120 Hz when the desktop's refresh doesn't suit (from the next start)", &s.match_refresh);
+    ImGui::SeparatorText("Refresh rate");
+    const bool was_lock = s.lock_to_display, was_match = s.match_refresh, was_vrr = s.variable_refresh, was_vsync = s.vsync;
+    ImGui::Checkbox("Variable refresh (G-Sync, FreeSync, VRR: on in the driver too)", &s.variable_refresh);
+    ImGui::BeginDisabled(s.variable_refresh || !s.vsync);
+    ImGui::Checkbox("Lock the game to the display's refresh", &s.lock_to_display);
+    ImGui::Checkbox("Full screen at a multiple of 60 Hz (120 Hz on a 144 Hz monitor)", &s.match_refresh);
     ImGui::EndDisabled();
-    ImGui::EndDisabled();
+    if (was_lock != s.lock_to_display || was_match != s.match_refresh || was_vrr != s.variable_refresh || was_vsync != s.vsync)
+        host::display_settings_changed();  // the mode and the lock follow at once
+    if (!host::mode_note().empty()) ImGui::TextWrapped("%s", host::mode_note().c_str());
+
+    ImGui::SeparatorText("Sound");
     int latency = int(s.audio_latency_ms);
     if (ImGui::SliderInt("Sound latency", &latency, 5, 200, "%d ms", ImGuiSliderFlags_AlwaysClamp))
         s.audio_latency_ms = uint32_t(latency);
@@ -397,9 +569,11 @@ void Menu::display_page() {
         ImGui::EndCombo();
     }
     int scale = int(s.internal_scale);
-    char label[64];
-    std::snprintf(label, sizeof label, "%dx (%dx%d)", scale, 640 * scale, 528 * scale);
-    if (ImGui::SliderInt("Internal resolution", &scale, 1, 8, label, ImGuiSliderFlags_AlwaysClamp)) s.internal_scale = uint32_t(scale);
+    char label[96];
+    if (scale == 0) std::snprintf(label, sizeof label, "Auto (the screen's height: %ux now)", gx::internal_scale());
+    else std::snprintf(label, sizeof label, "%dx (%dx%d)", scale, 640 * scale, 528 * scale);
+    if (ImGui::SliderInt("Internal resolution", &scale, 0, 8, label, ImGuiSliderFlags_AlwaysClamp)) s.internal_scale = uint32_t(scale);
+    ImGui::TextDisabled("The GPU's work grows with the square: 8x is 64 times the pixels of 1x, 4x 16 times.");
     const float limit = gx::anisotropy_limit();
     ImGui::BeginDisabled(limit <= 1.0f);
     static constexpr uint32_t kAniso[] = {1, 2, 4, 8, 16};
@@ -425,7 +599,7 @@ void Menu::display_page() {
         ImGui::EndCombo();
     }
     ImGui::TextDisabled("In use: %s. A change takes effect the next time the game starts.", in_use.c_str());
-    ImGui::TextDisabled("The rest takes effect when this menu closes.");
+    ImGui::TextDisabled("The internal resolution and filtering take effect when this menu closes.");
 }
 
 void Menu::game_page() {
@@ -438,7 +612,7 @@ void Menu::game_page() {
         ImGui::EndCombo();
     }
     ImGui::Checkbox("60 Hz (EuRGB60; off: PAL 50 Hz)", &s.sixty_hz);
-    ImGui::Checkbox("Widescreen (16:9)", &s.widescreen);
+    ImGui::Checkbox("Widescreen (16:9; off: 4:3)", &s.widescreen);
     ImGui::Checkbox("Progressive scan", &s.progressive);
     // The game plays surround as Dolby Pro Logic II (dpl2.hpp), for a
     // receiver or TV that decodes it.
@@ -450,14 +624,11 @@ void Menu::game_page() {
     if (ImGui::SliderInt("Pointer sensitivity", &dpd, 1, 5, "%d", ImGuiSliderFlags_AlwaysClamp)) s.dpd_sensitivity = uint8_t(dpd);
 
     ImGui::SeparatorText("About");
+    ImGui::TextWrapped("Beat the Beat: Rhythm Paradise QilinRecomp %s: a static recompilation, the game's own code compiled for this computer.",
+                       QILIN_VERSION);
+    ImGui::TextWrapped("Graphics: Vulkan. Window, sound and input: SDL3 (zlib). Menu: Dear ImGui (MIT).");
     ImGui::TextWrapped("Settings file: %s", settings_path().string().c_str());
-    ImGui::TextWrapped("A static recompilation: the game's own code, compiled for this computer. "
-                       "Graphics: Vulkan. Window, sound and input: SDL3 (zlib). Menu: Dear ImGui (MIT).");
-    ImGui::Spacing();
-    if (ImGui::Button("Quit the game")) {
-        if (!save_settings()) std::fprintf(stderr, "qilin_run: the settings can't be saved to %s\n", settings_path().string().c_str());
-        quit_ = true;
-    }
+    ImGui::TextWrapped("Saves and the pipeline cache: %s", game_data_dir().string().c_str());
 }
 
 }  // namespace qilin::rt

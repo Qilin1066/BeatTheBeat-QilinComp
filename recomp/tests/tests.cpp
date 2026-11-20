@@ -1209,7 +1209,11 @@ void test_settings() {
                          BadFile{"[display]\nnot_a_key = 1\n", 2}, BadFile{"[display]\nfullscreen\n", 2},
                          BadFile{"[console]\nlanguage = -1\n", 2}, BadFile{"[display\n", 1}, BadFile{"[console]\nsound_mode = 3\n", 2},
                          BadFile{"[audio]\nlatency_ms = 4\n", 2}, BadFile{"[audio]\nlatency_ms = 201\n", 2},
-                         BadFile{"[display]\nlatency_ms = 30\n", 2}, BadFile{"[display]\nlock_to_display = 1\n", 2}}) {
+                         BadFile{"[display]\nlatency_ms = 30\n", 2}, BadFile{"[display]\nlock_to_display = 1\n", 2},
+                         BadFile{"[controls]\na = pad:Z\n", 2}, BadFile{"[controls]\na = key:Escape\n", 2},
+                         BadFile{"[controls]\nb = joystick:1\n", 2}, BadFile{"[controls]\nb = Space\n", 2},
+                         BadFile{"[controls]\none = key:1,, key:2\n", 2}, BadFile{"[display]\nlook = vhs\n", 2},
+                         BadFile{"[display]\nscanlines = 101\n", 2}, BadFile{"[display]\ninternal_scale = 9\n", 2}}) {
         CHECK(!parse(b.text, s, error, line) && line == b.line && !error.empty());
     }
     // what the menu saves reads back as the same settings (every key, set
@@ -1220,12 +1224,24 @@ void test_settings() {
     w.language = 4, w.sixty_hz = false, w.widescreen = false, w.progressive = false, w.sound_mode = 2;
     w.sensor_bar_above = true, w.dpd_sensitivity = 5;
     w.lock_to_display = false, w.match_refresh = false, w.audio_latency_ms = 85, w.exclusive_audio = false, w.variable_refresh = true;
+    w.look = rt::Look::crt, w.scanlines = 75, w.mask = 10, w.performance_overlay = true;
+    w.controls[rt::kCtlA] = {{rt::Binding::kMouse, 0, {}}, {rt::Binding::kPad, rt::kPadR3, {}}};
+    w.controls[rt::kCtlHome].clear();  // nothing presses it
+    w.controls[rt::kCtlB].push_back({rt::Binding::kKey, 0, "Keypad 5"});
     const std::string text = rt::settings_text(w);
     CHECK(parse(text.c_str(), s, error, line));
     CHECK(rt::settings_text(s) == text);
     CHECK(!s.lock_to_display && !s.match_refresh && s.audio_latency_ms == 85 && !s.exclusive_audio && s.variable_refresh);
+    CHECK(s.look == rt::Look::crt && s.scanlines == 75 && s.mask == 10 && s.performance_overlay);
+    CHECK(s.controls == w.controls && s.controls[rt::kCtlHome].empty() && s.controls[rt::kCtlB].back().key == "Keypad 5");
     CHECK(s.monitor == "Second Display" && s.scaling == rt::Scaling::integer && !s.smooth && s.internal_scale == 5 &&
           s.anisotropy == 8 && s.gpu == "Some GPU" && !s.rumble && s.language == 4 && s.dpd_sensitivity == 5);
+    CHECK(parse("[display]\ninternal_scale = 0\n", s, error, line) && s.internal_scale == 0);  // 0: from the screen's height
+    // an input listed twice is kept once; the default layout presses A with the right shoulder
+    CHECK(parse("[controls]\none = key:1, key:1, pad:X\n", s, error, line) && s.controls[rt::kCtlOne].size() == 2);
+    const rt::Settings defaults;
+    CHECK(std::find(defaults.controls[rt::kCtlA].begin(), defaults.controls[rt::kCtlA].end(),
+                    rt::Binding{rt::Binding::kPad, rt::kPadRB, {}}) != defaults.controls[rt::kCtlA].end());
     // the default file is the defaults
     CHECK(parse(rt::settings_text(rt::Settings{}).c_str(), s, error, line) && rt::settings_text(s) == rt::settings_text(rt::Settings{}));
     CHECK(!parse("[display]\nscaling = zoom\n", s, error, line) && line == 2);

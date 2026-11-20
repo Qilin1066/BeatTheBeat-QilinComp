@@ -111,7 +111,7 @@ build-rt/qilin_run path/to/extracted-disc
 
 `qilin_run` takes the folder Dolphin's **Extract Entire Disc** writes (`sys/` and `files/`); a `.wbfs` or `.iso` can't be read directly, since a Wii disc is encrypted with a key this project can't include. It opens a window named after the game, at the largest whole multiple of the picture that fits the screen; **F11** or **Alt+Enter** switch borderless fullscreen, and closing the window quits. Anything the runtime can't do yet stops the run with a message saying what, who called it, and what the run did before. `docs/runtime.md` has the details. Keep `pal_symbols.txt` and the extracted disc outside the repository.
 
-The Wii Remote is played upright, by a controller or the keyboard (both at once work):
+The Wii Remote is played upright, by a controller or the keyboard (both at once work). These are the defaults; the settings menu's Controls page changes them by pressing the new input (a key, a controller button or a click), and they're kept in the settings file's `[controls]`:
 
 | Wii Remote | Controller (any SDL knows) | Keyboard |
 |---|---|---|
@@ -122,7 +122,7 @@ The Wii Remote is played upright, by a controller or the keyboard (both at once 
 | Home | Guide | H |
 | D-pad | d-pad or left stick | I, J, K, L, or the Up and Down arrows |
 
-The first controller connected plays the remote (another takes over if it's unplugged); the game's rumble reaches it.
+Every controller connected plays the remote (their buttons add up); the game's rumble reaches them. **F1** or **Esc** (a controller: Back and Start together) opens the settings menu, with Close and Quit at its top right; **F3** shows the frame rate, its 1% and 0.1% lows, the frame times, the display's refresh and the sound's lag in a corner.
 
 **The game's data folder** is `qilin/beatthebeat` in the per-user application data (`%LOCALAPPDATA%`, `~/Library/Application Support` or `~/.local/share`), as the other Qilin recomps keep theirs: saves in `nand/` (or wherever `QILIN_NAND` points), `pipelines.bin` (compiled shaders, so later runs start without compile stutters) and **the settings file, `beatthebeat.ini`**, written with comments on the first run:
 

@@ -17,13 +17,29 @@ namespace qilin::rt::gx {
 bool init_vulkan(SDL_Window* window);
 // The window's drawable size changed: the swapchain is remade at the next frame.
 void window_resized();
-// The display lock is on at `speed` (host.cpp, before the game's threads
-// start): from here each frame's present is steered to land just before a
-// vblank (Windows: the compositor's vblank times), by nudging the game's
-// clock within 0.2% of that speed.
+// The display lock is on at `speed` (host.cpp, whenever the display changes;
+// 0: off): each frame's present is steered to land just before a vblank
+// (Windows: the compositor's vblank times), by nudging the game's clock
+// within 0.2% of that speed.
 void lock_frames_to_vblank(double speed);
-// The vblank lock's numbers for the run report (empty if it isn't on).
+// The vblank lock's numbers for the run report (empty if it isn't on), and
+// for the F3 readout: how long before its vblank a frame is presented (ms; 0
+// without the lock).
 std::string vblank_report();
+double vblank_slack_ms();
+
+// ---- the F3 readout: the time between frames shown ----
+// A "low" is the frame rate of the average of the slowest 1% (or 0.1%) of
+// frame times in the last 20 s: one bad frame in a thousand shows.
+struct FrameTimeSummary {
+    size_t frames = 0;  // in the window
+    double average_ms = 0, fps = 0, low1_fps = 0, low01_fps = 0, worst_ms = 0;
+};
+FrameTimeSummary frame_time_summary();
+std::vector<float> recent_frame_times(size_t n);  // the last n, oldest first (ms)
+// The internal resolution the frame buffer has now (settings: 0 is from the
+// screen's height, worked out at start).
+uint32_t internal_scale();
 
 // ---- for the settings menu (menu.cpp) ----
 // What ImGui's Vulkan backend needs to draw into the window's images

@@ -244,7 +244,7 @@ if(QILIN_RUNTIME_GEN_DIR)
         # The shaders: GLSL in recomp/runtime/shaders, SPIR-V headers
         # (uint32_t arrays) in its spirv folder, and the GLSL's SHA-256
         # (line endings normalised) in spirv/sources.sha256.
-        set(QILIN_SHADERS gx.vert gx.frag copy.vert copy.frag)
+        set(QILIN_SHADERS gx.vert gx.frag copy.vert copy.frag present.vert crt.frag)
         set(QILIN_SHADER_SRC "${CMAKE_CURRENT_SOURCE_DIR}/recomp/runtime/shaders")
         set(QILIN_SHADER_DIR "${QILIN_SHADER_SRC}/spirv")
         set(stamp "")
@@ -313,6 +313,7 @@ if(QILIN_RUNTIME_GEN_DIR)
 
         target_sources(qilin_run PRIVATE recomp/runtime/host.cpp recomp/runtime/gx_vulkan.cpp recomp/runtime/gx_texture.cpp
                                          recomp/runtime/menu.cpp recomp/runtime/pause.cpp)
+        set_source_files_properties(recomp/runtime/menu.cpp PROPERTIES COMPILE_DEFINITIONS QILIN_VERSION="${PROJECT_VERSION}")  # the menu's About
         if(WIN32)
             target_sources(qilin_run PRIVATE recomp/runtime/wasapi.cpp)  # exclusive-mode audio
         endif()

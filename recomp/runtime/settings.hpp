@@ -10,15 +10,64 @@
 // file and line (nothing is guessed). Runtime code: no std::format.
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <filesystem>
 #include <istream>
 #include <string>
+#include <vector>
 
 namespace qilin::rt {
 
 // How the picture fills the window.
 enum class Scaling : uint8_t { integer, fit, stretch };  // whole multiples; the largest that keeps its shape; the whole window
+// What it's drawn through: as it is, or a CRT television's raster lines and
+// phosphor stripes (shaders/crt.frag).
+enum class Look : uint8_t { plain, crt };
+
+// The Wii Remote's buttons, held upright, as the settings and the menu name
+// them; each is pressed by any of its bindings.
+enum Control : unsigned {
+    kCtlA, kCtlB, kCtlOne, kCtlTwo, kCtlPlus, kCtlMinus, kCtlHome, kCtlUp, kCtlDown, kCtlLeft, kCtlRight, kControlCount
+};
+const char* control_name(Control c);   // as the file names it: "a"
+const char* control_label(Control c);  // as the menu shows it: "A"
+uint16_t control_button(Control c);    // the Wii Remote's button bit (input.hpp)
+
+// A controller's buttons, by an Xbox pad's names (any SDL gamepad maps onto
+// them). The left stick counts as the d-pad past half way, the triggers past
+// half way. The mouse's left button rides along for binding.
+enum PadButton : uint32_t {
+    kPadUp = 1u << 0, kPadDown = 1u << 1, kPadLeft = 1u << 2, kPadRight = 1u << 3,
+    kPadA = 1u << 4, kPadB = 1u << 5, kPadX = 1u << 6, kPadY = 1u << 7,
+    kPadStart = 1u << 8, kPadBack = 1u << 9, kPadGuide = 1u << 10,
+    kPadClick = 1u << 11,                // the mouse's left button
+    kPadLB = 1u << 12, kPadRB = 1u << 13,  // the shoulder buttons
+    kPadLT = 1u << 14, kPadRT = 1u << 15,  // the triggers
+    kPadL3 = 1u << 16, kPadR3 = 1u << 17,  // the sticks, pressed in
+};
+
+// One input that presses a control: a controller's button, a key (by SDL's
+// scancode name, so the same place on any layout: "Space", "Right Shift"),
+// or the mouse's left button.
+struct Binding {
+    enum Kind : uint8_t { kPad, kKey, kMouse } kind = kPad;
+    uint32_t pad = 0;  // kPad: a PadButton bit
+    std::string key;   // kKey: the key's name
+    bool operator==(const Binding& o) const { return kind == o.kind && pad == o.pad && key == o.key; }
+};
+// As the file writes it ("pad:RB", "key:Space", "mouse") and as the menu
+// shows it ("Pad RB", "Space", "Mouse").
+std::string binding_text(const Binding& b);
+std::string binding_label(const Binding& b);
+const char* pad_button_name(uint32_t bit);  // null if it isn't one
+// Keys kept for the program: Escape and F1 (the menu), F3 (frame times),
+// F11 (full screen).
+bool key_reserved(const std::string& name);
+
+using Controls = std::array<std::vector<Binding>, kControlCount>;
+// The default layout: the keyboard and a controller (README's table).
+Controls default_controls();
 
 struct Settings {
     // [display]
@@ -27,7 +76,11 @@ struct Settings {
     std::string monitor;              // the display's name (empty: the main one)
     Scaling scaling = Scaling::fit;   // the picture's size in the window
     bool smooth = true;               // filtered at sizes that aren't whole multiples
-    uint32_t internal_scale = 1;      // the frame buffer at 1-8x the console's 640x528
+    Look look = Look::plain;          // plain, or a CRT television
+    uint32_t scanlines = 60;          // CRT: how dark the gaps between raster lines are, 0-100
+    uint32_t mask = 30;               // CRT: the phosphor stripes' strength, 0-100
+    bool performance_overlay = false; // frame rate, lows and frame times in a corner (F3 switches it)
+    uint32_t internal_scale = 1;      // the frame buffer at 1-8x the console's 640x528; 0: from the screen's height
     uint32_t anisotropy = 1;          // texture filtering: 1 (the console's), 2, 4, 8 or 16
     bool vsync = true;                // present at the display's refresh (no tearing); off: lowest latency
     bool lock_to_display = true;      // with vsync: the game's clock at the display's refresh when within 0.5% (read at start)
@@ -39,6 +92,7 @@ struct Settings {
     bool exclusive_audio = true;      // Windows: the device for the game alone (WASAPI exclusive: the shortest periods)
     // [controls]
     bool rumble = true;  // the Wii Remote's rumble on the controller
+    Controls controls = default_controls();  // each control's inputs
     // [console]: what the game reads as the Wii's own settings
     uint8_t language = 1;          // 0 Japanese, 1 English, 2 German, 3 French, 4 Spanish, 5 Italian, 6 Dutch
     bool sixty_hz = true;          // EuRGB60 (60 Hz) rather than PAL 50 Hz

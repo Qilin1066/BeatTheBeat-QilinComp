@@ -7,6 +7,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <string>
 
 namespace qilin::rt::host {
 
@@ -32,6 +33,19 @@ bool test_controllers(unsigned seconds);
 uint16_t keyboard_buttons();
 // Plays stereo 16-bit frames (host byte order, left then right).
 void play_audio(const int16_t* lr, uint32_t frames);
+// For the settings menu (the main thread): the controllers' buttons held now
+// (settings.hpp's PadButton bits, the mouse's left button as kPadClick), and
+// the bindings changed (the tables are made again).
+uint32_t pad_bits_held();
+void controls_changed();
+// The menu's frame-time readout: the live sound lag (ms queued) and the
+// display's refresh (Hz, 0 if unknown).
+double audio_queued_ms();
+double display_hz();
+// What the display does now, in a sentence (the refresh, the lock), and the
+// menu's refresh settings changed: the mode and the lock are worked out again.
+const std::string& mode_note();
+void display_settings_changed();
 #endif
 
 }  // namespace qilin::rt::host

@@ -10,7 +10,9 @@
 #include <SDL3/SDL.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <bit>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -39,6 +41,8 @@ SDL_Window* g_window = nullptr;
 // be opened at start), used by the game's (play_audio).
 std::atomic<SDL_AudioStream*> g_audio{nullptr};
 std::atomic<int> g_floor_ms{0};  // the least latency the open device can be held at (open_audio)
+std::atomic<double> g_audio_ms{0};    // the sound queued, smoothed (the F3 readout)
+std::atomic<double> g_display_hz{0};  // the window's display's refresh now (the F3 readout)
 #if defined(_WIN32)
 std::atomic<bool> g_exclusive{false};  // g_audio feeds wasapi.cpp's exclusive output, not an SDL device
 #endif
@@ -75,71 +79,87 @@ struct AudioClock {
 
 bool hidden();
 
-// The keyboard as a Wii Remote held upright.
-struct Key {
-    SDL_Scancode code;
-    uint16_t button;
-};
-// The owner's layout (2026-11-20): A and B on their own letters, and in
-// pairs for two hands, right A and left B as on a controller's shoulders:
-// the shift keys, and the left and right arrows. Space is A too. The d-pad
-// moves to I, J, K, L (with the up and down arrows).
-constexpr Key kKeys[] = {
-    {SDL_SCANCODE_A, kButtonA},      {SDL_SCANCODE_RSHIFT, kButtonA},    {SDL_SCANCODE_RIGHT, kButtonA},
-    {SDL_SCANCODE_SPACE, kButtonA},  {SDL_SCANCODE_B, kButtonB},         {SDL_SCANCODE_LSHIFT, kButtonB},
-    {SDL_SCANCODE_LEFT, kButtonB},   {SDL_SCANCODE_1, kButton1},         {SDL_SCANCODE_2, kButton2},
-    {SDL_SCANCODE_RETURN, kButtonPlus}, {SDL_SCANCODE_BACKSPACE, kButtonMinus}, {SDL_SCANCODE_TAB, kButtonMinus},
-    {SDL_SCANCODE_H, kButtonHome},   {SDL_SCANCODE_UP, kButtonUp},       {SDL_SCANCODE_DOWN, kButtonDown},
-    {SDL_SCANCODE_I, kButtonUp},     {SDL_SCANCODE_K, kButtonDown},      {SDL_SCANCODE_J, kButtonLeft},
-    {SDL_SCANCODE_L, kButtonRight},
-};
+// The Wii Remote's buttons, from the settings' bindings (settings.hpp's
+// Controls): each key, controller button and the mouse's left button presses
+// the controls it's bound to. Compiled into tables when the settings change
+// (rebuild_controls); the main thread reads and updates them.
+struct CompiledControls {
+    std::vector<std::pair<SDL_Scancode, uint16_t>> keys;  // key -> Wii buttons
+    std::array<uint16_t, 32> pad{};                       // PadButton bit index -> Wii buttons
+} g_controls;
+std::atomic<uint32_t> g_pad_bits{0};  // the controllers' buttons held (PadButton bits), the mouse's as kPadClick
+bool g_mouse_held = false;
+
+void rebuild_controls() {
+    CompiledControls c;
+    const Controls& from = settings().controls;
+    for (unsigned i = 0; i < kControlCount; ++i) {
+        const uint16_t button = control_button(Control(i));
+        for (const Binding& b : from[i]) {
+            if (b.kind == Binding::kKey) {
+                const SDL_Scancode code = SDL_GetScancodeFromName(b.key.c_str());
+                if (code == SDL_SCANCODE_UNKNOWN)
+                    std::fprintf(stderr, "qilin_run: controls: SDL doesn't know a key named \"%s\" (%s): it does nothing\n",
+                                 b.key.c_str(), control_name(Control(i)));
+                else c.keys.emplace_back(code, button);
+            } else {
+                const uint32_t bit = b.kind == Binding::kMouse ? uint32_t(kPadClick) : b.pad;
+                if (bit) c.pad[std::countr_zero(bit)] |= button;
+            }
+        }
+    }
+    g_controls = std::move(c);
+}
 
 void update_keys() {
     const bool* state = SDL_GetKeyboardState(nullptr);
     uint16_t held = 0;
-    for (const Key& k : kKeys)
-        if (state[k.code]) held |= k.button;
+    for (const auto& [code, button] : g_controls.keys)
+        if (state[code]) held |= button;
     g_keys.store(held, std::memory_order_relaxed);
 }
 
-// Controllers as the Wii Remote held upright: the south face button is A,
-// the east one, the left shoulder and the right trigger B (the remote's
-// trigger), the right shoulder A as well, west 1,
-// north 2, Start +, Back -, Guide Home; the d-pad and the left stick the
-// remote's d-pad.
+// A controller's buttons, by an Xbox pad's names; the left stick counts as
+// the d-pad past half way, as do the triggers as buttons.
 //
 // Every gamepad SDL knows is opened and any of them plays (their buttons
 // add up), as the other recomps do it (Zelda64Recomp reads all pads,
 // UnleashedRecomp the one last touched). Taking only the first one listed
 // went wrong on computers with other game devices: a virtual pad or a wheel
 // listed first took the place and the real controller was never read.
-uint16_t pad_buttons(SDL_Gamepad* pad) {
-    uint16_t held = 0;
+uint32_t pad_bits(SDL_Gamepad* pad) {
+    uint32_t held = 0;
     auto button = [pad](SDL_GamepadButton b) { return SDL_GetGamepadButton(pad, b); };
-    // The shoulder buttons too (right A, left B): a hand each, for play.
-    if (button(SDL_GAMEPAD_BUTTON_SOUTH) || button(SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER)) held |= kButtonA;
-    if (button(SDL_GAMEPAD_BUTTON_EAST) || button(SDL_GAMEPAD_BUTTON_LEFT_SHOULDER) ||
-        SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) > 16000)
-        held |= kButtonB;
-    if (button(SDL_GAMEPAD_BUTTON_WEST)) held |= kButton1;
-    if (button(SDL_GAMEPAD_BUTTON_NORTH)) held |= kButton2;
-    if (button(SDL_GAMEPAD_BUTTON_START)) held |= kButtonPlus;
-    if (button(SDL_GAMEPAD_BUTTON_BACK)) held |= kButtonMinus;
-    if (button(SDL_GAMEPAD_BUTTON_GUIDE)) held |= kButtonHome;
-    const int x = SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFTX), y = SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFTY);
-    if (button(SDL_GAMEPAD_BUTTON_DPAD_UP) || y < -16000) held |= kButtonUp;
-    if (button(SDL_GAMEPAD_BUTTON_DPAD_DOWN) || y > 16000) held |= kButtonDown;
-    if (button(SDL_GAMEPAD_BUTTON_DPAD_LEFT) || x < -16000) held |= kButtonLeft;
-    if (button(SDL_GAMEPAD_BUTTON_DPAD_RIGHT) || x > 16000) held |= kButtonRight;
+    auto axis = [pad](SDL_GamepadAxis a) { return int(SDL_GetGamepadAxis(pad, a)); };
+    const int x = axis(SDL_GAMEPAD_AXIS_LEFTX), y = axis(SDL_GAMEPAD_AXIS_LEFTY);
+    if (button(SDL_GAMEPAD_BUTTON_DPAD_UP) || y < -16000) held |= kPadUp;
+    if (button(SDL_GAMEPAD_BUTTON_DPAD_DOWN) || y > 16000) held |= kPadDown;
+    if (button(SDL_GAMEPAD_BUTTON_DPAD_LEFT) || x < -16000) held |= kPadLeft;
+    if (button(SDL_GAMEPAD_BUTTON_DPAD_RIGHT) || x > 16000) held |= kPadRight;
+    if (button(SDL_GAMEPAD_BUTTON_SOUTH)) held |= kPadA;
+    if (button(SDL_GAMEPAD_BUTTON_EAST)) held |= kPadB;
+    if (button(SDL_GAMEPAD_BUTTON_WEST)) held |= kPadX;
+    if (button(SDL_GAMEPAD_BUTTON_NORTH)) held |= kPadY;
+    if (button(SDL_GAMEPAD_BUTTON_START)) held |= kPadStart;
+    if (button(SDL_GAMEPAD_BUTTON_BACK)) held |= kPadBack;
+    if (button(SDL_GAMEPAD_BUTTON_GUIDE)) held |= kPadGuide;
+    if (button(SDL_GAMEPAD_BUTTON_LEFT_SHOULDER)) held |= kPadLB;
+    if (button(SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER)) held |= kPadRB;
+    if (axis(SDL_GAMEPAD_AXIS_LEFT_TRIGGER) > 16000) held |= kPadLT;
+    if (axis(SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) > 16000) held |= kPadRT;
+    if (button(SDL_GAMEPAD_BUTTON_LEFT_STICK)) held |= kPadL3;
+    if (button(SDL_GAMEPAD_BUTTON_RIGHT_STICK)) held |= kPadR3;
     return held;
 }
 
 void update_pad() {
+    uint32_t bits = g_mouse_held ? uint32_t(kPadClick) : 0u;
+    for (SDL_Gamepad* pad : g_pads) bits |= pad_bits(pad);
+    g_pad_bits.store(bits, std::memory_order_relaxed);
     uint16_t held = 0;
-    for (SDL_Gamepad* pad : g_pads) held |= pad_buttons(pad);
+    for (uint32_t rest = bits; rest; rest &= rest - 1) held |= g_controls.pad[std::countr_zero(rest)];
     g_pad_buttons.store(held, std::memory_order_relaxed);
 }
-
 const char* pad_type(SDL_Gamepad* pad) {
     const char* s = SDL_GetGamepadStringForType(SDL_GetGamepadType(pad));
     return s ? s : "unknown";
@@ -295,13 +315,33 @@ double lock_speed(double hz, int& k) {
 // highest such. F11 and Alt+Enter use it too; windowed play keeps the desktop.
 SDL_DisplayMode g_fullscreen_mode{};
 bool g_have_fullscreen_mode = false;
+std::string g_mode_note;  // what the display does now, for the menu (main thread)
+
+// Sets the window's fullscreen mode only if it differs: setting it while full
+// screen switches the display, which comes back as a mode-change event.
+void set_fullscreen_mode(const SDL_DisplayMode* want) {
+    const SDL_DisplayMode* now = SDL_GetWindowFullscreenMode(g_window);
+    const bool same = (!now && !want) || (now && want && now->w == want->w && now->h == want->h &&
+                                          now->refresh_rate_numerator == want->refresh_rate_numerator &&
+                                          now->refresh_rate_denominator == want->refresh_rate_denominator &&
+                                          now->refresh_rate == want->refresh_rate);
+    if (!same) SDL_SetWindowFullscreenMode(g_window, want);
+}
 
 void choose_fullscreen_mode() {
-    if (hidden() || !settings().vsync || !settings().match_refresh || settings().variable_refresh) return;
+    g_have_fullscreen_mode = false;
+    const bool wanted = !hidden() && settings().vsync && settings().match_refresh && !settings().variable_refresh;
+    if (!wanted) {
+        set_fullscreen_mode(nullptr);  // the desktop's mode
+        return;
+    }
     const SDL_DisplayID display = SDL_GetDisplayForWindow(g_window);
     const SDL_DisplayMode* desktop = SDL_GetDesktopDisplayMode(display);
     int k = 0;
-    if (!desktop || lock_speed(mode_hz(*desktop), k) != 0) return;  // the desktop's own refresh suits
+    if (!desktop || lock_speed(mode_hz(*desktop), k) != 0) {  // the desktop's own refresh suits
+        set_fullscreen_mode(nullptr);
+        return;
+    }
     int n = 0;
     SDL_DisplayMode** modes = SDL_GetFullscreenDisplayModes(display, &n);
     if (!modes) return;
@@ -311,50 +351,50 @@ void choose_fullscreen_mode() {
         if (m->w != desktop->w || m->h != desktop->h || m->pixel_density != desktop->pixel_density) continue;
         if (lock_speed(mode_hz(*m), k) != 0 && (!best || mode_hz(*m) > mode_hz(*best))) best = m;
     }
-    if (best) {
-        g_fullscreen_mode = *best, g_have_fullscreen_mode = true;
-        SDL_SetWindowFullscreenMode(g_window, &g_fullscreen_mode);
-        std::fprintf(stderr, "qilin_run: the desktop runs at %.3f Hz; fullscreen switches to %dx%d at %.3f Hz to show every frame evenly\n",
-                     mode_hz(*desktop), best->w, best->h, mode_hz(*best));
-    } else {
-        std::fprintf(stderr, "qilin_run: the desktop runs at %.3f Hz and the display has no %dx%d mode near a multiple of %.2f Hz\n",
-                     mode_hz(*desktop), desktop->w, desktop->h, field_hz());
-    }
+    if (best) g_fullscreen_mode = *best, g_have_fullscreen_mode = true;
     SDL_free(modes);
+    set_fullscreen_mode(g_have_fullscreen_mode ? &g_fullscreen_mode : nullptr);
 }
 
-void lock_to_display() {
+// The game's clock and the display, made to agree for the display as it is
+// now: at start, and again whenever full screen is switched, the display's
+// mode changes or the menu's refresh settings do. With vsync, a refresh
+// within 0.5% of the game's 59.94 Hz (or 50 Hz) times 1-8 locks the clock to
+// it (each frame shown that many times) and the vblank lock steers the
+// presents; otherwise the clock runs at its own rate. A variable-refresh
+// display follows the frames: nothing is locked or switched. Not for runs
+// that must replay alike (hidden, the bot).
+void apply_display_mode() {
     if (hidden() || bot::active()) return;
-    if (settings().variable_refresh) {
-        // The display follows the frames: the game keeps its own clock
-        // (the console's 59.94 or 50 Hz) and nothing is locked or switched.
-        const SDL_DisplayMode* m = SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(g_window));
-        std::fprintf(stderr, "qilin_run: variable refresh: the display (up to %.3f Hz) follows the game's %.2f Hz frames; "
-                             "it must be on in the graphics driver (on a fixed-refresh display frames come unevenly)\n",
-                     m ? mode_hz(*m) : 0.0, field_hz());
-        return;
-    }
-    if (!settings().vsync || !settings().lock_to_display) return;
+    choose_fullscreen_mode();
+    const bool full = (SDL_GetWindowFlags(g_window) & SDL_WINDOW_FULLSCREEN) != 0;
     double hz = 0;
-    if (g_have_fullscreen_mode && (SDL_GetWindowFlags(g_window) & SDL_WINDOW_FULLSCREEN)) {
-        hz = mode_hz(g_fullscreen_mode);
-    } else if (const SDL_DisplayMode* m = SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(g_window))) {
-        hz = mode_hz(*m);
-    }
+    if (full && g_have_fullscreen_mode) hz = mode_hz(g_fullscreen_mode);
+    else if (const SDL_DisplayMode* m = SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(g_window))) hz = mode_hz(*m);
+    g_display_hz.store(hz, std::memory_order_relaxed);
+    char note[256];
     int k = 0;
-    if (const double speed = lock_speed(hz, k); speed != 0) {
+    const double speed = settings().vsync && settings().lock_to_display && !settings().variable_refresh ? lock_speed(hz, k) : 0;
+    if (speed != 0) {
         set_time_base_speed(speed);
-        std::fprintf(stderr, "qilin_run: display %.3f Hz: the game runs at %.3f Hz (%+.2f%%), so every frame is shown %d time%s\n",
-                     hz, hz / k, (speed - 1.0) * 100.0, k, k == 1 ? "" : "s");
         gx::lock_frames_to_vblank(speed);
-        return;
+        std::snprintf(note, sizeof note, "%.3f Hz: the game runs at %.3f Hz (%+.2f%%), each frame shown %d time%s, locked to the vblanks.",
+                      hz, hz / k, (speed - 1.0) * 100.0, k, k == 1 ? "" : "s");
+    } else {
+        gx::lock_frames_to_vblank(0);  // off
+        set_time_base_speed(1.0);
+        if (settings().variable_refresh)
+            std::snprintf(note, sizeof note, "Variable refresh: the display (up to %.0f Hz) follows the game's %.2f Hz frames "
+                                             "(it must be on in the graphics driver).", hz, field_hz());
+        else if (!settings().vsync)
+            std::snprintf(note, sizeof note, "No vsync: frames are shown as soon as they're drawn (tearing).");
+        else
+            std::snprintf(note, sizeof note, "%.3f Hz: not a whole multiple of the game's %.2f Hz, so frames are shown unevenly%s.", hz,
+                          field_hz(), full ? "" : g_have_fullscreen_mode ? " (full screen switches to a mode that suits)" : "");
     }
-    std::fprintf(stderr,
-                 "qilin_run: display %.3f Hz: no whole multiple of the game's %.2f Hz is near, so frames are shown unevenly "
-                 "(fullscreen%s, a 60 Hz desktop, or a variable-refresh display avoids it)\n",
-                 hz, field_hz(), g_have_fullscreen_mode ? " (switches the display to suit)" : "");
+    if (g_mode_note != note) std::fprintf(stderr, "qilin_run: display %s\n", note);
+    g_mode_note = note;
 }
-
 // QILIN_HIDDEN=1: the renderer runs as with a window, but the window isn't
 // shown and nothing is played (scripted runs on a computer someone is
 // using, with QILIN_FRAME_DUMP to see the frames).
@@ -445,6 +485,7 @@ void play_audio(const int16_t* lr, uint32_t frames) {
     // The depth over about 200 ms (64 frames of 3 ms): the device takes the
     // queue in its own bursts, so one reading says little.
     g_clock.depth += (queued - g_clock.depth) / 64.0;
+    g_audio_ms.store(g_clock.depth / kBytesPerMs, std::memory_order_relaxed);  // for the F3 readout
     if (++g_clock.frames < 16) return;  // the ratio every 48 ms
     g_clock.frames = 0;
     // Proportional: 10 ms too deep plays 1/3% faster at a 30 ms target, which
@@ -455,6 +496,17 @@ void play_audio(const int16_t* lr, uint32_t frames) {
     st.audio_ratio = ratio;
     SDL_SetAudioStreamFrequencyRatio(audio, float(ratio));
 }
+
+uint32_t pad_bits_held() { return g_pad_bits.load(std::memory_order_relaxed); }
+void controls_changed() {
+    rebuild_controls();
+    update_keys();
+    update_pad();
+}
+double audio_queued_ms() { return g_audio_ms.load(std::memory_order_relaxed); }
+double display_hz() { return g_display_hz.load(std::memory_order_relaxed); }
+const std::string& mode_note() { return g_mode_note; }
+void display_settings_changed() { apply_display_mode(); }
 
 void rumble(bool on) {
     if (g_rumble.exchange(on) == on || !g_wake_event) return;
@@ -481,6 +533,7 @@ bool test_controllers(unsigned seconds) {
     } kNames[] = {{kButtonA, "A"},       {kButtonB, "B"},         {kButton1, "1"},       {kButton2, "2"},
                   {kButtonPlus, "+"},    {kButtonMinus, "-"},     {kButtonHome, "Home"}, {kButtonUp, "Up"},
                   {kButtonDown, "Down"}, {kButtonLeft, "Left"},   {kButtonRight, "Right"}};
+    rebuild_controls();  // the settings' bindings, as in the game
     const uint64_t end = SDL_GetTicks() + 1000ull * seconds;
     uint16_t last = 0;
     unsigned changes = 0;
@@ -529,15 +582,15 @@ bool run(const std::function<void()>& game) {
     }
     if (!gx::init_vulkan(g_window)) return false;
     if (!hidden()) open_audio();
+    rebuild_controls();
     attach_connected();
     std::fprintf(stderr,
                  "qilin_run: settings: %s (preset %s, %ux internal resolution, %ux anisotropic filtering)\n"
-                 "qilin_run: keys: A = A, Right Shift, Right arrow or Space; B = B, Left Shift or Left arrow; 1, 2; "
-                 "+ = Enter; - = Backspace or Tab; Home = H; the d-pad = I J K L or Up/Down; F11 or Alt+Enter: fullscreen\n",
-                 settings_path().string().c_str(), settings().preset.c_str(), settings().internal_scale, settings().anisotropy);
+                 "qilin_run: controls as the settings file has them (the menu's Controls page sets them); "
+                 "F1 or Esc: settings, F3: frame times, F11 or Alt+Enter: full screen\n",
+                 settings_path().string().c_str(), settings().preset.c_str(), gx::internal_scale(), settings().anisotropy);
 
-    choose_fullscreen_mode();
-    lock_to_display();  // before the game's threads: the clock's speed is set here first
+    apply_display_mode();  // before the game's threads: the clock's speed is set here first
     g_report_extra = gx::vblank_report;
     std::thread(game).detach();
     Menu menu(g_window);
@@ -604,7 +657,20 @@ bool run(const std::function<void()>& game) {
             case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
             case SDL_EVENT_GAMEPAD_BUTTON_UP:
             case SDL_EVENT_GAMEPAD_AXIS_MOTION: update_pad(); break;
+            case SDL_EVENT_MOUSE_BUTTON_DOWN:
+            case SDL_EVENT_MOUSE_BUTTON_UP:
+                if (e.button.button == SDL_BUTTON_LEFT) {
+                    g_mouse_held = e.type == SDL_EVENT_MOUSE_BUTTON_DOWN;
+                    update_pad();
+                }
+                break;
             case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED: gx::window_resized(); break;
+            // Full screen switched (F11, the menu) or the display changed:
+            // the game's clock and the vblank lock follow the refresh now.
+            case SDL_EVENT_WINDOW_ENTER_FULLSCREEN:
+            case SDL_EVENT_WINDOW_LEAVE_FULLSCREEN:
+            case SDL_EVENT_WINDOW_DISPLAY_CHANGED:
+            case SDL_EVENT_DISPLAY_CURRENT_MODE_CHANGED: apply_display_mode(); break;
             default:
                 if (e.type == g_wake_event) apply_rumble();
                 break;
