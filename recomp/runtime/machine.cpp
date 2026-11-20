@@ -6,6 +6,7 @@
 
 #if defined(_WIN32)
 #include <windows.h>
+#include <avrt.h>
 #include <timeapi.h>
 #else
 #include <sys/mman.h>
@@ -18,6 +19,25 @@ void fine_timers() {
     // Windows rounds short waits up to its 15.6 ms tick by default; the
     // audio clock needs 3 ms (the setting lasts until the process exits).
     timeBeginPeriod(1);
+    // Windows 11 throttles a process whose window is hidden, minimised or
+    // covered: slower cores (EcoQoS) and its timer request ignored. The
+    // game's clock keeps running whether it's seen or not, so the audio
+    // would break up. Opt out of both.
+    PROCESS_POWER_THROTTLING_STATE p{};
+    p.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+    p.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION;
+    p.StateMask = 0;  // neither
+    SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &p, sizeof p);  // older Windows: refused, harmless
+#endif
+}
+
+void game_thread_started() {
+#if defined(_WIN32)
+    // The multimedia scheduler's "Games" class: the game's threads aren't
+    // held back behind background work, so the retrace and the audio DMA
+    // run when due. Each guest thread has its own host thread, so each asks.
+    DWORD task = 0;
+    AvSetMmThreadCharacteristicsW(L"Games", &task);  // without the service: no change
 #endif
 }
 

@@ -179,7 +179,9 @@ if(QILIN_RUNTIME_GEN_DIR)
     )
     target_link_libraries(qilin_run PRIVATE qilin_gen_runtime qilin_dol qilin_warnings)
     if(WIN32)
-        target_link_libraries(qilin_run PRIVATE winmm)  # timeBeginPeriod: 1 ms timers for the audio clock
+        # winmm: timeBeginPeriod (1 ms timers for the audio clock); avrt: the
+        # multimedia scheduler's "Games" class for the game's threads.
+        target_link_libraries(qilin_run PRIVATE winmm avrt)
     endif()
     # Link-time optimisation: lifted functions call each other across the
     # generated files; LTO lets the compiler inline across them. Slower to

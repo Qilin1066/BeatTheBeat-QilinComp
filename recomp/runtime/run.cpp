@@ -160,6 +160,7 @@ int main(int argc, char** argv) {
 namespace {
 
 void run_game(rt::Context& c) {
+    rt::game_thread_started();
     rt::set_thread_context(&c);
     if (!rt::init_threads(c)) end(2);
     start_time_limit();

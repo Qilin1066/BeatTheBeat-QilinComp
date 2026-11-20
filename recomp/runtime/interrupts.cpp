@@ -12,6 +12,16 @@
 
 #include "native.hpp"
 
+#if defined(_WIN32)  // after the runtime's headers: its macros can't reach them
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 namespace qilin::rt {
 
 namespace {
@@ -56,6 +66,43 @@ std::mutex g_mutex;
 std::condition_variable g_wake;
 std::deque<Queued> g_queue;
 std::atomic<uint64_t> g_next_due{kNever};
+
+#if defined(_WIN32)
+// Windows: the idle wait sleeps on a high-resolution waitable timer (Windows
+// 10 1803 on; to the half-millisecond, whatever the system's timer period)
+// and an event posting sets. A condition variable's timed wait rounds to the
+// timer period: 1 ms with timeBeginPeriod(1), which Windows 11 ignores for a
+// window that isn't visible, and 15.6 ms then. The retrace and the audio
+// DMA (every 3 ms) are woken for on time.
+HANDLE g_posted = CreateEventW(nullptr, FALSE, FALSE, nullptr);  // auto-reset
+HANDLE make_timer() {
+    HANDLE t = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    return t ? t : CreateWaitableTimerExW(nullptr, nullptr, 0, TIMER_ALL_ACCESS);  // before 1803: the coarse one
+}
+#endif
+
+// Sleeps for up to `ns` or until something is posted (g_mutex held by `l`
+// on entry and exit).
+void idle_wait(std::unique_lock<std::mutex>& l, uint64_t ns) {
+#if defined(_WIN32)
+    thread_local const HANDLE timer = make_timer();  // one per host thread: a timer has one deadline
+    LARGE_INTEGER due;
+    due.QuadPart = -static_cast<LONGLONG>(ns / 100);  // relative, in 100 ns units
+    if (due.QuadPart == 0) return;
+    if (!timer || !g_posted || !SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE)) {
+        g_wake.wait_for(l, std::chrono::nanoseconds(ns));
+        return;
+    }
+    // A post between the unlock and the wait leaves the event set: no lost
+    // wake-up.
+    l.unlock();
+    const HANDLE both[2] = {timer, g_posted};
+    WaitForMultipleObjects(2, both, FALSE, INFINITE);
+    l.lock();
+#else
+    g_wake.wait_for(l, std::chrono::nanoseconds(ns));
+#endif
+}
 
 // Lifted loops test g_irq_pending on every backward branch: it says
 // something is due now. What comes due later (an I/O completion 1 ms
@@ -197,6 +244,9 @@ void post_interrupt(std::function<void(Context&)> handler, uint64_t delay) {
         update_next_due();  // lifted loops start looking
     }
     g_wake.notify_all();
+#if defined(_WIN32)
+    if (g_posted) SetEvent(g_posted);
+#endif
 }
 
 void poll(Context& c) { deliver_due(c); }
@@ -241,8 +291,7 @@ bool wait_and_deliver(Context& c) {
             if (!any) return false;  // nothing queued, no timer, and nothing can queue one yet
             const uint64_t now = time_base();
             if (now >= next) break;
-            const uint64_t ns = (next - now) * kNsPerSecond / kTimeBaseHz;
-            g_wake.wait_for(l, std::chrono::nanoseconds(ns));
+            idle_wait(l, host_ns_for_ticks(next - now));
         }
     }
     ++stats().idle_deliveries;

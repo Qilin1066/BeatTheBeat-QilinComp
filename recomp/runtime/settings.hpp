@@ -30,7 +30,11 @@ struct Settings {
     uint32_t internal_scale = 1;      // the frame buffer at 1-8x the console's 640x528
     uint32_t anisotropy = 1;          // texture filtering: 1 (the console's), 2, 4, 8 or 16
     bool vsync = true;                // present at the display's refresh (no tearing); off: lowest latency
+    bool lock_to_display = true;      // with vsync: the game's clock at the display's refresh when within 0.5% (read at start)
+    bool match_refresh = true;        // with vsync: fullscreen switches to a refresh that suits the game (60/120 Hz) if the desktop's doesn't
     std::string gpu;                  // the graphics device's name (empty: the best one)
+    // [audio]
+    uint32_t audio_latency_ms = 30;   // the sound queued ahead of the speakers, held there (20-200)
     // [controls]
     bool rumble = true;  // the Wii Remote's rumble on the controller
     // [console]: what the game reads as the Wii's own settings

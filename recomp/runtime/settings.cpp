@@ -64,8 +64,20 @@ std::string settings_text(const Settings& s) {
     line("anisotropy = " + std::to_string(s.anisotropy));
     line("# Present at the display's refresh (no tearing). false: the lowest latency.");
     line(std::string("vsync = ") + b(s.vsync));
+    line("# With vsync: when the display's refresh is within 0.5% of the game's 59.94 Hz (or 50 Hz),");
+    line("# or a whole multiple of it, run the game at the display's rate, so no frame is shown twice");
+    line("# (a hitch every 17 s at 60 Hz otherwise). The game and its sound run up to 0.5% faster.");
+    line(std::string("lock_to_display = ") + b(s.lock_to_display));
+    line("# With vsync: if the desktop's refresh can't show the game's frames evenly (75 Hz, 144 Hz),");
+    line("# fullscreen switches the display to the same resolution at 60 or 120 Hz. false: the desktop's mode.");
+    line(std::string("match_refresh = ") + b(s.match_refresh));
     line("# The graphics device, by name (empty: the best one).");
     line("gpu = " + s.gpu);
+    line("");
+    line("[audio]");
+    line("# Milliseconds of sound queued ahead of the speakers, held there by resampling a little.");
+    line("# Lower is less lag between a press and its sound; raise it if the sound crackles (20-200).");
+    line("latency_ms = " + std::to_string(s.audio_latency_ms));
     line("");
     line("[controls]");
     line("# The Wii Remote's rumble on the controller.");
@@ -130,7 +142,8 @@ bool parse_settings(std::istream& in, Settings& s, std::string& error, unsigned&
         if (line.front() == '[') {
             if (line.back() != ']') return bad("a section is written [name]");
             section = trim(line.substr(1, line.size() - 2));
-            if (section != "display" && section != "controls" && section != "console") return bad("no section [" + section + "]");
+            if (section != "display" && section != "audio" && section != "controls" && section != "console")
+                return bad("no section [" + section + "]");
             continue;
         }
         const size_t eq = line.find('=');
@@ -175,6 +188,12 @@ bool parse_settings(std::istream& in, Settings& s, std::string& error, unsigned&
             boolean(s.rumble);
         } else if (section == "display" && key == "vsync") {
             boolean(s.vsync);
+        } else if (section == "display" && key == "lock_to_display") {
+            boolean(s.lock_to_display);
+        } else if (section == "display" && key == "match_refresh") {
+            boolean(s.match_refresh);
+        } else if (section == "audio" && key == "latency_ms") {
+            s.audio_latency_ms = number(20, 200);  // under 20, a 10 ms device period empties the queue each time it reads
         } else if (section == "console" && key == "language") {
             s.language = static_cast<uint8_t>(number(0, 6));
         } else if (section == "console" && key == "sixty_hz") {

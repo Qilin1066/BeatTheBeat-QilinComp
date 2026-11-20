@@ -43,6 +43,9 @@ using namespace qilin::rt;
 
 constexpr uint32_t kSampleRate = 32000, kFrameSamples = 96;
 constexpr uint32_t kFrameBytes = kFrameSamples * 4;  // stereo, 16-bit
+// The runtime's start, as input.cpp's press times count it (both initialised
+// before main).
+const uint64_t g_process_start = time_base();
 
 // ---- AI ----
 struct Ai {
@@ -144,6 +147,12 @@ QILIN_NATIVE(AIStartDMA) {
     ai.running = true;
     ai.started = time_base() + kTimeBaseHz * kFrameSamples / kSampleRate;  // the first interrupt's due time
     add_periodic(kTimeBaseHz * kFrameSamples / kSampleRate, dma_interrupt);
+    // The dump's time 0 is this first DMA, not the runtime's start that
+    // QILIN_INPUT counts from: said, so the two can be lined up (a press's
+    // sound otherwise looks late by this much).
+    if (const char* dump = std::getenv("QILIN_AUDIO_DUMP"); dump && *dump)
+        std::fprintf(stderr, "qilin_run: QILIN_AUDIO_DUMP: the WAV's 0 is %.4f s after the start (QILIN_INPUT's 0)\n",
+                     double(ai.started - g_process_start) / double(kTimeBaseHz));
 }
 // The DMA interrupt comes when a buffer has played out: AX asks at that
 // moment, so nothing is left.

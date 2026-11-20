@@ -373,6 +373,16 @@ void Menu::display_page() {
     ImGui::SameLine();
     ImGui::Checkbox("Vsync", &s.vsync);
 
+    ImGui::SeparatorText("Timing");
+    ImGui::BeginDisabled(!s.vsync);
+    ImGui::Checkbox("Lock the game to the display's refresh (from the next start)", &s.lock_to_display);
+    ImGui::Checkbox("Fullscreen at 60/120 Hz when the desktop's refresh doesn't suit (from the next start)", &s.match_refresh);
+    ImGui::EndDisabled();
+    int latency = int(s.audio_latency_ms);
+    if (ImGui::SliderInt("Sound latency", &latency, 20, 200, "%d ms", ImGuiSliderFlags_AlwaysClamp))
+        s.audio_latency_ms = uint32_t(latency);
+    ImGui::TextDisabled("Lower: less lag between a press and its sound. Raise it if the sound crackles.");
+
     ImGui::SeparatorText("Enhancements");
     static constexpr const char* kPresets[] = {"original", "low-end", "desktop"};
     if (ImGui::BeginCombo("Preset", s.preset.c_str())) {

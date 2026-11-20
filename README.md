@@ -54,7 +54,7 @@ Nothing of the game is in this repository, and a built game can't be shared eith
 
 It checks for the tools it needs (CMake 3.25, Visual Studio 2022 17.10's C++ tools, Python 3.9; if one is missing it gives the `winget` command that installs it), checks the disc, recompiles and builds the game (several minutes, and about 6 GB of space while it builds), and installs it for you only, without administrator rights: a folder under `%LOCALAPPDATA%\Programs`, shortcuts in the Start menu and on the desktop, and an entry in Windows' "Installed apps" whose uninstall removes it again (saves and settings are kept unless asked). The disc folder must stay where it is: the game reads its files from it.
 
-Options (`install.cmd -Option`, or `tools\install\install.ps1`): `-Disc FOLDER`, `-InstallDir FOLDER`, `-Portable` (the folder only: no shortcuts, nothing registered), `-NoDesktop`, `-NoShortcuts`, `-Unchecked` (faster, without the memory checks that name a fault), `-KeepBuild`, `-Jobs N`. On Linux and macOS, build as below for now.
+Options (`install.cmd -Option`, or `tools\install\install.ps1`): `-Disc FOLDER`, `-InstallDir FOLDER`, `-Portable` (the folder only: no shortcuts, nothing registered), `-NoDesktop`, `-NoShortcuts`, `-Checked` (the memory checks that name a fault in the game's code: about twice that code's time, for reporting a crash; off by default), `-KeepBuild`, `-Jobs N`. On Linux and macOS, build as below for now.
 
 ## Building
 

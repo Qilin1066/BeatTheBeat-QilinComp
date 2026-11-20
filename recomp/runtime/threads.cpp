@@ -91,6 +91,7 @@ void wait_turn() {
 // register OSCreateThread set sends it there.
 void host_main(uint32_t t, uint32_t gen) {
     t_self = t, t_gen = gen;
+    game_thread_started();
     try {
         wait_turn();
         Context c = g_template;

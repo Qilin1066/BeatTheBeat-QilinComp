@@ -11,7 +11,7 @@
 #
 # Run install.cmd (double-click), or:
 #   powershell -ExecutionPolicy Bypass -File tools\install\install.ps1 [-Disc FOLDER] [-InstallDir FOLDER]
-#       [-NoShortcuts] [-NoDesktop] [-Portable] [-Unchecked] [-Jobs N] [-KeepBuild]
+#       [-NoShortcuts] [-NoDesktop] [-Portable] [-Checked] [-Jobs N] [-KeepBuild]
 #
 # It needs the Internet once (CMake fetches SDL3, the Vulkan headers and
 # Dear ImGui, each checked against a pinned hash). Works with Windows
@@ -25,8 +25,12 @@ param(
     [switch]$NoDesktop,
     # Only the folder (with Play.cmd): no shortcuts, nothing in Windows' "Installed apps".
     [switch]$Portable,
-    # Builds without checked memory: about twice as fast in the game's code,
-    # but a fault there is no longer caught and named. The default keeps the checks.
+    # Builds with checked memory: every access of the game's code is tested,
+    # so a fault there is caught and named, at about twice the time in that
+    # code (more lag on a slow computer). For reporting a crash; the default
+    # is without the checks.
+    [switch]$Checked,
+    # The default since v0.17.0; still accepted from older command lines.
     [switch]$Unchecked,
     [int]$Jobs = 0,
     [switch]$KeepBuild
@@ -166,7 +170,9 @@ Run "Recompiling the game's code to C++" $qilin @('lift', $Dol, '--out', $gen, '
 
 Step 'Building the game (3 of 4): this is the long step, several minutes'
 $configure = @('-S', $Repo, '-B', $game, '-DCMAKE_BUILD_TYPE=Release', "-DQILIN_RUNTIME_GEN_DIR=$gen")
-if ($Unchecked) { $configure += '-DQILIN_RUNTIME_CHECKED=OFF' }
+if ($Checked -and $Unchecked) { throw '-Checked and -Unchecked contradict each other: give one.' }
+if (-not $Checked) { $configure += '-DQILIN_RUNTIME_CHECKED=OFF' }
+else { $configure += '-DQILIN_RUNTIME_CHECKED=ON' }   # explicit: a kept build folder may hold OFF from before
 Run 'Configuring the game (fetches SDL3, the Vulkan headers and Dear ImGui)' 'cmake' $configure
 Run 'Building the game' 'cmake' (@('--build', $game, '--config', 'Release', '--target', 'qilin_run') + $parallel)
 $built = Find-Built $game 'qilin_run.exe'
@@ -187,7 +193,7 @@ Set-Content -Path (Join-Path $InstallDir 'install-info.txt') -Value @(
     "$GameName (Qilin recompilation) $version",
     "Installed $(Get-Date -Format 'yyyy-MM-dd HH:mm') from $Repo",
     "Disc folder: $Disc",
-    "Memory checks: $(if ($Unchecked) { 'off (-Unchecked)' } else { 'on' })",
+    "Memory checks: $(if ($Checked) { 'on (-Checked)' } else { 'off' })",
     'Saves and settings: %LOCALAPPDATA%\qilin\beatthebeat (kept when uninstalling, unless asked)')
 
 $made = @()

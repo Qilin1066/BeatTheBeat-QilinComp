@@ -9,12 +9,15 @@
 
 #include <SDL3/SDL.h>
 
+#include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <thread>
 #include <vector>
 
+#include "bot.hpp"
 #include "console.hpp"
 #include "gx_vulkan.hpp"
 #include "input.hpp"
@@ -36,9 +39,28 @@ std::atomic<bool> g_rumble{false};
 uint32_t g_wake_event = 0;  // an SDL user event: something for the main thread to do
 
 constexpr uint32_t kSampleRate = 32000;
-// Audio queued beyond this is dropped (counted), so the output's latency
-// stays bounded if the host falls behind.
-constexpr int kMaxQueuedBytes = kSampleRate * 4 / 10;  // 100 ms
+constexpr int kBytesPerMs = kSampleRate * 4 / 1000;  // 16-bit stereo
+// Audio more than this beyond the target (a burst after a stall: the
+// periodic interrupts catching up) is dropped, counted, so the lag between
+// the game and its sound snaps back at once.
+constexpr int kMaxExtraBytes = 40 * kBytesPerMs;
+
+// The audio clock. The game's DMA makes 32 kHz by its own clock (the time
+// base); the sound card plays by its crystal. Left alone, the queue between
+// them wanders (any lag from 0 to the cap, a different one each session) and
+// then clicks as frames are dropped or run out. Instead it is held at the
+// target (settings: audio latency_ms): the queue is filled to the target
+// before playing starts, then SDL resamples by a ratio that follows the
+// queue's average depth (at most 0.5% from the game's speed: inaudible).
+// Running dry fills it back to the target with silence at once. Touched only
+// from the DMA interrupt (one guest thread at a time) and open_audio.
+struct AudioClock {
+    bool primed = false;  // the device is playing (the queue reached the target once)
+    double depth = 0;     // the queue's depth, smoothed (bytes)
+    unsigned frames = 0;  // since the ratio was last set
+} g_clock;
+
+bool hidden();
 
 // The keyboard as a Wii Remote held upright. The other Qilin recomps' keys
 // (Space or K for the main button, L for the second, Enter Start, Backspace
@@ -154,14 +176,102 @@ void apply_rumble() {
     for (SDL_Gamepad* pad : g_pads) SDL_RumbleGamepad(pad, on ? 0xA000 : 0, on ? 0xA000 : 0, on ? 60000 : 0);
 }
 bool open_audio() {
+    // A small device buffer: the latency is the queue (held at the target)
+    // plus this. Backends with a fixed period (WASAPI's shared mode: 10 ms)
+    // keep their own.
+    SDL_SetHint(SDL_HINT_AUDIO_DEVICE_SAMPLE_FRAMES, "256");
     const SDL_AudioSpec spec{SDL_AUDIO_S16, 2, kSampleRate};
     g_audio = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, nullptr, nullptr);
     if (!g_audio) {
         std::fprintf(stderr, "qilin_run: no audio output (%s); running silent\n", SDL_GetError());
         return false;
     }
-    SDL_ResumeAudioStreamDevice(g_audio);
+    // The device starts paused: it plays once the queue has reached the
+    // target (play_audio).
+    SDL_AudioSpec out{};
+    int frames = 0;
+    if (SDL_GetAudioDeviceFormat(SDL_GetAudioStreamDevice(g_audio), &out, &frames) && out.freq > 0)
+        std::fprintf(stderr, "qilin_run: audio: %d Hz, a %d-sample device buffer (%.1f ms), %u ms queued ahead\n", out.freq,
+                     frames, 1000.0 * frames / out.freq, settings().audio_latency_ms);
     return true;
+}
+
+// With vsync, the game's clock follows the display when they nearly agree:
+// a 60 Hz display shows the game's 59.94 Hz frames with one shown twice
+// every 16.7 s (a hitch in anything that scrolls), a 120 Hz one likewise
+// every 8.3 s. Running the game at the display's rate (or a whole fraction
+// of it) within 0.5% removes that; its sound follows the same clock (the
+// audio clock resamples by the same speed). Set once at start: the window's
+// display then. Not for runs that must replay alike (hidden, the bot).
+double mode_hz(const SDL_DisplayMode& m) {
+    return m.refresh_rate_numerator > 0 && m.refresh_rate_denominator > 0
+               ? double(m.refresh_rate_numerator) / double(m.refresh_rate_denominator)
+               : double(m.refresh_rate);
+}
+double field_hz() { return console().eurgb60 ? 60000.0 / 1001.0 : 50.0; }
+// The game's speed that shows each frame for a whole number of refreshes
+// (k) at `hz`, within 0.5%; 0 if there is none.
+double lock_speed(double hz, int& k) {
+    if (!(hz > 0)) return 0;
+    for (k = 1; k <= 4; ++k)
+        if (const double speed = hz / k / field_hz(); std::abs(speed - 1.0) <= 0.005) return speed;
+    return 0;
+}
+
+// The display mode fullscreen switches to (settings: match_refresh), when
+// the desktop's refresh can't carry the game's frames evenly (75 Hz, 144 Hz:
+// at 75 Hz every fourth frame stays up for an extra refresh, a constant
+// judder). The same resolution at a refresh that can (60 or 120 Hz), the
+// highest such. F11 and Alt+Enter use it too; windowed play keeps the desktop.
+SDL_DisplayMode g_fullscreen_mode{};
+bool g_have_fullscreen_mode = false;
+
+void choose_fullscreen_mode() {
+    if (hidden() || !settings().vsync || !settings().match_refresh) return;
+    const SDL_DisplayID display = SDL_GetDisplayForWindow(g_window);
+    const SDL_DisplayMode* desktop = SDL_GetDesktopDisplayMode(display);
+    int k = 0;
+    if (!desktop || lock_speed(mode_hz(*desktop), k) != 0) return;  // the desktop's own refresh suits
+    int n = 0;
+    SDL_DisplayMode** modes = SDL_GetFullscreenDisplayModes(display, &n);
+    if (!modes) return;
+    const SDL_DisplayMode* best = nullptr;
+    for (int i = 0; i < n; ++i) {
+        const SDL_DisplayMode* m = modes[i];
+        if (m->w != desktop->w || m->h != desktop->h || m->pixel_density != desktop->pixel_density) continue;
+        if (lock_speed(mode_hz(*m), k) != 0 && (!best || mode_hz(*m) > mode_hz(*best))) best = m;
+    }
+    if (best) {
+        g_fullscreen_mode = *best, g_have_fullscreen_mode = true;
+        SDL_SetWindowFullscreenMode(g_window, &g_fullscreen_mode);
+        std::fprintf(stderr, "qilin_run: the desktop runs at %.3f Hz; fullscreen switches to %dx%d at %.3f Hz to show every frame evenly\n",
+                     mode_hz(*desktop), best->w, best->h, mode_hz(*best));
+    } else {
+        std::fprintf(stderr, "qilin_run: the desktop runs at %.3f Hz and the display has no %dx%d mode near a multiple of %.2f Hz\n",
+                     mode_hz(*desktop), desktop->w, desktop->h, field_hz());
+    }
+    SDL_free(modes);
+}
+
+void lock_to_display() {
+    if (hidden() || bot::active() || !settings().vsync || !settings().lock_to_display) return;
+    double hz = 0;
+    if (g_have_fullscreen_mode && (SDL_GetWindowFlags(g_window) & SDL_WINDOW_FULLSCREEN)) {
+        hz = mode_hz(g_fullscreen_mode);
+    } else if (const SDL_DisplayMode* m = SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(g_window))) {
+        hz = mode_hz(*m);
+    }
+    int k = 0;
+    if (const double speed = lock_speed(hz, k); speed != 0) {
+        set_time_base_speed(speed);
+        std::fprintf(stderr, "qilin_run: display %.3f Hz: the game runs at %.3f Hz (%+.2f%%), so every frame is shown %s\n", hz,
+                     hz / k, (speed - 1.0) * 100.0, k == 1 ? "once" : k == 2 ? "twice" : k == 3 ? "three times" : "four times");
+        return;
+    }
+    std::fprintf(stderr,
+                 "qilin_run: display %.3f Hz: no whole multiple of the game's %.2f Hz is near, so frames are shown unevenly "
+                 "(fullscreen%s, a 60 Hz desktop, or a variable-refresh display avoids it)\n",
+                 hz, field_hz(), g_have_fullscreen_mode ? " (switches the display to suit)" : "");
 }
 
 // QILIN_HIDDEN=1: the renderer runs as with a window, but the window isn't
@@ -213,11 +323,47 @@ uint16_t keyboard_buttons() {
 
 void play_audio(const int16_t* lr, uint32_t frames) {
     if (!g_audio) return;
-    if (SDL_GetAudioStreamQueued(g_audio) > kMaxQueuedBytes) {
-        ++stats().audio_frames_dropped;
+    Stats& st = stats();
+    const int target = int(settings().audio_latency_ms) * kBytesPerMs, bytes = int(frames * 4);
+    int queued = SDL_GetAudioStreamQueued(g_audio);
+    if (queued < 0) return;  // the device is gone
+    if (queued > target + kMaxExtraBytes) {
+        ++st.audio_frames_dropped;
         return;
     }
-    SDL_PutAudioStreamData(g_audio, lr, static_cast<int>(frames * 4));
+    if (g_clock.primed && queued == 0) {
+        // Ran dry (a stall, or the pause for the menu): silence up to the
+        // target at once, so the lag is the target again, not whatever the
+        // queue grows back to.
+        ++st.audio_underruns;
+        static const std::vector<uint8_t> silence(size_t(200 + 40) * kBytesPerMs, 0);
+        const int fill = std::max(target - bytes, 0);
+        SDL_PutAudioStreamData(g_audio, silence.data(), fill & ~3);
+        queued = fill & ~3;
+    }
+    SDL_PutAudioStreamData(g_audio, lr, bytes);
+    queued += bytes;
+    if (!g_clock.primed) {
+        if (queued < target) return;
+        g_clock.primed = true, g_clock.depth = queued, g_clock.frames = 0;
+        SDL_ResumeAudioStreamDevice(g_audio);
+        return;
+    }
+    st.audio_queue_sum += uint64_t(queued), ++st.audio_queue_count;
+    st.audio_queue_min = std::min<uint64_t>(st.audio_queue_min, uint64_t(queued));
+    st.audio_queue_max = std::max<uint64_t>(st.audio_queue_max, uint64_t(queued));
+    // The depth over about 200 ms (64 frames of 3 ms): the device takes the
+    // queue in its own bursts, so one reading says little.
+    g_clock.depth += (queued - g_clock.depth) / 64.0;
+    if (++g_clock.frames < 16) return;  // the ratio every 48 ms
+    g_clock.frames = 0;
+    // Proportional: 10 ms too deep plays 1/3% faster at a 30 ms target, which
+    // takes it back in about 3 s. The clocks' own difference (a few in ten
+    // thousand) leaves a steady error of about a millisecond.
+    const double error = (g_clock.depth - target) / target;
+    const double ratio = time_base_speed() * (1.0 + std::clamp(error * 0.01, -0.005, 0.005));
+    st.audio_ratio = ratio;
+    SDL_SetAudioStreamFrequencyRatio(g_audio, float(ratio));
 }
 
 void rumble(bool on) {
@@ -300,6 +446,8 @@ bool run(const std::function<void()>& game) {
                  "- = Backspace or Tab; Home = H; the d-pad = arrows; F11 or Alt+Enter: fullscreen\n",
                  settings_path().string().c_str(), settings().preset.c_str(), settings().internal_scale, settings().anisotropy);
 
+    choose_fullscreen_mode();
+    lock_to_display();  // before the game's threads: the clock's speed is set once
     std::thread(game).detach();
     Menu menu(g_window);
     // QILIN_MENU_TOGGLE=<seconds>,...: the menu opened or closed at those

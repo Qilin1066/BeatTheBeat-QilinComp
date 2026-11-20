@@ -1207,7 +1207,9 @@ void test_settings() {
     for (const BadFile& b : {BadFile{"[display]\ninternal_scale = 9\n", 2}, BadFile{"[display]\nanisotropy = 3\n", 2},
                          BadFile{"[display]\nvsync = yes\n", 2}, BadFile{"[nowhere]\n", 1}, BadFile{"[display]\npreset = fast\n", 2},
                          BadFile{"[display]\nnot_a_key = 1\n", 2}, BadFile{"[display]\nfullscreen\n", 2},
-                         BadFile{"[console]\nlanguage = -1\n", 2}, BadFile{"[display\n", 1}, BadFile{"[console]\nsound_mode = 3\n", 2}}) {
+                         BadFile{"[console]\nlanguage = -1\n", 2}, BadFile{"[display\n", 1}, BadFile{"[console]\nsound_mode = 3\n", 2},
+                         BadFile{"[audio]\nlatency_ms = 10\n", 2}, BadFile{"[audio]\nlatency_ms = 201\n", 2},
+                         BadFile{"[display]\nlatency_ms = 30\n", 2}, BadFile{"[display]\nlock_to_display = 1\n", 2}}) {
         CHECK(!parse(b.text, s, error, line) && line == b.line && !error.empty());
     }
     // what the menu saves reads back as the same settings (every key, set
@@ -1217,9 +1219,11 @@ void test_settings() {
     w.smooth = false, w.internal_scale = 5, w.anisotropy = 8, w.vsync = false, w.gpu = "Some GPU", w.rumble = false;
     w.language = 4, w.sixty_hz = false, w.widescreen = false, w.progressive = false, w.sound_mode = 2;
     w.sensor_bar_above = true, w.dpd_sensitivity = 5;
+    w.lock_to_display = false, w.match_refresh = false, w.audio_latency_ms = 85;
     const std::string text = rt::settings_text(w);
     CHECK(parse(text.c_str(), s, error, line));
     CHECK(rt::settings_text(s) == text);
+    CHECK(!s.lock_to_display && !s.match_refresh && s.audio_latency_ms == 85);
     CHECK(s.monitor == "Second Display" && s.scaling == rt::Scaling::integer && !s.smooth && s.internal_scale == 5 &&
           s.anisotropy == 8 && s.gpu == "Some GPU" && !s.rumble && s.language == 4 && s.dpd_sensitivity == 5);
     // the default file is the defaults

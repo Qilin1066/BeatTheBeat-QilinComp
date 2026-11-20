@@ -41,6 +41,7 @@
 #include <fstream>
 #include <iterator>
 #include <mutex>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -87,7 +88,7 @@ namespace {
     X(vkCmdBlitImage) X(vkCmdCopyBufferToImage) X(vkCmdClearAttachments) X(vkCmdClearColorImage) X(vkCmdPushConstants)    \
     X(vkCmdClearDepthStencilImage) X(vkDestroyBuffer) X(vkCmdCopyImage) X(vkDestroySampler) X(vkCreateQueryPool) X(vkCmdResetQueryPool)                    \
     X(vkCmdWriteTimestamp2) X(vkGetQueryPoolResults) X(vkCreatePipelineCache) X(vkGetPipelineCacheData)              \
-    X(vkCmdCopyImageToBuffer)
+    X(vkCmdCopyImageToBuffer) X(vkDestroyPipeline)
 
 PFN_vkGetInstanceProcAddr vkGetInstanceProcAddr = nullptr;
 #define QILIN_VK_DECLARE(f) PFN_##f f = nullptr;
@@ -415,7 +416,10 @@ bool make_swapchain() {
 
     VkSwapchainCreateInfoKHR si = vk_struct<VkSwapchainCreateInfoKHR>(VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR);
     si.surface = g.surface;
-    si.minImageCount = std::max(caps.minImageCount, 3u);
+    // Mailbox needs three images to never wait. FIFO queues every frame
+    // presented, so each image beyond two is a refresh of lag (16.7 ms at
+    // 60 Hz) between the game drawing a frame and it being seen: two.
+    si.minImageCount = std::max(caps.minImageCount, mode == VK_PRESENT_MODE_FIFO_KHR ? 2u : 3u);
     if (caps.maxImageCount) si.minImageCount = std::min(si.minImageCount, caps.maxImageCount);
     si.imageFormat = format.format, si.imageColorSpace = format.colorSpace, si.imageExtent = extent;
     // Drawn into too where it can be (the settings menu over the picture).
@@ -427,6 +431,14 @@ bool make_swapchain() {
     si.oldSwapchain = g.swapchain;
     VkSwapchainKHR sc;
     vk_check(vkCreateSwapchainKHR(g.device, &si, nullptr, &sc), "vkCreateSwapchainKHR");
+    static VkPresentModeKHR said = VK_PRESENT_MODE_MAX_ENUM_KHR;
+    if (mode != said) {  // once per change: which mode, since it decides the lag
+        said = mode;
+        std::fprintf(stderr, "qilin_run: presenting: %s\n",
+                     mode == VK_PRESENT_MODE_MAILBOX_KHR     ? "mailbox (vsync, no waiting)"
+                     : mode == VK_PRESENT_MODE_IMMEDIATE_KHR ? "immediate (no vsync)"
+                                                             : "FIFO (vsync, waits for the display: two images)");
+    }
     if (g.swapchain) {
         vk_check(vkDeviceWaitIdle(g.device), "vkDeviceWaitIdle");
         for (VkImageView v : g.swap_views) vkDestroyImageView(g.device, v, nullptr);
@@ -542,9 +554,9 @@ void save_pipeline_cache() {
     std::filesystem::rename(tmp, path, ec);
 }
 
-VkPipeline pipeline(const PipelineKey& pk) {
-    if (auto it = g.pipelines.find(pk); it != g.pipelines.end()) return it->second;
-    const Timed timed(Section::Pipeline);
+// Makes a pipeline. Thread-safe: it reads only what start-up made (the
+// shaders, the layout) and the pipeline cache, which Vulkan synchronises.
+VkPipeline build_pipeline(const PipelineKey& pk) {
     const uint32_t key = pk.blend, type = key & 3;
     VkSpecializationMapEntry entries[kSpecCount];
     for (uint32_t i = 0; i < kSpecCount; ++i) entries[i] = {i, 4 * i, 4};
@@ -605,7 +617,111 @@ VkPipeline pipeline(const PipelineKey& pk) {
     pi.pColorBlendState = &cb, pi.pDynamicState = &dy, pi.layout = g.layout;
     VkPipeline p;
     vk_check(vkCreateGraphicsPipelines(g.device, g.pipeline_cache, 1, &pi, nullptr, &p), "vkCreateGraphicsPipelines");
+    return p;
+}
+
+// The configurations met before (pipelines.keys beside pipelines.bin): the
+// pipeline cache makes a compile quick (45 ms to 0.1 ms) but only once it is
+// asked for, on first use, in the frame. At start a background thread makes
+// every pipeline the list names, so play doesn't stop for them at all. A
+// configuration never met before still compiles when first drawn (there is
+// no other shader to draw it with meanwhile).
+constexpr uint32_t kKeysMagic = 0x314B5051u;  // "QPK1"
+constexpr size_t kKeyWords = 1 + kSpecCount;   // the blend word, then the specialisation constants
+
+std::filesystem::path pipeline_keys_path() {
+    const std::filesystem::path dir = game_data_dir();
+    return dir.empty() ? dir : dir / "pipelines.keys";
+}
+
+// The list as read at start, plus what this run made: written with the cache.
+std::vector<PipelineKey> g_known_keys;
+// The background thread's pipelines, taken into g.pipelines when first used.
+std::mutex g_prebuilt_lock;
+std::unordered_map<PipelineKey, VkPipeline, PipelineKeyHash> g_prebuilt;
+
+void load_pipeline_keys() {
+    const std::filesystem::path path = pipeline_keys_path();
+    if (path.empty()) return;
+    std::ifstream f(path, std::ios::binary);
+    uint32_t head[2] = {};
+    if (!f.read(reinterpret_cast<char*>(head), sizeof head) || head[0] != kKeysMagic || head[1] != kKeyWords) return;
+    std::array<uint32_t, kKeyWords> w;
+    while (f.read(reinterpret_cast<char*>(w.data()), sizeof w)) {
+        PipelineKey k;
+        k.blend = w[0];
+        std::copy(w.begin() + 1, w.end(), k.spec.v.begin());
+        g_known_keys.push_back(k);
+    }
+}
+
+void save_pipeline_keys() {
+    const std::filesystem::path path = pipeline_keys_path();
+    if (path.empty()) return;
+    const std::filesystem::path tmp = path.string() + ".tmp";
+    {
+        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+        const uint32_t head[2] = {kKeysMagic, uint32_t(kKeyWords)};
+        f.write(reinterpret_cast<const char*>(head), sizeof head);
+        for (const PipelineKey& k : g_known_keys) {
+            std::array<uint32_t, kKeyWords> w;
+            w[0] = k.blend;
+            std::copy(k.spec.v.begin(), k.spec.v.end(), w.begin() + 1);
+            f.write(reinterpret_cast<const char*>(w.data()), sizeof w);
+        }
+        if (!f) return;
+    }
+    std::error_code ec;
+    std::filesystem::rename(tmp, path, ec);
+}
+
+void start_precompiling() {
+    load_pipeline_keys();
+    if (g_known_keys.empty()) return;
+    std::thread([keys = g_known_keys] {
+        const auto start = std::chrono::steady_clock::now();
+        size_t made = 0;
+        try {
+            for (const PipelineKey& k : keys) {
+                {
+                    std::lock_guard l(g_prebuilt_lock);
+                    if (g_prebuilt.contains(k)) continue;
+                }
+                const VkPipeline p = build_pipeline(k);
+                std::lock_guard l(g_prebuilt_lock);
+                if (g_prebuilt.emplace(k, p).second) ++made;
+                else vkDestroyPipeline(g.device, p, nullptr);  // the game made it meanwhile (never bound: safe)
+            }
+        } catch (const Stop&) {
+            // A configuration the driver refuses now (a new driver?): the game
+            // meets it on first use and stops there with the reason.
+            std::fprintf(stderr, "qilin_run: precompiling pipelines stopped after %zu of %zu\n", made, keys.size());
+            return;
+        }
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+        std::fprintf(stderr, "qilin_run: %zu pipelines made ahead in %.0f ms\n", made, ms);
+    }).detach();
+}
+
+VkPipeline pipeline(const PipelineKey& pk) {
+    if (auto it = g.pipelines.find(pk); it != g.pipelines.end()) return it->second;
+    {
+        std::lock_guard l(g_prebuilt_lock);
+        if (auto it = g_prebuilt.find(pk); it != g_prebuilt.end()) {
+            const VkPipeline p = it->second;
+            g.pipelines.emplace(pk, p);
+            return p;
+        }
+    }
+    const Timed timed(Section::Pipeline);
+    const VkPipeline p = build_pipeline(pk);
     g.pipelines.emplace(pk, p);
+    {
+        // Made here: the background thread (if still going) skips it.
+        std::lock_guard l(g_prebuilt_lock);
+        g_prebuilt.emplace(pk, p);
+    }
+    if (std::find(g_known_keys.begin(), g_known_keys.end(), pk) == g_known_keys.end()) g_known_keys.push_back(pk);
     g.pipeline_cache_dirty = true;
     return p;
 }
@@ -1731,7 +1847,10 @@ void Renderer::copy_display(const State& s, uint32_t, bool clear) {
         }
         g.frame = (g.frame + 1) % kFrames;
         ++g.frame_number;
-        if (g.frame_number % 300 == 0) save_pipeline_cache();  // every 5 s, when there are new pipelines
+        if (g.frame_number % 300 == 0 && g.pipeline_cache_dirty) {  // every 5 s, when there are new pipelines
+            save_pipeline_keys();
+            save_pipeline_cache();
+        }
     }
     park_if_requested();  // the settings menu: nothing is being recorded now
 }
@@ -1878,6 +1997,7 @@ bool create_resources() {
     g.vert = shader(k_gx_vert, sizeof k_gx_vert);
     g.frag = shader(k_gx_frag, sizeof k_gx_frag);
     create_pipeline_cache();
+    start_precompiling();
     create_copy_pipeline();
     if (profiling()) {  // GPU time per frame, where the queue can stamp time
         uint32_t qn = 0;

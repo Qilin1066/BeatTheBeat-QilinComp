@@ -220,6 +220,12 @@ void report_stats() {
                  "qilin_run:          host: %" PRIu64 " frames presented, %" PRIu64 " texture uploads, %" PRIu64
                  " audio frames dropped (output behind)\n",
                  s.frames_presented, s.textures_uploaded, s.audio_frames_dropped);
+    if (s.audio_queue_count)
+        std::fprintf(stderr,
+                     "qilin_run:          audio out: queued %.1f ms on average (%.1f-%.1f), %" PRIu64
+                     " underruns, resampling ratio %.5f; the game's clock at %.5fx\n",
+                     double(s.audio_queue_sum) / double(s.audio_queue_count) / 128.0, double(s.audio_queue_min) / 128.0,
+                     double(s.audio_queue_max) / 128.0, s.audio_underruns, s.audio_ratio, time_base_speed());
     report_profile();
     std::fprintf(stderr,
                  "qilin_run:          %" PRIu64 " periodic interrupts dropped (late by a period); deliveries: %" PRIu64

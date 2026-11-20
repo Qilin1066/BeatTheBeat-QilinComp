@@ -542,6 +542,13 @@ uint64_t time_base();
 // to the time the game doesn't see pass (the settings menu: pause.cpp).
 uint64_t time_base_unpaused();
 void skip_time_base(uint64_t ticks);
+// The game's clock may run a little faster or slower than the host's (the
+// display lock: host.cpp), by `speed`. Set once, before the game's threads
+// start; the clock carries on from where it was. host_ns_for_ticks converts
+// a span of the game's ticks to host nanoseconds at that speed.
+void set_time_base_speed(double speed);
+double time_base_speed();
+uint64_t host_ns_for_ticks(uint64_t ticks);
 void syscall(Context& c, uint32_t pc);
 // fifo_st8/16/32 (declared above psq_st): stores to the GX write-gather pipe
 // (0xCC008000). The lifter emits them for the stores hwaccess finds there

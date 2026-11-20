@@ -97,6 +97,12 @@ struct Stats {
     uint64_t periods_dropped = 0, idle_deliveries = 0, running_deliveries = 0;
     uint64_t remotes_connected = 0, remote_reports = 0, voice_frames = 0, audio_frames_dropped = 0;
     uint64_t textures_uploaded = 0, frames_presented = 0;
+    // The audio output's queue (host.cpp): how often it ran dry, and its
+    // depth when each frame was queued (sum and count for the mean, in bytes
+    // of 32 kHz stereo: 128 a millisecond).
+    uint64_t audio_underruns = 0, audio_queue_sum = 0, audio_queue_count = 0;
+    uint64_t audio_queue_min = ~uint64_t(0), audio_queue_max = 0;
+    double audio_ratio = 1.0;  // the output's last resampling ratio
 };
 Stats& stats();
 void report_stats();

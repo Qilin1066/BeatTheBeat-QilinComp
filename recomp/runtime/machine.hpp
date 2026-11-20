@@ -20,6 +20,10 @@ bool map_guest_memory();
 // Host timers fine enough for the audio clock's 3 ms (Windows: 1 ms
 // resolution; elsewhere the default already is).
 void fine_timers();
+// Called on each host thread that runs guest code as it starts: on Windows,
+// the multimedia scheduler's "Games" class, so background work doesn't
+// delay the retrace and the audio DMA.
+void game_thread_started();
 
 // Guest memory for the runtime's own objects that the game's code works on
 // (GX's FIFO object, VI's thread queue): a block OSInit keeps back from the
