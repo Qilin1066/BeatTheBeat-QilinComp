@@ -78,6 +78,10 @@ std::string settings_text(const Settings& s) {
     line("# Milliseconds of sound queued ahead of the speakers, held there by resampling a little.");
     line("# Lower is less lag between a press and its sound (5-200); a value below what the sound device can keep up is raised to it (said at start). Raise it if the sound crackles.");
     line("latency_ms = " + std::to_string(s.audio_latency_ms));
+    line("# Windows: take the sound device for the game alone (exclusive mode), for its shortest periods");
+    line("# (3 ms on a USB interface, where sharing gives 10): about 10 ms less lag. Other programs' sound");
+    line("# waits while the game runs. Windows' volume and mute still apply. false: share the device.");
+    line(std::string("exclusive = ") + b(s.exclusive_audio));
     line("");
     line("[controls]");
     line("# The Wii Remote's rumble on the controller.");
@@ -192,6 +196,8 @@ bool parse_settings(std::istream& in, Settings& s, std::string& error, unsigned&
             boolean(s.lock_to_display);
         } else if (section == "display" && key == "match_refresh") {
             boolean(s.match_refresh);
+        } else if (section == "audio" && key == "exclusive") {
+            boolean(s.exclusive_audio);
         } else if (section == "audio" && key == "latency_ms") {
             s.audio_latency_ms = number(5, 200);  // raised to what the device can keep up (host.cpp)
         } else if (section == "console" && key == "language") {

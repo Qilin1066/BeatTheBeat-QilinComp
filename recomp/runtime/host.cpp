@@ -19,6 +19,9 @@
 
 #include "bot.hpp"
 #include "console.hpp"
+#if defined(_WIN32)
+#include "wasapi.hpp"
+#endif
 #include "gx_vulkan.hpp"
 #include "input.hpp"
 #include "menu.hpp"
@@ -36,6 +39,9 @@ SDL_Window* g_window = nullptr;
 // be opened at start), used by the game's (play_audio).
 std::atomic<SDL_AudioStream*> g_audio{nullptr};
 std::atomic<int> g_floor_ms{0};  // the least latency the open device can be held at (open_audio)
+#if defined(_WIN32)
+std::atomic<bool> g_exclusive{false};  // g_audio feeds wasapi.cpp's exclusive output, not an SDL device
+#endif
 std::vector<SDL_Gamepad*> g_pads;  // every connected gamepad: any of them plays the Wii Remote
 std::atomic<uint16_t> g_keys{0}, g_pad_buttons{0};
 std::atomic<bool> g_rumble{false};
@@ -44,9 +50,12 @@ uint32_t g_wake_event = 0;  // an SDL user event: something for the main thread 
 constexpr uint32_t kSampleRate = 32000;
 constexpr int kBytesPerMs = kSampleRate * 4 / 1000;  // 16-bit stereo
 // Audio more than this beyond the target (a burst after a stall: the
-// periodic interrupts catching up) is dropped, counted, so the lag between
-// the game and its sound snaps back at once.
-constexpr int kMaxExtraBytes = 40 * kBytesPerMs;
+// periodic interrupts catching up, a display mode switch) is dropped,
+// counted, so the lag between the game and its sound snaps back at once: a
+// skip once is better than seconds of extra lag in a rhythm game (the
+// resampling takes about 6 s to drain 30 ms). The target or 10 ms, whichever
+// is more (40 ms before: a burst of 48 ms took the average from 7 to 11).
+int max_extra_bytes(int target) { return std::max(target, 10 * kBytesPerMs); }
 
 // The audio clock. The game's DMA makes 32 kHz by its own clock (the time
 // base); the sound card plays by its crystal. Left alone, the queue between
@@ -58,6 +67,7 @@ constexpr int kMaxExtraBytes = 40 * kBytesPerMs;
 // Running dry fills it back to the target with silence at once. Touched only
 // from the DMA interrupt (one guest thread at a time) and open_audio.
 struct AudioClock {
+    SDL_AudioStream* stream = nullptr;  // the output this is for (a new one starts again)
     bool primed = false;  // the device is playing (the queue reached the target once)
     double depth = 0;     // the queue's depth, smoothed (bytes)
     unsigned frames = 0;  // since the ratio was last set
@@ -190,7 +200,39 @@ void apply_rumble() {
 // device at all (a USB interface's driver stuck: WASAPI's "can't initialize
 // audio client", 0x8889000F, found 2026-11-20), every program is silent;
 // the main loop tries again every 2 s, so sound comes when the device does.
+// The least the queue can be held at for a device: the device takes a whole
+// period at each read, so just before one the queue must hold a period, and
+// the game's frames come 3 ms at a time with a little jitter; the queue's
+// average is about half a period above its low point. So a period plus 4 ms
+// (14 ms with a 10 ms period, 7 with a 3 ms one). A lower setting is raised
+// to it, and said.
+void set_audio_floor(double period_ms) {
+    const int floor_ms = int(std::ceil(period_ms)) + 4;
+    g_floor_ms.store(floor_ms, std::memory_order_relaxed);
+    if (int(settings().audio_latency_ms) < floor_ms)
+        std::fprintf(stderr, "qilin_run: audio: %u ms is below what this device can keep up (%d ms); holding at %d ms\n",
+                     settings().audio_latency_ms, floor_ms, floor_ms);
+}
+
 bool open_audio(bool retry = false) {
+#if defined(_WIN32)
+    // Exclusive mode first (settings: [audio] exclusive): the device's
+    // shortest period (3 ms on a USB interface, against 10 shared).
+    if (settings().exclusive_audio) {
+        wasapi::Opened o;
+        const char* why = "";
+        if (wasapi::open(o, why)) {
+            g_exclusive.store(true, std::memory_order_relaxed);
+            std::fprintf(stderr, "qilin_run: audio%s: exclusive, %d Hz, %d channels, %s, a %.2f ms period\n",
+                         retry ? " (the device is back)" : "", o.rate, o.channels, o.sample, o.period_ms);
+            set_audio_floor(o.period_ms);
+            g_audio.store(o.stream, std::memory_order_release);
+            return true;
+        }
+        if (!retry) std::fprintf(stderr, "qilin_run: audio: no exclusive mode (%s); sharing the device\n", why);
+    }
+    g_exclusive.store(false, std::memory_order_relaxed);
+#endif
     // A small device buffer: the latency is the queue (held at the target)
     // plus this. SDL asks WASAPI for its low-latency shared mode with it
     // (IAudioClient3), which a driver grants down to its own minimum (a
@@ -216,19 +258,7 @@ bool open_audio(bool retry = false) {
     if (SDL_GetAudioDeviceFormat(SDL_GetAudioStreamDevice(stream), &out, &frames) && out.freq > 0)
         std::fprintf(stderr, "qilin_run: audio%s: %d Hz, a %d-sample device buffer (%.1f ms), %u ms queued ahead\n",
                      retry ? " (the device is back)" : "", out.freq, frames, 1000.0 * frames / out.freq, settings().audio_latency_ms);
-    // The least the queue can be held at for this device: the device takes a
-    // whole period at each read, so just before one the queue must hold a
-    // period, and the game's frames come 3 ms at a time with a little
-    // jitter; the queue's average is about half a period above its low point.
-    // So a period plus 4 ms (11 ms with a 7 ms period). A lower setting is
-    // raised to it, and said.
-    if (out.freq > 0 && frames > 0) {
-        const int floor_ms = int(std::ceil(1000.0 * frames / out.freq)) + 4;
-        g_floor_ms.store(floor_ms, std::memory_order_relaxed);
-        if (int(settings().audio_latency_ms) < floor_ms)
-            std::fprintf(stderr, "qilin_run: audio: %u ms is below what this device can keep up (%d ms); holding at %d ms\n",
-                         settings().audio_latency_ms, floor_ms, floor_ms);
-    }
+    if (out.freq > 0 && frames > 0) set_audio_floor(1000.0 * frames / out.freq);
     g_audio.store(stream, std::memory_order_release);
     return true;
 }
@@ -250,7 +280,7 @@ double field_hz() { return console().eurgb60 ? 60000.0 / 1001.0 : 50.0; }
 // (k) at `hz`, within 0.5%; 0 if there is none.
 double lock_speed(double hz, int& k) {
     if (!(hz > 0)) return 0;
-    for (k = 1; k <= 4; ++k)
+    for (k = 1; k <= 8; ++k)  // up to 480 Hz: each frame shown k times
         if (const double speed = hz / k / field_hz(); std::abs(speed - 1.0) <= 0.005) return speed;
     return 0;
 }
@@ -301,8 +331,9 @@ void lock_to_display() {
     int k = 0;
     if (const double speed = lock_speed(hz, k); speed != 0) {
         set_time_base_speed(speed);
-        std::fprintf(stderr, "qilin_run: display %.3f Hz: the game runs at %.3f Hz (%+.2f%%), so every frame is shown %s\n", hz,
-                     hz / k, (speed - 1.0) * 100.0, k == 1 ? "once" : k == 2 ? "twice" : k == 3 ? "three times" : "four times");
+        std::fprintf(stderr, "qilin_run: display %.3f Hz: the game runs at %.3f Hz (%+.2f%%), so every frame is shown %d time%s\n",
+                     hz, hz / k, (speed - 1.0) * 100.0, k, k == 1 ? "" : "s");
+        gx::lock_frames_to_vblank(speed);
         return;
     }
     std::fprintf(stderr,
@@ -361,12 +392,13 @@ uint16_t keyboard_buttons() {
 void play_audio(const int16_t* lr, uint32_t frames) {
     SDL_AudioStream* const audio = g_audio.load(std::memory_order_acquire);
     if (!audio) return;
+    if (g_clock.stream != audio) g_clock = AudioClock{audio};  // a new output (opened again): fill it first
     Stats& st = stats();
     const int target_ms = std::max(int(settings().audio_latency_ms), g_floor_ms.load(std::memory_order_relaxed));
     const int target = target_ms * kBytesPerMs, bytes = int(frames * 4);
     int queued = SDL_GetAudioStreamQueued(audio);
     if (queued < 0) return;  // the device is gone
-    if (queued > target + kMaxExtraBytes) {
+    if (queued > target + max_extra_bytes(target)) {
         ++st.audio_frames_dropped;
         return;
     }
@@ -375,7 +407,7 @@ void play_audio(const int16_t* lr, uint32_t frames) {
         // target at once, so the lag is the target again, not whatever the
         // queue grows back to.
         ++st.audio_underruns;
-        static const std::vector<uint8_t> silence(size_t(200 + 40) * kBytesPerMs, 0);
+        static const std::vector<uint8_t> silence(size_t(200) * kBytesPerMs, 0);  // the most a target can be
         const int fill = std::max(target - bytes, 0);
         SDL_PutAudioStreamData(audio, silence.data(), fill & ~3);
         queued = fill & ~3;
@@ -385,6 +417,12 @@ void play_audio(const int16_t* lr, uint32_t frames) {
     if (!g_clock.primed) {
         if (queued < target) return;
         g_clock.primed = true, g_clock.depth = queued, g_clock.frames = 0;
+#if defined(_WIN32)
+        if (g_exclusive.load(std::memory_order_relaxed)) {
+            wasapi::start();
+            return;
+        }
+#endif
         SDL_ResumeAudioStreamDevice(audio);
         return;
     }
@@ -486,7 +524,8 @@ bool run(const std::function<void()>& game) {
                  settings_path().string().c_str(), settings().preset.c_str(), settings().internal_scale, settings().anisotropy);
 
     choose_fullscreen_mode();
-    lock_to_display();  // before the game's threads: the clock's speed is set once
+    lock_to_display();  // before the game's threads: the clock's speed is set here first
+    g_report_extra = gx::vblank_report;
     std::thread(game).detach();
     Menu menu(g_window);
     // QILIN_MENU_TOGGLE=<seconds>,...: the menu opened or closed at those
@@ -571,6 +610,16 @@ bool run(const std::function<void()>& game) {
             std::_Exit(1);
         }
         if (menu.quit_requested()) quit();
+#if defined(_WIN32)
+        // The exclusive device went away (unplugged, the default changed):
+        // let go of it (its stream is left, the game's thread may be in it)
+        // and open the output again below.
+        if (g_exclusive.load(std::memory_order_relaxed) && wasapi::lost()) {
+            std::fprintf(stderr, "qilin_run: audio: the device went away; opening the output again\n");
+            g_exclusive.store(false, std::memory_order_relaxed);
+            g_audio.store(nullptr, std::memory_order_release);
+        }
+#endif
         // No sound device yet (it couldn't be opened): try again every 2 s.
         if (!hidden() && !g_audio.load(std::memory_order_relaxed)) {
             static uint64_t next_try = 0;

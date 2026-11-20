@@ -226,6 +226,8 @@ void report_stats() {
                      " underruns, resampling ratio %.5f; the game's clock at %.5fx\n",
                      double(s.audio_queue_sum) / double(s.audio_queue_count) / 128.0, double(s.audio_queue_min) / 128.0,
                      double(s.audio_queue_max) / 128.0, s.audio_underruns, s.audio_ratio, time_base_speed());
+    if (g_report_extra)
+        if (const std::string extra = g_report_extra(); !extra.empty()) std::fprintf(stderr, "qilin_run:          %s\n", extra.c_str());
     report_profile();
     std::fprintf(stderr,
                  "qilin_run:          %" PRIu64 " periodic interrupts dropped (late by a period); deliveries: %" PRIu64

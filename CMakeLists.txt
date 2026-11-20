@@ -180,8 +180,10 @@ if(QILIN_RUNTIME_GEN_DIR)
     target_link_libraries(qilin_run PRIVATE qilin_gen_runtime qilin_dol qilin_warnings)
     if(WIN32)
         # winmm: timeBeginPeriod (1 ms timers for the audio clock); avrt: the
-        # multimedia scheduler's "Games" class for the game's threads.
-        target_link_libraries(qilin_run PRIVATE winmm avrt)
+        # multimedia scheduler's classes for the game's and audio's threads;
+        # dwmapi: the compositor's vblank times (the vblank lock); ole32: COM
+        # for WASAPI's exclusive mode.
+        target_link_libraries(qilin_run PRIVATE winmm avrt dwmapi ole32)
     endif()
     # Link-time optimisation: lifted functions call each other across the
     # generated files; LTO lets the compiler inline across them. Slower to
@@ -298,6 +300,9 @@ if(QILIN_RUNTIME_GEN_DIR)
 
         target_sources(qilin_run PRIVATE recomp/runtime/host.cpp recomp/runtime/gx_vulkan.cpp recomp/runtime/gx_texture.cpp
                                          recomp/runtime/menu.cpp recomp/runtime/pause.cpp)
+        if(WIN32)
+            target_sources(qilin_run PRIVATE recomp/runtime/wasapi.cpp)  # exclusive-mode audio
+        endif()
         target_include_directories(qilin_run PRIVATE "${QILIN_SHADER_DIR}")
         target_link_libraries(qilin_run PRIVATE SDL3::SDL3 Vulkan::Headers qilin_imgui)
     endif()

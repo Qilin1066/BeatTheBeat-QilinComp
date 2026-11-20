@@ -1,8 +1,11 @@
 // The time base (guest.hpp): mftb reads it, and the runtime's timers run on
 // it. Its own file, so the differential test, the runtime and the unit tests
 // can all link it. Runtime code: no std::format.
+#include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
+#include <mutex>
 
 #include "guest.hpp"
 
@@ -11,10 +14,6 @@ namespace qilin::rt {
 namespace {
 // Time the game was paused for (the settings menu): it doesn't see it pass.
 std::atomic<uint64_t> g_skipped{0};
-// The game's speed against the host clock (set_time_base_speed), from the
-// moment it was set: written once, before any thread but the main one runs.
-double g_speed = 1.0;
-uint64_t g_anchor_ns = 0, g_anchor_ticks = 0;
 
 uint64_t host_ns() {
     using namespace std::chrono;
@@ -23,27 +22,59 @@ uint64_t host_ns() {
 uint64_t ticks_of(uint64_t ns) {
     return ns / kNsPerSecond * kTimeBaseHz + ns % kNsPerSecond * kTimeBaseHz / kNsPerSecond;  // no overflow for centuries
 }
+
+// The game's speed against the host clock (set_time_base_speed), from the
+// moment it was set: the display lock sets it at start, and the vblank lock
+// steers it by a little while the game runs. Each setting is a new entry in
+// a ring and the index moves to it, so a reader on any thread sees one whole
+// entry; updates come a few times a second at most, so the ring never comes
+// round to an entry still being read.
+struct Rate {
+    uint64_t anchor_ns = 0, anchor_ticks = 0;  // the clock at the moment it was set
+    double speed = 1.0;
+};
+constexpr unsigned kRates = 256;
+std::array<Rate, kRates> g_rates{};  // [0]: anchored at 0, speed 1 (the host clock)
+std::atomic<unsigned> g_rate{0};
+std::mutex g_rate_lock;               // writers
+std::atomic<uint64_t> g_latest{0};   // the clock never goes back (a reader on the old rate)
+
+uint64_t ticks_at(const Rate& r, uint64_t ns) {
+    if (ns <= r.anchor_ns) return r.anchor_ticks;
+    const uint64_t since = ns - r.anchor_ns;
+    // At speed 1 in integers; otherwise the double holds only the time since
+    // the anchor (exact to well under a tick for days).
+    return r.anchor_ticks + ticks_of(r.speed == 1.0 ? since : static_cast<uint64_t>(double(since) * r.speed));
+}
 }  // namespace
 
 void set_time_base_speed(double speed) {
-    g_anchor_ns = host_ns();
-    g_anchor_ticks = ticks_of(g_anchor_ns);  // continuous: the clock doesn't jump here
-    g_speed = speed;
+    std::lock_guard l(g_rate_lock);
+    const unsigned i = g_rate.load(std::memory_order_relaxed);
+    if (g_rates[i % kRates].speed == speed) return;
+    const uint64_t ns = host_ns();
+    Rate next;
+    next.anchor_ns = ns;
+    next.anchor_ticks = std::max(ticks_at(g_rates[i % kRates], ns), g_latest.load(std::memory_order_relaxed));  // continuous
+    next.speed = speed;
+    g_rates[(i + 1) % kRates] = next;
+    g_rate.store(i + 1, std::memory_order_release);
 }
-double time_base_speed() { return g_speed; }
+double time_base_speed() { return g_rates[g_rate.load(std::memory_order_acquire) % kRates].speed; }
 
 uint64_t host_ns_for_ticks(uint64_t ticks) {
     const uint64_t ns = ticks / kTimeBaseHz * kNsPerSecond + ticks % kTimeBaseHz * kNsPerSecond / kTimeBaseHz;
-    return g_speed == 1.0 ? ns : static_cast<uint64_t>(double(ns) / g_speed);
+    const double speed = time_base_speed();
+    return speed == 1.0 ? ns : static_cast<uint64_t>(double(ns) / speed);
 }
 
 // The host clock in time-base ticks, pauses included.
 uint64_t time_base_unpaused() {
-    const uint64_t ns = host_ns();
-    if (g_speed == 1.0) return ticks_of(ns);
-    // From the anchor, so the double holds only the time since then (exact
-    // to well under a tick for days) and the result is monotonic.
-    return g_anchor_ticks + ticks_of(static_cast<uint64_t>(double(ns - g_anchor_ns) * g_speed));
+    const uint64_t v = ticks_at(g_rates[g_rate.load(std::memory_order_acquire) % kRates], host_ns());
+    uint64_t prev = g_latest.load(std::memory_order_relaxed);
+    while (v > prev && !g_latest.compare_exchange_weak(prev, v, std::memory_order_relaxed)) {
+    }
+    return v > prev ? v : prev;
 }
 void skip_time_base(uint64_t ticks) { g_skipped.fetch_add(ticks, std::memory_order_relaxed); }
 

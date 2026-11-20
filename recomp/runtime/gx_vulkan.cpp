@@ -32,6 +32,7 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -1800,6 +1801,77 @@ void finish_frame(Frame& f) {
     }
 }
 
+// ---- the vblank lock ----
+// With the display lock on (host.cpp: the game's clock at the display's
+// rate), the frames come at the display's rate but at no particular moment
+// of its refresh: a present lands anywhere between two vblanks and waits up
+// to a whole refresh to be shown, and as the two clocks drift (a few in a
+// hundred thousand) the moment slides until it crosses a vblank, when frames
+// are shown unevenly for a while. Here each present's slack (the time to the
+// next vblank, from the compositor's timing) is steered to a small target by
+// nudging the game's clock (within 0.2% of the lock's speed, a PI loop on
+// the slack's average): the frame is shown as soon after it is drawn as the
+// display allows, every frame alike. The target keeps a margin for the
+// frames' own spread (1 ms plus four standard deviations, at least 3 ms for
+// the GPU and the compositor's latch: at 2.5 ms about one frame in 500 just
+// missed its vblank, measured at 120 Hz on a GTX 1080 Ti). Windows only
+// (the compositor's vblank times); elsewhere the display lock alone.
+struct VblankLock {
+    bool on = false;
+    double base = 1.0;                // the display lock's speed
+    double mean = 0, var = 0;         // the slack's error from the target (ns), averaged
+    double integral = 0, delta = 0;   // the loop's state; the speed is base * (1 + delta)
+    uint64_t last = 0, frames = 0, skipped = 0;
+    double slack_sum = 0, target = 0;
+    uint64_t slack_count = 0, late = 0;
+} g_vbl;
+
+void steer_to_vblank() {
+    if (!g_vbl.on) return;
+    uint64_t vblank = 0, period = 0;
+    if (!display_vblank(vblank, period)) return;
+    const auto now = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+    const double dt = g_vbl.last ? double(now - g_vbl.last) : 0;
+    g_vbl.last = now;
+    // A frame that took far longer (loading, a pause) says nothing of the
+    // phase: start the averages again from the next.
+    if (dt <= 0 || dt > 4.0 * 1e9 / 59.0) {
+        ++g_vbl.skipped;
+        g_vbl.frames = 0;
+        return;
+    }
+    const double p = double(period);
+    double since = std::fmod(double(int64_t(now - vblank)), p);
+    if (since < 0) since += p;
+    const double slack = p - since;  // to the next vblank
+    // The target from the spread so far; the error wrapped into half a
+    // refresh either way, so a frame just past a vblank reads as late, not as
+    // a whole refresh early.
+    g_vbl.target = std::clamp(1e6 + 4.0 * std::sqrt(g_vbl.var), 3.0e6, p / 2);
+    double e = slack - g_vbl.target;
+    if (e > p / 2) e -= p;
+    if (e < -p / 2) e += p;
+    // Just missed a vblank, once locked (the average within half a
+    // millisecond of the target): counted for the report.
+    if (g_vbl.frames >= 16 && std::abs(g_vbl.mean) < 0.5e6 && slack > p - 0.5e6) ++g_vbl.late;
+    ++g_vbl.frames;
+    constexpr double a = 1.0 / 16;  // about a quarter of a second
+    if (g_vbl.frames == 1) g_vbl.mean = e, g_vbl.var = 0;
+    const double d = e - g_vbl.mean;
+    g_vbl.mean += a * d;
+    g_vbl.var = (1 - a) * (g_vbl.var + a * d * d);
+    if (g_vbl.frames < 16) return;  // the averages settle first
+    g_vbl.slack_sum += slack, ++g_vbl.slack_count;
+    // PI: presenting early (slack above the target) slows the game a little,
+    // so its frames come later. Gains for a well-damped loop that settles in
+    // about 10 s: Kp 1/s, Ki 0.25/s^2 (e in seconds).
+    const double es = g_vbl.mean / 1e9, dts = dt / 1e9;
+    g_vbl.integral = std::clamp(g_vbl.integral + 0.25 * es * dts, -0.001, 0.001);
+    g_vbl.delta = std::clamp(-(1.0 * es + g_vbl.integral), -0.002, 0.002);
+    if (g_vbl.frames % 4 == 0) set_time_base_speed(g_vbl.base * (1.0 + g_vbl.delta));
+}
+
 // GXCopyDisp: the frame. The EFB's source rectangle becomes the picture
 // shown (kept in last_frame), the EFB is cleared there if asked, and the
 // frame goes to the window. Then the game parks here if the menu asked.
@@ -1837,6 +1909,7 @@ void Renderer::copy_display(const State& s, uint32_t, bool clear) {
         }
         if (clear) clear_efb(s, s.disp_src);
         finish_frame(f);
+        steer_to_vblank();
         if (bot::active()) {
             // The game's clock stops from here until the bot has answered:
             // the wait for the picture and the bot's thinking aren't the game's.
@@ -2029,6 +2102,26 @@ bool create_resources() {
 }  // namespace
 
 void window_resized() { g.resized = true; }
+
+void lock_frames_to_vblank(double speed) {
+    uint64_t vblank = 0, period = 0;
+    if (!display_vblank(vblank, period)) {
+        std::fprintf(stderr, "qilin_run: no vblank times on this platform: frames follow the display's rate, not its vblanks\n");
+        return;
+    }
+    g_vbl.on = true, g_vbl.base = speed;
+}
+
+std::string vblank_report() {
+    if (!g_vbl.on || !g_vbl.slack_count) return {};
+    char line[256];
+    std::snprintf(line, sizeof line,
+                  "vblank lock: each frame presented %.2f ms before its vblank on average (target %.2f ms, spread %.2f ms), "
+                  "%llu just missed one, the clock steered by %+.4f%%",
+                  g_vbl.slack_sum / double(g_vbl.slack_count) / 1e6, g_vbl.target / 1e6, std::sqrt(g_vbl.var) / 1e6,
+                  static_cast<unsigned long long>(g_vbl.late), g_vbl.delta * 100.0);
+    return line;
+}
 
 // ---- for the settings menu (on the main thread, while the game is parked) ----
 bool overlay_target(OverlayTarget& t) {

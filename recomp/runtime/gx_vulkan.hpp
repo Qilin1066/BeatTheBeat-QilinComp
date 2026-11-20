@@ -17,6 +17,13 @@ namespace qilin::rt::gx {
 bool init_vulkan(SDL_Window* window);
 // The window's drawable size changed: the swapchain is remade at the next frame.
 void window_resized();
+// The display lock is on at `speed` (host.cpp, before the game's threads
+// start): from here each frame's present is steered to land just before a
+// vblank (Windows: the compositor's vblank times), by nudging the game's
+// clock within 0.2% of that speed.
+void lock_frames_to_vblank(double speed);
+// The vblank lock's numbers for the run report (empty if it isn't on).
+std::string vblank_report();
 
 // ---- for the settings menu (menu.cpp) ----
 // What ImGui's Vulkan backend needs to draw into the window's images

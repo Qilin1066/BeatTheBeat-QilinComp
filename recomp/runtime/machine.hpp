@@ -24,6 +24,10 @@ void fine_timers();
 // the multimedia scheduler's "Games" class, so background work doesn't
 // delay the retrace and the audio DMA.
 void game_thread_started();
+// The display's last vblank (on the steady clock, in nanoseconds) and its
+// refresh period, where the platform tells them (Windows: the compositor's
+// timing); false elsewhere.
+bool display_vblank(uint64_t& vblank_ns, uint64_t& period_ns);
 
 // Guest memory for the runtime's own objects that the game's code works on
 // (GX's FIFO object, VI's thread queue): a block OSInit keeps back from the

@@ -35,6 +35,7 @@ struct Settings {
     std::string gpu;                  // the graphics device's name (empty: the best one)
     // [audio]
     uint32_t audio_latency_ms = 10;   // the sound queued ahead of the speakers, held there (5-200; at least what the device can keep up)
+    bool exclusive_audio = true;      // Windows: the device for the game alone (WASAPI exclusive: the shortest periods)
     // [controls]
     bool rumble = true;  // the Wii Remote's rumble on the controller
     // [console]: what the game reads as the Wii's own settings

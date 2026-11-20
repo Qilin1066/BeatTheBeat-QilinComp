@@ -382,6 +382,9 @@ void Menu::display_page() {
     if (ImGui::SliderInt("Sound latency", &latency, 5, 200, "%d ms", ImGuiSliderFlags_AlwaysClamp))
         s.audio_latency_ms = uint32_t(latency);
     ImGui::TextDisabled("Lower: less lag between a press and its sound (held no lower than the device can keep up). Raise it if the sound crackles.");
+#if defined(_WIN32)
+    ImGui::Checkbox("Exclusive sound: the device for the game alone, less lag (from the next start)", &s.exclusive_audio);
+#endif
 
     ImGui::SeparatorText("Enhancements");
     static constexpr const char* kPresets[] = {"original", "low-end", "desktop"};

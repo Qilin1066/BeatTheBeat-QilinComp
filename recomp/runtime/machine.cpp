@@ -7,7 +7,10 @@
 #if defined(_WIN32)
 #include <windows.h>
 #include <avrt.h>
+#include <dwmapi.h>
 #include <timeapi.h>
+
+#include <chrono>
 #else
 #include <sys/mman.h>
 #endif
@@ -28,6 +31,31 @@ void fine_timers() {
     p.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION;
     p.StateMask = 0;  // neither
     SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &p, sizeof p);  // older Windows: refused, harmless
+#endif
+}
+
+bool display_vblank(uint64_t& vblank_ns, uint64_t& period_ns) {
+#if defined(_WIN32)
+    // The compositor's timing: the last vblank and the refresh period, on
+    // the performance counter. Read with the counter's present value and the
+    // steady clock's, so the vblank lands on the steady clock however the
+    // C++ library scales the counter.
+    DWM_TIMING_INFO ti{};
+    ti.cbSize = sizeof ti;
+    if (FAILED(DwmGetCompositionTimingInfo(nullptr, &ti)) || ti.qpcRefreshPeriod == 0) return false;
+    LARGE_INTEGER freq, now;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&now);
+    const auto steady = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+    const double ns_per_tick = 1e9 / double(freq.QuadPart);
+    const double ago = double(int64_t(now.QuadPart) - int64_t(ti.qpcVBlank)) * ns_per_tick;  // negative: a vblank ahead
+    vblank_ns = uint64_t(int64_t(steady) - int64_t(ago));
+    period_ns = uint64_t(double(ti.qpcRefreshPeriod) * ns_per_tick);
+    return period_ns > 0;
+#else
+    (void)vblank_ns, (void)period_ns;
+    return false;
 #endif
 }
 

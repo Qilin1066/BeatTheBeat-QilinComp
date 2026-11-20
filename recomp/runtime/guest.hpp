@@ -542,10 +542,12 @@ uint64_t time_base();
 // to the time the game doesn't see pass (the settings menu: pause.cpp).
 uint64_t time_base_unpaused();
 void skip_time_base(uint64_t ticks);
-// The game's clock may run a little faster or slower than the host's (the
-// display lock: host.cpp), by `speed`. Set once, before the game's threads
-// start; the clock carries on from where it was. host_ns_for_ticks converts
-// a span of the game's ticks to host nanoseconds at that speed.
+// The game's clock may run a little faster or slower than the host's, by
+// `speed`: the display lock sets it at start (host.cpp), the vblank lock
+// steers it by a little while the game runs (gx_vulkan.cpp). Any thread may
+// set or read it; the clock carries on from where it was and never goes
+// back. host_ns_for_ticks converts a span of the game's ticks to host
+// nanoseconds at the current speed.
 void set_time_base_speed(double speed);
 double time_base_speed();
 uint64_t host_ns_for_ticks(uint64_t ticks);

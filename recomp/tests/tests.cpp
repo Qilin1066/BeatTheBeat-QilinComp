@@ -1219,11 +1219,11 @@ void test_settings() {
     w.smooth = false, w.internal_scale = 5, w.anisotropy = 8, w.vsync = false, w.gpu = "Some GPU", w.rumble = false;
     w.language = 4, w.sixty_hz = false, w.widescreen = false, w.progressive = false, w.sound_mode = 2;
     w.sensor_bar_above = true, w.dpd_sensitivity = 5;
-    w.lock_to_display = false, w.match_refresh = false, w.audio_latency_ms = 85;
+    w.lock_to_display = false, w.match_refresh = false, w.audio_latency_ms = 85, w.exclusive_audio = false;
     const std::string text = rt::settings_text(w);
     CHECK(parse(text.c_str(), s, error, line));
     CHECK(rt::settings_text(s) == text);
-    CHECK(!s.lock_to_display && !s.match_refresh && s.audio_latency_ms == 85);
+    CHECK(!s.lock_to_display && !s.match_refresh && s.audio_latency_ms == 85 && !s.exclusive_audio);
     CHECK(s.monitor == "Second Display" && s.scaling == rt::Scaling::integer && !s.smooth && s.internal_scale == 5 &&
           s.anisotropy == 8 && s.gpu == "Some GPU" && !s.rumble && s.language == 4 && s.dpd_sensitivity == 5);
     // the default file is the defaults

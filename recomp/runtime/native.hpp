@@ -106,6 +106,9 @@ struct Stats {
 };
 Stats& stats();
 void report_stats();
+// More for the report from parts not in every build (the host: the vblank
+// lock); null if none.
+inline std::string (*g_report_extra)() = nullptr;
 
 // Joins registrations to g_natives. False, with the reason on stderr, if a
 // registered name isn't a replaced function of this game, is ambiguous, is
