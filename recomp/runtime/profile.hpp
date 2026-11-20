@@ -56,5 +56,8 @@ inline void note_gpu_frame(uint64_t ns) {
 
 // The profile so far, on stderr (with the stop or time-limit report).
 void report_profile();
+// QILIN_SAMPLE=1 (Windows): starts the sampling profiler (profile.cpp); its
+// report comes with report_profile's.
+void start_sampling();
 
 }  // namespace qilin::rt

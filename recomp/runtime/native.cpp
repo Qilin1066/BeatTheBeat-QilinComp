@@ -93,8 +93,14 @@ void native(Context& c, uint32_t index) {
     // changed (r1 among them), so an interrupt can be taken here, before the
     // call, as the console takes one between two instructions. It keeps
     // the audio clock (an interrupt every 3 ms) from missing frames while a
-    // thread is busy.
-    deliver_due(c);
+    // thread is busy. The clock is read only every 16th call unless an
+    // interrupt is already queued: native calls come thousands of times a
+    // millisecond, and reading the clock at each was 7% of the game's CPU
+    // (sampled, 2026-11-20); a timer is then taken a few microseconds late
+    // at most. Enabling interrupts and the idle loop still check exactly.
+    // One guest thread runs at a time, so the counter needs no atomics.
+    static uint32_t tick = 0;
+    if (g_irq_pending.load(std::memory_order_relaxed) || (++tick & 15u) == 0) deliver_due(c);
     if (g_native_guard) g_native_guard(c, g_natives[index]);
     fn(c);
     c.ret = c.lr;  // as the function's blr

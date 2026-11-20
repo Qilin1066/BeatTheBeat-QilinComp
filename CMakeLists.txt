@@ -182,8 +182,21 @@ if(QILIN_RUNTIME_GEN_DIR)
         # winmm: timeBeginPeriod (1 ms timers for the audio clock); avrt: the
         # multimedia scheduler's classes for the game's and audio's threads;
         # dwmapi: the compositor's vblank times (the vblank lock); ole32: COM
-        # for WASAPI's exclusive mode.
-        target_link_libraries(qilin_run PRIVATE winmm avrt dwmapi ole32)
+        # for WASAPI's exclusive mode; dbghelp: the sampling profiler's names.
+        target_link_libraries(qilin_run PRIVATE winmm avrt dwmapi ole32 dbghelp)
+    endif()
+    # Debug symbols in an optimised build, for the sampling profiler
+    # (QILIN_SAMPLE=1) and debuggers: the same code, with names.
+    option(QILIN_DEBUG_SYMBOLS "Debug symbols in the game's optimised build (profiling)" OFF)
+    if(QILIN_DEBUG_SYMBOLS)
+        if(MSVC)
+            target_compile_options(qilin_gen_runtime PRIVATE /Zi)
+            target_compile_options(qilin_run PRIVATE /Zi)
+            target_link_options(qilin_run PRIVATE /DEBUG /OPT:REF /OPT:ICF)
+        else()
+            target_compile_options(qilin_gen_runtime PRIVATE -g)
+            target_compile_options(qilin_run PRIVATE -g)
+        endif()
     endif()
     # Link-time optimisation: lifted functions call each other across the
     # generated files; LTO lets the compiler inline across them. Slower to
@@ -314,5 +327,8 @@ add_executable(qilin_tests recomp/tests/tests.cpp recomp/runtime/native.cpp reco
     recomp/runtime/gx_texture.cpp recomp/runtime/input.cpp recomp/runtime/profile.cpp recomp/runtime/settings.cpp recomp/runtime/bot.cpp)
 target_link_libraries(qilin_tests PRIVATE qilin_core qilin_runtime qilin_warnings)
 target_compile_definitions(qilin_tests PRIVATE QILIN_HEADLESS_ONLY)  # input.cpp without the host side
+if(WIN32)
+    target_link_libraries(qilin_tests PRIVATE dbghelp)  # profile.cpp's sampler names
+endif()
 qilin_tool(qilin_tests)
 add_test(NAME qilin_tests COMMAND qilin_tests)

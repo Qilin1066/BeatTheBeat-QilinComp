@@ -24,6 +24,7 @@
 #include "machine.hpp"
 #include "nand.hpp"
 #include "native.hpp"
+#include "profile.hpp"
 #include "threads.hpp"
 
 using namespace qilin;
@@ -119,6 +120,7 @@ int main(int argc, char** argv) {
     }
     rt::init_nand(build->disc_id);
     rt::fine_timers();
+    rt::start_sampling();
     if (!rt::map_guest_memory()) {
         std::fprintf(stderr, "qilin_run: cannot map the guest's memory (4 GB of address space, 88 MB of RAM)\n");
         return 2;

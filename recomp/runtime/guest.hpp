@@ -240,6 +240,13 @@ inline uint32_t g_ni_flushes = 0;  // the differential test: Unicorn ignores NI,
 inline constexpr double kMinNormalD = (std::numeric_limits<double>::min)();
 inline constexpr double kMinNormalS = (std::numeric_limits<float>::min)();
 
+// NaN, infinity and sign tests on the bits: exact, and inline everywhere
+// (MSVC's std::isnan and std::isinf call into the C runtime, _dclass, which
+// was 3% of the game's CPU in a sample, 2026-11-20).
+inline bool is_nan(double x) { return (bits(x) & 0x7FFFFFFFFFFFFFFFull) > 0x7FF0000000000000ull; }
+inline bool is_inf(double x) { return (bits(x) & 0x7FFFFFFFFFFFFFFFull) == 0x7FF0000000000000ull; }
+inline bool sign_bit(double x) { return (bits(x) >> 63) != 0; }
+
 // Non-IEEE mode: a denormal (in the given format) becomes zero of its sign.
 inline double ni_d(double x) {
     if (std::fabs(x) < kMinNormalD && x != 0.0) [[unlikely]] {
@@ -264,9 +271,9 @@ inline bool single_significand(double x) { return (bits(x) & 0x1FFFFFFFu) == 0; 
 // operation) the default QNaN, positive.
 inline double quiet(double x) { return dbl(bits(x) | 0x0008000000000000ull); }
 inline double nan_of(double a, double b, double c) {
-    if (std::isnan(a)) return quiet(a);
-    if (std::isnan(b)) return quiet(b);
-    if (std::isnan(c)) return quiet(c);
+    if (is_nan(a)) return quiet(a);
+    if (is_nan(b)) return quiet(b);
+    if (is_nan(c)) return quiet(c);
     return dbl(0x7FF8000000000000ull);
 }
 // A NaN rounded to single precision keeps the top 23 fraction bits.
@@ -278,25 +285,25 @@ inline double to_single(double r) { return ni_s(static_cast<double>(static_cast<
 // Double-precision arithmetic. Operand order is frA, frB, frC for NaNs.
 inline double fadd(double a, double b) {
     const double r = ni_d(a) + ni_d(b);
-    return std::isnan(r) ? nan_of(a, b, 0.0) : ni_d(r);
+    return is_nan(r) ? nan_of(a, b, 0.0) : ni_d(r);
 }
 inline double fsub(double a, double b) {
     const double r = ni_d(a) - ni_d(b);
-    return std::isnan(r) ? nan_of(a, b, 0.0) : ni_d(r);
+    return is_nan(r) ? nan_of(a, b, 0.0) : ni_d(r);
 }
 inline double fmul(double a, double c) {
     const double r = ni_d(a) * ni_d(c);
-    return std::isnan(r) ? nan_of(a, c, 0.0) : ni_d(r);
+    return is_nan(r) ? nan_of(a, c, 0.0) : ni_d(r);
 }
 inline double fdiv(double a, double b) {
     const double r = ni_d(a) / ni_d(b);
-    return std::isnan(r) ? nan_of(a, b, 0.0) : ni_d(r);
+    return is_nan(r) ? nan_of(a, b, 0.0) : ni_d(r);
 }
 // Fused multiply-add (one rounding): a*c + b, a*c - b, and their negations.
 // The negated forms leave a NaN's sign alone.
 inline double fma_(double a, double c, double b, bool sub, bool neg) {
     const double r = std::fma(ni_d(a), ni_d(c), sub ? -ni_d(b) : ni_d(b));
-    if (std::isnan(r)) return nan_of(a, b, c);
+    if (is_nan(r)) return nan_of(a, b, c);
     return ni_d(neg ? -r : r);
 }
 
@@ -304,28 +311,28 @@ inline double fma_(double a, double c, double b, bool sub, bool neg) {
 // rounded to single.
 inline double fadds(double a, double b) {
     const double r = ni_s(a) + ni_s(b);
-    return std::isnan(r) ? single_nan(nan_of(a, b, 0.0)) : to_single(r);
+    return is_nan(r) ? single_nan(nan_of(a, b, 0.0)) : to_single(r);
 }
 inline double fsubs(double a, double b) {
     const double r = ni_s(a) - ni_s(b);
-    return std::isnan(r) ? single_nan(nan_of(a, b, 0.0)) : to_single(r);
+    return is_nan(r) ? single_nan(nan_of(a, b, 0.0)) : to_single(r);
 }
 inline double fmuls(double a, double c) {
     const double r = ni_s(a) * ni_s(c);
-    return std::isnan(r) ? single_nan(nan_of(a, c, 0.0)) : to_single(r);
+    return is_nan(r) ? single_nan(nan_of(a, c, 0.0)) : to_single(r);
 }
 inline double fdivs(double a, double b) {
     const double r = ni_s(a) / ni_s(b);
-    return std::isnan(r) ? single_nan(nan_of(a, b, 0.0)) : to_single(r);
+    return is_nan(r) ? single_nan(nan_of(a, b, 0.0)) : to_single(r);
 }
 inline double fmas(double a, double c, double b, bool sub, bool neg) {
     const double r = std::fma(ni_s(a), ni_s(c), sub ? -ni_s(b) : ni_s(b));
-    if (std::isnan(r)) return single_nan(nan_of(a, b, c));
+    if (is_nan(r)) return single_nan(nan_of(a, b, c));
     return to_single(neg ? -r : r);
 }
 inline double frsp(double b) {
     const double x = ni_d(b);
-    return std::isnan(x) ? single_nan(quiet(x)) : to_single(x);
+    return is_nan(x) ? single_nan(quiet(x)) : to_single(x);
 }
 
 // Moves: bit operations, NaNs included.
@@ -336,7 +343,7 @@ inline double fabs_(double x) { return dbl(bits(x) & ~0x8000000000000000ull); }
 // high word is undefined in the architecture; the 750 family's is 0xFFF80000.
 inline double fctiwz(double b) {
     uint32_t v;
-    if (std::isnan(b)) v = 0x80000000u;
+    if (is_nan(b)) v = 0x80000000u;
     else if (b >= 2147483648.0) v = 0x7FFFFFFFu;
     else if (b <= -2147483649.0) v = 0x80000000u;
     else v = static_cast<uint32_t>(static_cast<int32_t>(b));
@@ -361,11 +368,11 @@ inline double estimate_12(double r) {  // round to nearest at 12 fraction bits
     return dbl((bits(r) + (1ull << (kDrop - 1))) & ~((1ull << kDrop) - 1));
 }
 inline double frsqrte(double b, [[maybe_unused]] uint32_t pc) {
-    if (std::isnan(b)) return quiet(b);
+    if (is_nan(b)) return quiet(b);
     const double x = ni_d(b);
     if (x == 0.0) return std::copysign(HUGE_VAL, x);
     if (x < 0.0) return dbl(0x7FF8000000000000ull);
-    if (std::isinf(x)) return 0.0;
+    if (is_inf(x)) return 0.0;
 #ifdef QILIN_APPROX_ESTIMATES
     return estimate_12(1.0 / std::sqrt(x));
 #else
@@ -373,10 +380,10 @@ inline double frsqrte(double b, [[maybe_unused]] uint32_t pc) {
 #endif
 }
 inline double fres(double b, [[maybe_unused]] uint32_t pc) {  // single precision
-    if (std::isnan(b)) return single_nan(quiet(b));
+    if (is_nan(b)) return single_nan(quiet(b));
     const double x = ni_s(b);
     if (x == 0.0) return std::copysign(HUGE_VAL, x);
-    if (std::isinf(x)) return std::copysign(0.0, x);
+    if (is_inf(x)) return std::copysign(0.0, x);
 #ifdef QILIN_APPROX_ESTIMATES
     return ni_s(to_single(estimate_12(1.0 / x)));
 #else
@@ -386,7 +393,7 @@ inline double fres(double b, [[maybe_unused]] uint32_t pc) {  // single precisio
 
 // fcmpu/fcmpo: the CR field (FL, FG, FE, FU). FPSCR's FPCC and VX bits aren't kept.
 inline uint32_t fcmp(double a, double b) {
-    if (std::isnan(a) || std::isnan(b)) return 1;
+    if (is_nan(a) || is_nan(b)) return 1;
     return a < b ? kLt : a > b ? kGt : kEq;
 }
 
@@ -461,7 +468,7 @@ inline void quantize(uint32_t ea, double v, unsigned type, int scale) {
     const double lo = type == 6 ? -128.0 : type == 7 ? -32768.0 : 0.0;
     const double hi = type == 4 ? 255.0 : type == 5 ? 65535.0 : type == 6 ? 127.0 : 32767.0;
     double x;
-    if (std::isnan(v)) x = std::signbit(v) ? lo : hi;
+    if (is_nan(v)) x = sign_bit(v) ? lo : hi;
     else {
         x = std::trunc(std::ldexp(v, scale));
         x = x < lo ? lo : x > hi ? hi : x;
