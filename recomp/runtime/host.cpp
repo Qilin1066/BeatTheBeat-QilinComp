@@ -32,7 +32,9 @@ namespace {
 constexpr const char* kGameName = "Beat the Beat: Rhythm Paradise";
 
 SDL_Window* g_window = nullptr;
-SDL_AudioStream* g_audio = nullptr;
+// Opened by the main thread (open_audio, again later if the device couldn't
+// be opened at start), used by the game's (play_audio).
+std::atomic<SDL_AudioStream*> g_audio{nullptr};
 std::vector<SDL_Gamepad*> g_pads;  // every connected gamepad: any of them plays the Wii Remote
 std::atomic<uint16_t> g_keys{0}, g_pad_buttons{0};
 std::atomic<bool> g_rumble{false};
@@ -175,24 +177,37 @@ void apply_rumble() {
     const bool on = g_rumble && settings().rumble;
     for (SDL_Gamepad* pad : g_pads) SDL_RumbleGamepad(pad, on ? 0xA000 : 0, on ? 0xA000 : 0, on ? 60000 : 0);
 }
-bool open_audio() {
+// Opens the default output. `retry`: a later attempt after the device
+// couldn't be opened (said only when it works). When Windows can't open the
+// device at all (a USB interface's driver stuck: WASAPI's "can't initialize
+// audio client", 0x8889000F, found 2026-11-20), every program is silent;
+// the main loop tries again every 2 s, so sound comes when the device does.
+bool open_audio(bool retry = false) {
     // A small device buffer: the latency is the queue (held at the target)
     // plus this. Backends with a fixed period (WASAPI's shared mode: 10 ms)
     // keep their own.
     SDL_SetHint(SDL_HINT_AUDIO_DEVICE_SAMPLE_FRAMES, "256");
     const SDL_AudioSpec spec{SDL_AUDIO_S16, 2, kSampleRate};
-    g_audio = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, nullptr, nullptr);
-    if (!g_audio) {
-        std::fprintf(stderr, "qilin_run: no audio output (%s); running silent\n", SDL_GetError());
+    SDL_AudioStream* stream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, nullptr, nullptr);
+    if (!stream) {
+        // A driver may refuse a buffer that small: its own, then.
+        SDL_ResetHint(SDL_HINT_AUDIO_DEVICE_SAMPLE_FRAMES);
+        stream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, nullptr, nullptr);
+    }
+    if (!stream) {
+        if (!retry)
+            std::fprintf(stderr, "qilin_run: no audio output (%s): Windows or the driver can't open the default device; "
+                                 "trying again every 2 s\n", SDL_GetError());
         return false;
     }
     // The device starts paused: it plays once the queue has reached the
     // target (play_audio).
     SDL_AudioSpec out{};
     int frames = 0;
-    if (SDL_GetAudioDeviceFormat(SDL_GetAudioStreamDevice(g_audio), &out, &frames) && out.freq > 0)
-        std::fprintf(stderr, "qilin_run: audio: %d Hz, a %d-sample device buffer (%.1f ms), %u ms queued ahead\n", out.freq,
-                     frames, 1000.0 * frames / out.freq, settings().audio_latency_ms);
+    if (SDL_GetAudioDeviceFormat(SDL_GetAudioStreamDevice(stream), &out, &frames) && out.freq > 0)
+        std::fprintf(stderr, "qilin_run: audio%s: %d Hz, a %d-sample device buffer (%.1f ms), %u ms queued ahead\n",
+                     retry ? " (the device is back)" : "", out.freq, frames, 1000.0 * frames / out.freq, settings().audio_latency_ms);
+    g_audio.store(stream, std::memory_order_release);
     return true;
 }
 
@@ -322,10 +337,11 @@ uint16_t keyboard_buttons() {
 }
 
 void play_audio(const int16_t* lr, uint32_t frames) {
-    if (!g_audio) return;
+    SDL_AudioStream* const audio = g_audio.load(std::memory_order_acquire);
+    if (!audio) return;
     Stats& st = stats();
     const int target = int(settings().audio_latency_ms) * kBytesPerMs, bytes = int(frames * 4);
-    int queued = SDL_GetAudioStreamQueued(g_audio);
+    int queued = SDL_GetAudioStreamQueued(audio);
     if (queued < 0) return;  // the device is gone
     if (queued > target + kMaxExtraBytes) {
         ++st.audio_frames_dropped;
@@ -338,15 +354,15 @@ void play_audio(const int16_t* lr, uint32_t frames) {
         ++st.audio_underruns;
         static const std::vector<uint8_t> silence(size_t(200 + 40) * kBytesPerMs, 0);
         const int fill = std::max(target - bytes, 0);
-        SDL_PutAudioStreamData(g_audio, silence.data(), fill & ~3);
+        SDL_PutAudioStreamData(audio, silence.data(), fill & ~3);
         queued = fill & ~3;
     }
-    SDL_PutAudioStreamData(g_audio, lr, bytes);
+    SDL_PutAudioStreamData(audio, lr, bytes);
     queued += bytes;
     if (!g_clock.primed) {
         if (queued < target) return;
         g_clock.primed = true, g_clock.depth = queued, g_clock.frames = 0;
-        SDL_ResumeAudioStreamDevice(g_audio);
+        SDL_ResumeAudioStreamDevice(audio);
         return;
     }
     st.audio_queue_sum += uint64_t(queued), ++st.audio_queue_count;
@@ -363,7 +379,7 @@ void play_audio(const int16_t* lr, uint32_t frames) {
     const double error = (g_clock.depth - target) / target;
     const double ratio = time_base_speed() * (1.0 + std::clamp(error * 0.01, -0.005, 0.005));
     st.audio_ratio = ratio;
-    SDL_SetAudioStreamFrequencyRatio(g_audio, float(ratio));
+    SDL_SetAudioStreamFrequencyRatio(audio, float(ratio));
 }
 
 void rumble(bool on) {
@@ -532,6 +548,14 @@ bool run(const std::function<void()>& game) {
             std::_Exit(1);
         }
         if (menu.quit_requested()) quit();
+        // No sound device yet (it couldn't be opened): try again every 2 s.
+        if (!hidden() && !g_audio.load(std::memory_order_relaxed)) {
+            static uint64_t next_try = 0;
+            if (const uint64_t now = SDL_GetTicks(); now >= next_try) {
+                if (next_try) open_audio(true);
+                next_try = now + 2000;
+            }
+        }
         if (was_shown != menu.is_open()) {  // opened or closed: what's held now is the game's again
             update_keys();
             update_pad();
