@@ -375,8 +375,11 @@ void Menu::display_page() {
 
     ImGui::SeparatorText("Timing");
     ImGui::BeginDisabled(!s.vsync);
+    ImGui::Checkbox("Variable refresh: G-Sync / FreeSync / VRR is on (from the next start)", &s.variable_refresh);
+    ImGui::BeginDisabled(s.variable_refresh);
     ImGui::Checkbox("Lock the game to the display's refresh (from the next start)", &s.lock_to_display);
     ImGui::Checkbox("Fullscreen at 60/120 Hz when the desktop's refresh doesn't suit (from the next start)", &s.match_refresh);
+    ImGui::EndDisabled();
     ImGui::EndDisabled();
     int latency = int(s.audio_latency_ms);
     if (ImGui::SliderInt("Sound latency", &latency, 5, 200, "%d ms", ImGuiSliderFlags_AlwaysClamp))

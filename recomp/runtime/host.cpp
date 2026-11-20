@@ -294,7 +294,7 @@ SDL_DisplayMode g_fullscreen_mode{};
 bool g_have_fullscreen_mode = false;
 
 void choose_fullscreen_mode() {
-    if (hidden() || !settings().vsync || !settings().match_refresh) return;
+    if (hidden() || !settings().vsync || !settings().match_refresh || settings().variable_refresh) return;
     const SDL_DisplayID display = SDL_GetDisplayForWindow(g_window);
     const SDL_DisplayMode* desktop = SDL_GetDesktopDisplayMode(display);
     int k = 0;
@@ -321,7 +321,17 @@ void choose_fullscreen_mode() {
 }
 
 void lock_to_display() {
-    if (hidden() || bot::active() || !settings().vsync || !settings().lock_to_display) return;
+    if (hidden() || bot::active()) return;
+    if (settings().variable_refresh) {
+        // The display follows the frames: the game keeps its own clock
+        // (the console's 59.94 or 50 Hz) and nothing is locked or switched.
+        const SDL_DisplayMode* m = SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(g_window));
+        std::fprintf(stderr, "qilin_run: variable refresh: the display (up to %.3f Hz) follows the game's %.2f Hz frames; "
+                             "it must be on in the graphics driver (on a fixed-refresh display frames come unevenly)\n",
+                     m ? mode_hz(*m) : 0.0, field_hz());
+        return;
+    }
+    if (!settings().vsync || !settings().lock_to_display) return;
     double hz = 0;
     if (g_have_fullscreen_mode && (SDL_GetWindowFlags(g_window) & SDL_WINDOW_FULLSCREEN)) {
         hz = mode_hz(g_fullscreen_mode);

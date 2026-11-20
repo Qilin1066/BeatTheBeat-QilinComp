@@ -32,6 +32,7 @@ struct Settings {
     bool vsync = true;                // present at the display's refresh (no tearing); off: lowest latency
     bool lock_to_display = true;      // with vsync: the game's clock at the display's refresh when within 0.5% (read at start)
     bool match_refresh = true;        // with vsync: fullscreen switches to a refresh that suits the game (60/120 Hz) if the desktop's doesn't
+    bool variable_refresh = false;    // G-Sync/FreeSync/VRR on: the display follows the game's frames (no lock, no mode switch; read at start)
     std::string gpu;                  // the graphics device's name (empty: the best one)
     // [audio]
     uint32_t audio_latency_ms = 10;   // the sound queued ahead of the speakers, held there (5-200; at least what the device can keep up)

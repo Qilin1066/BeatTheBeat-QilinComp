@@ -71,6 +71,11 @@ std::string settings_text(const Settings& s) {
     line("# With vsync: if the desktop's refresh can't show the game's frames evenly (75 Hz, 144 Hz),");
     line("# fullscreen switches the display to the same resolution at 60 or 120 Hz. false: the desktop's mode.");
     line(std::string("match_refresh = ") + b(s.match_refresh));
+    line("# A variable-refresh display (G-Sync, FreeSync, VRR) with it turned on in the graphics driver:");
+    line("# the display refreshes when each frame arrives, so any refresh rate shows the game evenly");
+    line("# (a 144 Hz desktop as it is, with no mode switch). Overrides the two above. Only turn it on");
+    line("# if the display and driver have it on: on a fixed-refresh display it shows frames unevenly.");
+    line(std::string("variable_refresh = ") + b(s.variable_refresh));
     line("# The graphics device, by name (empty: the best one).");
     line("gpu = " + s.gpu);
     line("");
@@ -196,6 +201,8 @@ bool parse_settings(std::istream& in, Settings& s, std::string& error, unsigned&
             boolean(s.lock_to_display);
         } else if (section == "display" && key == "match_refresh") {
             boolean(s.match_refresh);
+        } else if (section == "display" && key == "variable_refresh") {
+            boolean(s.variable_refresh);
         } else if (section == "audio" && key == "exclusive") {
             boolean(s.exclusive_audio);
         } else if (section == "audio" && key == "latency_ms") {

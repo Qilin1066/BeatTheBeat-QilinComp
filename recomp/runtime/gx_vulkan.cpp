@@ -411,9 +411,13 @@ bool make_swapchain() {
     // else FIFO (always there). Without: immediate (the lowest latency),
     // else mailbox, else FIFO.
     auto has = [&](VkPresentModeKHR m) { return std::find(modes.begin(), modes.end(), m) != modes.end(); };
+    // Variable refresh with vsync: FIFO, the mode G-Sync and FreeSync follow
+    // (the display refreshes as each frame is presented; mailbox can keep a
+    // driver at the fixed rate). Two images: a frame is shown at once, so
+    // presenting never waits at 60 frames a second.
     VkPresentModeKHR mode = VK_PRESENT_MODE_FIFO_KHR;
     if (!settings().vsync && has(VK_PRESENT_MODE_IMMEDIATE_KHR)) mode = VK_PRESENT_MODE_IMMEDIATE_KHR;
-    else if (has(VK_PRESENT_MODE_MAILBOX_KHR)) mode = VK_PRESENT_MODE_MAILBOX_KHR;
+    else if (!settings().variable_refresh && has(VK_PRESENT_MODE_MAILBOX_KHR)) mode = VK_PRESENT_MODE_MAILBOX_KHR;
 
     VkSwapchainCreateInfoKHR si = vk_struct<VkSwapchainCreateInfoKHR>(VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR);
     si.surface = g.surface;
@@ -438,6 +442,7 @@ bool make_swapchain() {
         std::fprintf(stderr, "qilin_run: presenting: %s\n",
                      mode == VK_PRESENT_MODE_MAILBOX_KHR     ? "mailbox (vsync, no waiting)"
                      : mode == VK_PRESENT_MODE_IMMEDIATE_KHR ? "immediate (no vsync)"
+                     : settings().variable_refresh           ? "FIFO for variable refresh (the display follows each frame)"
                                                              : "FIFO (vsync, waits for the display: two images)");
     }
     if (g.swapchain) {
