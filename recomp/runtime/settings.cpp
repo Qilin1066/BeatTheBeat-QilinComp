@@ -201,7 +201,7 @@ std::filesystem::path game_data_dir() {
         const std::filesystem::path base = user_data_base();
         if (base.empty()) return base;
         const std::filesystem::path now = base / "qilin" / "beatthebeat", before = base / "BeatTheBeat-QilinComp";
-        // Up to v0.16.0 the folder was named after the project: what's there
+        // Up to v0.16.0 the folder was named after the project (then called
         // (saves above all) moves to the new place once.
         std::error_code ec;
         if (std::filesystem::is_directory(before, ec) && !std::filesystem::exists(now, ec)) {

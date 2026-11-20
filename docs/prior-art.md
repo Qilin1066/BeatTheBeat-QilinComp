@@ -1,6 +1,6 @@
 # Prior art: Wii and PowerPC recompilation, and this game (researched 2026-11-18)
 
-What exists, what each project chose, and what it means for this one (C++23, Vulkan 1.3, cross-platform including low-end ARM boards, efficiency and reliability first, the same targets as GBTG-Qilincomp).
+What exists, what each project chose, and what it means for this one (C++23, Vulkan 1.3, cross-platform including low-end ARM boards, efficiency and reliability first, the same targets as GBTGhoulies-QilinRecomp).
 
 ## 1. This project's 0.1 phase (ChatGPT, 2026-11-18)
 The repository started with work by ChatGPT, in two parts. Both are retired; the history is in git (`v0.1.0-alpha.1` is commit `751b042`, the native probe ends at `b1c602c`).

@@ -2,7 +2,7 @@
 
 **Guiding principle: efficiency and reliability come first.** Every design choice is judged on whether it makes the game cheaper to run on low-end hardware and whether it fails loudly and predictably instead of silently misbehaving.
 
-The requirements and scope are the same as GBTG-Qilincomp's (Grabbed by the Ghoulies). Where the Wii differs from the Xbox, this document says how the same rule applies.
+The requirements and scope are the same as GBTGhoulies-QilinRecomp's (Grabbed by the Ghoulies). Where the Wii differs from the Xbox, this document says how the same rule applies.
 
 ## Targets
 - **Game:** *Beat the Beat: Rhythm Paradise*, Europe/Australia, disc `SOMP01`, revision 0, recognised by the SHA-256 of `main.dol`. Other regions are other binaries and out of scope for now.

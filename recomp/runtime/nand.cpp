@@ -1,7 +1,7 @@
 // revolution/nand (the console's flash), native: the game's save data in a
 // host folder, laid out as the flash's own paths
 // (<root>/title/00010000/534f4d50/data/...). The root is QILIN_NAND, or the
-// platform's per-user data folder (BeatTheBeat-QilinComp/nand): never the
+// platform's per-user data folder (qilin/beatthebeat/nand): never the
 // repository, since saves are the game's data. Functions are added as
 // bring-up reaches them, each checked against how its callers use the
 // result. Runtime code: no std::format.

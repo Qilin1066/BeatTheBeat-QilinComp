@@ -10,7 +10,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$UninstallKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\BeatTheBeat-QilinComp'
+$UninstallKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\BeatTheBeat-QilinRecomp'
 $InstallDir = $PSScriptRoot
 $exe = Join-Path $InstallDir 'qilin_run.exe'
 

@@ -4,7 +4,7 @@ The same rule as the other Qilin recomps: **Qilin** is the author's name and goe
 
 | Thing | Name | Why |
 |---|---|---|
-| The repo / project | BeatTheBeat-QilinComp | The game plus the toolchain that ports it |
+| The repo / project | BeatTheBeat-QilinRecomp | The game plus the toolchain that ports it |
 | The recompiler CLI | `qilin` | The author's tool |
 | C++ namespaces | `qilin`, `qilin::rt`, `qilin::gen` | The project's namespace |
 | Build options, macros, CMake targets, environment variables | `QILIN_*`, `qilin_*` | Same prefix as the namespace |
@@ -16,4 +16,4 @@ The same rule as the other Qilin recomps: **Qilin** is the author's name and goe
 
 The game executable is still `qilin_run` while the runtime is brought up, as in the sister projects; it takes the game's name with the first player release.
 
-The data folder moved from `<per-user data>/BeatTheBeat-QilinComp` (up to v0.16.0) to `<per-user data>/qilin/beatthebeat`: the runtime moves an old folder across on its first run.
+The data folder moved from `<per-user data>/BeatTheBeat-QilinComp` (the project's name up to v0.16.0; the folder keeps that old name where it still exists) to `<per-user data>/qilin/beatthebeat`: the runtime moves an old folder across on its first run.

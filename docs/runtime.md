@@ -130,7 +130,7 @@ GX is replaced at its API, as the roadmap says: its own code drives the GPU's re
 
 ## The player's side: settings, window, controllers, enhancements (after v0.16.0)
 
-As in the other Qilin recomps (`docs/naming.md`): the window is named after the game and opens at the largest whole multiple of the picture (854×480 at 16:9, 640×480 at 4:3) that fits nine tenths of the main display; F11 or Alt+Enter switch borderless fullscreen. The data folder is `<per-user data>/qilin/beatthebeat` (`settings.cpp`'s `game_data_dir`; an old `BeatTheBeat-QilinComp` folder moves there once).
+As in the other Qilin recomps (`docs/naming.md`): the window is named after the game and opens at the largest whole multiple of the picture (854×480 at 16:9, 640×480 at 4:3) that fits nine tenths of the main display; F11 or Alt+Enter switch borderless fullscreen. The data folder is `<per-user data>/qilin/beatthebeat` (`settings.cpp`'s `game_data_dir`; an old `BeatTheBeat-QilinComp` folder, the project's former name, moves there once).
 
 - **The settings file** (`settings.*`, `beatthebeat.ini`): `[display]` has the preset (`original`, `low-end`, `desktop`) and the keys that override it; `[console]` the Wii's own settings, which `console.hpp` hands to the SC and VI natives. `parse_settings` is apart from the file, and unit-tested; a malformed line ends the start with the file, line and reason.
 - **Controllers** (`host.cpp`): SDL's gamepad API, hot-plugged; the first controller plays the Wii Remote held upright, merged with the keyboard. `WPADControlMotor` rumbles it (through an SDL user event, so the main thread does it).
@@ -204,7 +204,7 @@ KPAD, the Wii Remote processing, is lifted; WPAD is native at its API. **Until t
 
 ## NAND (`recomp/runtime/nand.*`; v0.15.0)
 
-The game's saves in a host folder laid out as the flash's own paths (`<root>/title/00010000/534f4d50/data/...`; the title's code from the disc ID). The root is `QILIN_NAND`, or the platform's per-user data folder (`%LOCALAPPDATA%\BeatTheBeat-QilinComp\nand`, `~/Library/Application Support/...`, `$XDG_DATA_HOME` or `~/.local/share/...`): never the repository, since saves are the game's data. The title's data directory and `/tmp` exist before the game runs, as a console's system makes them.
+The game's saves in a host folder laid out as the flash's own paths (`<root>/title/00010000/534f4d50/data/...`; the title's code from the disc ID). The root is `QILIN_NAND`, or the platform's per-user data folder (`%LOCALAPPDATA%\qilin\beatthebeat\nand`, `~/Library/Application Support/...`, `$XDG_DATA_HOME` or `~/.local/share/...`): never the repository, since saves are the game's data. The title's data directory and `/tmp` exist before the game runs, as a console's system makes them.
 
 - Paths: absolute as given, relative from the title's home directory; `..` is refused (it would leave the folder).
 - Results as the game's backup manager tests them (read from its code): `NANDGetType` -12 for "no save yet", `NANDCheck`'s answer bits (5: no space, 10: too many files; 0 here), `NANDGetStatus` as an existence check (owner and group aren't kept; the permission is owner read/write, as the game creates its files), `NANDMove` failing with EXISTS onto an existing file, as on the console.
