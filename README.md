@@ -177,6 +177,15 @@ This compares the decoder with GNU objdump (`-M broadway,raw`): mnemonic and eve
 | `third_party/rhf/` | The Rhythm Heaven Fever decomp's symbols and splits (CC0) |
 | `docs/` | Roadmap and design targets, prior art, analysis and status notes |
 
+## Licence
+
+This project's own code and documentation are under the [MIT licence](LICENSE). Two things in or around it are not:
+
+- `third_party/rhf/`, the symbol names and splits from the Rhythm Heaven Fever decompilation, keeps its own licence, CC0 1.0 (`third_party/rhf/LICENSE`).
+- The dependencies CMake fetches at build time keep theirs: SDL3 (zlib), Khronos' Vulkan headers (Apache-2.0), Dear ImGui (MIT), and glslang when shaders are rebuilt.
+
+The game itself is Nintendo's and is not covered by anything here: you need your own copy, and nothing built from it may be shared.
+
 ## Design targets (short version)
 
 - **Efficiency and reliability come first.** Every choice is judged by whether it makes the game cheaper to run on low-end hardware, and whether it fails loudly instead of misbehaving quietly.
