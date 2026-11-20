@@ -8,7 +8,7 @@ A static recompilation of **Beat the Beat: Rhythm Paradise** (Nintendo, Wii; *Rh
 
 ## Status
 
-The recompiler core is done for the game's code: all 8,108 liftable functions lift and match the original under the differential test. The runtime boots the game in a window with Vulkan graphics, sound and keyboard controls, through to its title screen and beyond the first press of A. It is **not playable end to end yet**: the picture is unverified by eye, unsupported GX features stop the run with a message, and rhythm timing isn't measured (`docs/runtime.md` keeps the current list).
+The recompiler core is done for the game's code: all 8,108 liftable functions lift and match the original under the differential test. The runtime plays the game in a window with Vulkan graphics, stereo or Dolby Pro Logic II sound, the keyboard or any gamepad, and a settings menu (F1). It plays from boot through the title, save creation, the opening scene, the HOME menu and the first rhythm tests (the timing calibration, the countdown, "Keep the beat!") with no stop, the picture checked by eye on the way. It is **not playable end to end yet**: the rhythm games beyond haven't been reached, rhythm timing isn't measured against a console, and features not met so far stop the run with a message (`docs/runtime.md` keeps the current list). A Windows installer builds it from your own disc (below).
 
 | Piece | State |
 |---|---|
@@ -31,9 +31,13 @@ The recompiler core is done for the game's code: all 8,108 liftable functions li
 | Audio clock (AX lifted, AI and DSP native), saves (NAND on a host folder), safe points in lifted loops | ✅ the game initialises, saves, reaches its title and keeps running at a frame per retrace, the audio clock at the console's rate |
 | Wii Remote: the keyboard, or a script of timed presses (`QILIN_INPUT`), through WPAD into the game's own KPAD | ✅ presses reach the game's controller code |
 | The DSP mixer: AX's command list (DSP-ADPCM and PCM, resampling, envelopes and ramps, aux effects through AX's callbacks) | ✅ exact where game logic looks; approximations marked; sound on the host's output |
-| GX on Vulkan 1.3: transform and lighting on the CPU, the TEV in one shader, GX's texture formats, mipmaps, copies to textures, fog, lines | 🔨 draws detailed frames (checked by numbers, not yet by eye); some features still stop the run |
-| The SDK API the game's code calls (260 replaced functions) | 🔨 all but 18 natively; the rest stop when reached |
-| Rhythm timing measured against the console, other platforms run, settings | later (see roadmap) |
+| GX on Vulkan 1.3: transform and lighting on the CPU, the TEV specialised per configuration, GX's texture formats, mipmaps, copies to textures, fog, lines, display lists recorded and called | 🔨 every screen met so far draws correctly (checked by eye); features not met yet stop the run |
+| The SDK API the game's code calls (255 replaced functions) | 🔨 all but 12 natively, none of those 12 reached in play (the balance board, MotionPlus, field rendering, the console's own font); they stop if reached |
+| Settings and a menu in the window (F1 or Esc): presets, internal resolution, anisotropic filtering, picture size; controllers (any gamepad SDL knows) | ✅ the other Qilin recomps' menu and conventions; controllers not yet confirmed on real hardware |
+| Sound: every AX frame mixed on time; stereo, and Dolby Pro Logic II for the console's surround setting | ✅ the beat steady to the sample; the surround encoding marked approximate |
+| Windows installer (`install.cmd`): builds the game from your own disc and installs it | ✅ tested end to end |
+| A lockstep test bot (`tools/bot/`) that plays by the game's own beat | ✅ plays through the first rhythm tests |
+| Rhythm timing measured against a console, other platforms run, the rest of the game | later (see roadmap) |
 
 The repository's first version (0.1.0-alpha.1, a Dolphin-based preview, and a native boot probe on top of DolRecomp) was written with ChatGPT and has been retired. `docs/prior-art.md` §1 says what it did and what carried over.
 

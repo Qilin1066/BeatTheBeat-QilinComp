@@ -1200,14 +1200,14 @@ void test_settings() {
     CHECK(s.preset == "desktop" && s.internal_scale == 3 && s.anisotropy == 4 && s.language == 2 && !s.widescreen);
     CHECK(parse("[display]\npreset = original\n", s, error, line) && s.internal_scale == 1 && s.anisotropy == 1);
     // each malformed form names its line
-    struct Bad {
+    struct BadFile {
         const char* text;
         unsigned line;
     };
-    for (const Bad& b : {Bad{"[display]\ninternal_scale = 9\n", 2}, Bad{"[display]\nanisotropy = 3\n", 2},
-                         Bad{"[display]\nvsync = yes\n", 2}, Bad{"[nowhere]\n", 1}, Bad{"[display]\npreset = fast\n", 2},
-                         Bad{"[display]\nnot_a_key = 1\n", 2}, Bad{"[display]\nfullscreen\n", 2},
-                         Bad{"[console]\nlanguage = -1\n", 2}, Bad{"[display\n", 1}, Bad{"[console]\nsound_mode = 3\n", 2}}) {
+    for (const BadFile& b : {BadFile{"[display]\ninternal_scale = 9\n", 2}, BadFile{"[display]\nanisotropy = 3\n", 2},
+                         BadFile{"[display]\nvsync = yes\n", 2}, BadFile{"[nowhere]\n", 1}, BadFile{"[display]\npreset = fast\n", 2},
+                         BadFile{"[display]\nnot_a_key = 1\n", 2}, BadFile{"[display]\nfullscreen\n", 2},
+                         BadFile{"[console]\nlanguage = -1\n", 2}, BadFile{"[display\n", 1}, BadFile{"[console]\nsound_mode = 3\n", 2}}) {
         CHECK(!parse(b.text, s, error, line) && line == b.line && !error.empty());
     }
     // what the menu saves reads back as the same settings (every key, set
