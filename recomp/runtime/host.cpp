@@ -280,7 +280,10 @@ double field_hz() { return console().eurgb60 ? 60000.0 / 1001.0 : 50.0; }
 // (k) at `hz`, within 0.5%; 0 if there is none.
 double lock_speed(double hz, int& k) {
     if (!(hz > 0)) return 0;
-    for (k = 1; k <= 8; ++k)  // up to 480 Hz: each frame shown k times
+    // 60 Hz (EuRGB60): up to 480 Hz, each frame shown k times. PAL 50 Hz:
+    // only a 50 Hz display (the owner's choice, 2026-11-20: no 100 or 150).
+    const int most = console().eurgb60 ? 8 : 1;
+    for (k = 1; k <= most; ++k)
         if (const double speed = hz / k / field_hz(); std::abs(speed - 1.0) <= 0.005) return speed;
     return 0;
 }
