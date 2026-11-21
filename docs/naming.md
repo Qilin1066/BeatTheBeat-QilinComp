@@ -4,7 +4,7 @@ The same rule as the other Qilin recomps: **Qilin** is the author's name and goe
 
 | Thing | Name | Why |
 |---|---|---|
-| The repo / project | BeatTheBeat-QilinRecomp | The game plus the toolchain that ports it |
+| The repo / project | RhythmHeavenFever--QilinRecomp | The game plus the toolchain that ports it, in the owner's form for every project (`<Game>--QilinRecomp`); it carries the game's North American title, and was BeatTheBeat-QilinRecomp until 2026-11-21 |
 | The recompiler CLI | `qilin` | The author's tool |
 | C++ namespaces | `qilin`, `qilin::rt`, `qilin::gen` | The project's namespace |
 | Build options, macros, CMake targets, environment variables | `QILIN_*`, `qilin_*` | Same prefix as the namespace |
