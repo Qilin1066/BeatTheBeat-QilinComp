@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <string>
 
 #include "guest.hpp"
 
@@ -24,6 +25,9 @@ void fine_timers();
 // the multimedia scheduler's "Games" class, so background work doesn't
 // delay the retrace and the audio DMA.
 void game_thread_started();
+// Windows, started without a console (a shortcut): the log (stderr) goes to
+// qilin_run.log in the game's data folder; its path, or empty if not.
+std::string log_to_file_without_console();
 // The display's last vblank (on the steady clock, in nanoseconds) and its
 // refresh period, where the platform tells them (Windows: the compositor's
 // timing); false elsewhere.

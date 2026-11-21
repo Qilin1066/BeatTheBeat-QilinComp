@@ -16,8 +16,10 @@
 
 #include "gx_vulkan.hpp"
 #include "host.hpp"
+#include "native.hpp"
 #include "pause.hpp"
 #include "settings.hpp"
+#include "threads.hpp"
 
 #ifndef QILIN_VERSION
 #define QILIN_VERSION "?"
@@ -622,6 +624,21 @@ void Menu::game_page() {
     ImGui::Checkbox("Sensor bar above the TV", &s.sensor_bar_above);
     int dpd = std::clamp(int(s.dpd_sensitivity), 1, 5);
     if (ImGui::SliderInt("Pointer sensitivity", &dpd, 1, 5, "%d", ImGuiSliderFlags_AlwaysClamp)) s.dpd_sensitivity = uint8_t(dpd);
+
+    ImGui::SeparatorText("If the game is stuck");
+    // The game is parked while the menu is open: every guest thread is still,
+    // so their state can be read from here.
+    if (ImGui::Button("Write a report to the log")) {
+        std::fprintf(stderr, "qilin_run: a report asked for from the settings menu\n");
+        report_stats();
+        report_threads();
+        std::fflush(stderr);
+        report_note_ = "Written: what each of the game's threads waits on, and what it has read and played.";
+    }
+    ImGui::SameLine();
+    ImGui::TextDisabled("(for a black screen or a freeze: then quit, and send the log)");
+    if (!report_note_.empty()) ImGui::TextDisabled("%s", report_note_.c_str());
+    ImGui::TextWrapped("The log: %s", (game_data_dir() / "qilin_run.log").string().c_str());
 
     ImGui::SeparatorText("About");
     ImGui::TextWrapped("Beat the Beat: Rhythm Paradise QilinRecomp %s: a static recompilation, the game's own code compiled for this computer.",

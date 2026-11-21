@@ -102,6 +102,8 @@ int main(int argc, char** argv) {
         return 2;
     }
     rt::bot::at_end = rt::report_threads;  // a bot's run ends with where the threads are
+    if (const std::string log = rt::log_to_file_without_console(); !log.empty())
+        std::fprintf(stderr, "qilin_run: the log of this run (no console): %s\n", log.c_str());
     // The extracted disc's folder (Dolphin: Extract Entire Disc) gives the
     // game and its files; main.dol alone runs until the game reads the disc.
     const std::filesystem::path arg = argv[1];

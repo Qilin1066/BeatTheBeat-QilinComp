@@ -75,6 +75,7 @@ private:
     uint32_t capture_held_ = 0;   // the controller's buttons held when it began (they don't count)
     bool wait_release_ = false;   // after one was taken: the mouse and the pad's navigation back once it's let go
     std::string note_;            // said under the table (what moved where)
+    std::string report_note_;     // said under "Write a report"
 };
 
 }  // namespace qilin::rt

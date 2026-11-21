@@ -3,6 +3,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <string>
+
+#include "settings.hpp"
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -56,6 +60,26 @@ bool display_vblank(uint64_t& vblank_ns, uint64_t& period_ns) {
 #else
     (void)vblank_ns, (void)period_ns;
     return false;
+#endif
+}
+
+std::string log_to_file_without_console() {
+#if defined(_WIN32)
+    // Started from a shortcut or Explorer there is no console: stderr goes
+    // nowhere, and a stuck or stopped game leaves nothing to read. Then the
+    // log goes to qilin_run.log in the game's data folder (a new one each run).
+    const HANDLE h = GetStdHandle(STD_ERROR_HANDLE);
+    if (h && h != INVALID_HANDLE_VALUE && GetFileType(h) != FILE_TYPE_UNKNOWN) return {};
+    const std::filesystem::path dir = game_data_dir();
+    if (dir.empty()) return {};
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    const std::filesystem::path path = dir / "qilin_run.log";
+    if (!std::freopen(path.string().c_str(), "w", stderr)) return {};
+    std::setvbuf(stderr, nullptr, _IONBF, 0);  // every line reaches the file, a hang or a crash included
+    return path.string();
+#else
+    return {};
 #endif
 }
 
