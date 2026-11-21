@@ -179,7 +179,7 @@ This compares the decoder with GNU objdump (`-M broadway,raw`): mnemonic and eve
 
 ## Licence
 
-This project's own code and documentation are under the [MIT licence](LICENSE). Two things in or around it are not:
+This project's own code and documentation are under the [GNU General Public License, version 3](LICENSE) (GPL-3.0), as in the other QilinRecomp projects: you may use, share, change and sell it, but anything you distribute that is built from it must come with its full source under the same licence. (Versions before 2026-11-21 were released under MIT, and those copies stay under MIT.) Two things in or around it are not:
 
 - `third_party/rhf/`, the symbol names and splits from the Rhythm Heaven Fever decompilation, keeps its own licence, CC0 1.0 (`third_party/rhf/LICENSE`).
 - The dependencies CMake fetches at build time keep theirs: SDL3 (zlib), Khronos' Vulkan headers (Apache-2.0), Dear ImGui (MIT), and glslang when shaders are rebuilt.

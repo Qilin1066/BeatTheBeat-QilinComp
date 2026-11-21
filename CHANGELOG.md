@@ -11,6 +11,9 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+### Changed
+- **Licence: GPL-3.0** (`LICENSE`), as in all the QilinRecomp projects, in place of MIT: anyone may use, share, change and sell it, but whatever they distribute that is built from it must come with its full source under the same licence. Earlier versions stay under MIT.
+
 ## [0.17.0] - 2026-11-21
 
 Played by the owner through the first four rhythm games into the first remix. Less lag and stutter, the settings menu as the other Qilin recomps', and the first remix's black screen fixed.
