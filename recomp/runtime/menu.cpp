@@ -112,6 +112,9 @@ Menu::Menu(SDL_Window* window) : window_(window) {
     ImGui::GetStyle().FontScaleDpi = dpi;
 
     sdl_backend_ = ImGui_ImplSDL3_InitForVulkan(window);
+    // Every controller works the menu, not only the first one SDL lists
+    // (which can be a virtual pad, or a wheel's base).
+    if (sdl_backend_) ImGui_ImplSDL3_SetGamepadMode(ImGui_ImplSDL3_GamepadMode_AutoAll);
     g_gipa = reinterpret_cast<PFN_vkGetInstanceProcAddr>(t.get_instance_proc_addr);
     g_instance = static_cast<VkInstance>(t.instance);
     if (!sdl_backend_ || !ImGui_ImplVulkan_LoadFunctions(VK_API_VERSION_1_3, load)) {

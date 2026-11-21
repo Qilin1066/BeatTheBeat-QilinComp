@@ -14,6 +14,9 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 ### Changed
 - **Licence: GPL-3.0** (`LICENSE`), as in all the QilinRecomp projects, in place of MIT: anyone may use, share, change and sell it, but whatever they distribute that is built from it must come with its full source under the same licence. Earlier versions stay under MIT.
 
+### Fixed
+- **Every controller works the F1 menu**, not only the first one SDL lists (which can be a virtual pad or a wheel's base): Dear ImGui's SDL3 backend is set to read them all, as APB's menu now does.
+
 ## [0.17.0] - 2026-11-21
 
 Played by the owner through the first four rhythm games into the first remix. Less lag and stutter, the settings menu as the other Qilin recomps', and the first remix's black screen fixed.
