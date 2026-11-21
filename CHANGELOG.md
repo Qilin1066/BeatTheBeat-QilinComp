@@ -11,6 +11,10 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-11-21
+
+Played by the owner through the first four rhythm games into the first remix. Less lag and stutter, the settings menu as the other Qilin recomps', and the first remix's black screen fixed.
+
 ### Fixed
 - **The first remix stayed black and silent** (every time). The game's file manager frees a file slot when a disc read completes, but an archive keeps the slot's address until it has been decompressed (a frame or more later), and a completed read marks the first archive with a matching slot. Reads finished in 1 ms, so a read on a reused slot completed while the older archive still held it; the newer archive was never marked read and the remix waited for good. The drive now takes time as the console's does (one request at a time, 10 ms of access plus the bytes at 8 MB/s; APPROX). Very likely the same cause as the rare black screen after the strap screen. `QILIN_DVD_TRACE=1` logs the disc's opens, reads and completions.
 - **A log file and a report:** started without a console, the log goes to `qilin_run.log` in the data folder; the menu's Game page writes a report (counters and each thread's state) for a game that seems stuck.
