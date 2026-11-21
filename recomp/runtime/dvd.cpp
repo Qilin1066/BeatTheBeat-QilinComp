@@ -103,9 +103,20 @@ int32_t entry_of(const std::string& path) {
     return -1;
 }
 
+// QILIN_DVD_TRACE=1: each file opened and each read, on stderr (what the
+// game loaded last, when it waits for something).
+bool tracing() {
+    static const bool on = [] {
+        const char* v = std::getenv("QILIN_DVD_TRACE");
+        return v && *v && *v != '0';
+    }();
+    return on;
+}
+
 bool fast_open(int32_t entry, uint32_t fi) {
     if (entry < 0 || static_cast<size_t>(entry) >= disc.entries.size() || disc.entries[entry].dir) return false;
     const Entry& e = disc.entries[entry];
+    if (tracing()) std::fprintf(stderr, "[dvd %.3f] open %s (%u bytes) -> %08X\n", double(time_base()) / kTimeBaseHz, e.path.c_str(), e.size, fi);
     poke32(fi + kStart, e.disc_offset);
     poke32(fi + kLength, e.size);
     poke32(fi + kCallback, 0);
@@ -125,6 +136,9 @@ bool read(uint32_t fi, uint32_t addr, uint32_t length, uint32_t offset) {
         return false;
     }
     const Entry& e = disc.entries[it->second];
+    if (tracing())
+        std::fprintf(stderr, "[dvd %.3f] read %s at %u, %u bytes -> %08X (block %08X)\n", double(time_base()) / kTimeBaseHz,
+                     e.path.c_str(), offset, length, addr, fi);
     if (!guest_range_ok(addr, length)) {
         std::fprintf(stderr, "qilin_run: a read of %u bytes to %08X, outside guest memory\n", length, addr);
         return false;
@@ -149,13 +163,41 @@ std::map<uint32_t, uint64_t> g_pending;
 std::set<uint32_t> g_cancelled;  // cancelled asynchronously: the completion reports it
 uint64_t g_next_request = 1;
 
-void complete(uint32_t fi, int32_t result, uint32_t callback) {
+// The drive's time. An asynchronous read finishes after the time the
+// console's drive would take: one request at a time, each an access time
+// plus its bytes at the drive's rate. The game depends on it: its file
+// manager (CFileManager) frees a file slot when a read completes, but an
+// archive keeps the slot's address until it has been decompressed, a frame
+// or more later; a read on the reused slot that completes before then is
+// matched to the older archive, and the newer one is never marked read. With
+// reads finishing in 1 ms that happened at the first remix (four games'
+// archives on five slots): a black screen for good (found 2026-11-21).
+// APPROX: no measurement of the Wii's drive is at hand; the figures are of
+// the order of a DVD drive's (megabytes a second, milliseconds an access),
+// and leave a read of a large archive well past a frame, as on the console.
+// Synchronous reads still return at once (their thread would wait either way).
+constexpr uint64_t kDriveAccess = kTimeBaseHz / 100;            // 10 ms a request
+constexpr uint64_t kDriveBytesPerSecond = 8 * 1024 * 1024;      // 8 MB/s
+uint64_t g_drive_free = 0;                                       // when the drive finishes what it has (time base)
+
+uint64_t drive_time(uint32_t bytes) {
+    const uint64_t now = time_base();
+    const uint64_t start = std::max(now, g_drive_free);
+    g_drive_free = start + kDriveAccess + uint64_t(bytes) * kTimeBaseHz / kDriveBytesPerSecond;
+    return g_drive_free - now;
+}
+
+void complete(uint32_t fi, int32_t result, uint32_t callback, uint32_t bytes) {
     const uint64_t request = g_next_request++;
     g_pending[fi] = request;
     stats().dvd_pending = g_pending.size();
     g_cancelled.erase(fi);
     post_interrupt([fi, result, callback, request](Context& c) {
         const auto it = g_pending.find(fi);
+        if (tracing())
+            std::fprintf(stderr, "[dvd %.3f] completion of block %08X: %s, callback %08X\n", double(time_base()) / kTimeBaseHz, fi,
+                         it == g_pending.end() || it->second != request ? "nothing pending (cancelled or reused)" : "delivered",
+                         callback);
         if (it == g_pending.end() || it->second != request) return;
         g_pending.erase(it);
         stats().dvd_pending = g_pending.size();
@@ -166,7 +208,7 @@ void complete(uint32_t fi, int32_t result, uint32_t callback) {
         c.r[3] = static_cast<uint32_t>(cancelled ? kResultCanceled : result);
         c.r[4] = fi;
         call_guest(c, callback);
-    }, kIoLatency);
+    }, drive_time(bytes));
 }
 
 // A synchronous cancel (DVDCancel, and DVDClose's): as the SDK's, the request
@@ -229,7 +271,7 @@ QILIN_NATIVE(DVDReadAsyncPrio) {
     const bool ok = read(fi, c.r[4], c.r[5], c.r[6]);
     poke32(fi + kCallback, callback);
     poke32(fi + kCbState, kStateBusy);
-    complete(fi, ok ? static_cast<int32_t>(c.r[5]) : kResultFatal, callback);
+    complete(fi, ok ? static_cast<int32_t>(c.r[5]) : kResultFatal, callback, c.r[5]);
     c.r[3] = 1;
 }
 

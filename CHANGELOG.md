@@ -11,6 +11,10 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+### Fixed
+- **The first remix stayed black and silent** (every time). The game's file manager frees a file slot when a disc read completes, but an archive keeps the slot's address until it has been decompressed (a frame or more later), and a completed read marks the first archive with a matching slot. Reads finished in 1 ms, so a read on a reused slot completed while the older archive still held it; the newer archive was never marked read and the remix waited for good. The drive now takes time as the console's does (one request at a time, 10 ms of access plus the bytes at 8 MB/s; APPROX). Very likely the same cause as the rare black screen after the strap screen. `QILIN_DVD_TRACE=1` logs the disc's opens, reads and completions.
+- **A log file and a report:** started without a console, the log goes to `qilin_run.log` in the data folder; the menu's Game page writes a report (counters and each thread's state) for a game that seems stuck.
+
 ### Changed: the settings menu as Punch-Out's
 - **Close and Quit the game** at the top right of every page (Quit was at the bottom of the Game page).
 - **Controls are set by pressing them:** each Wii Remote button lists what presses it; Add, then a key, a controller button or a click; clicking one removes it; an input taken from another button moves and says so; "Back to the defaults". Kept in the settings file's `[controls]` (`a = pad:A, pad:RB, key:A, key:Right Shift, key:Right, key:Space`; malformed or reserved inputs stop at start with the line). Escape, F1, F3 and F11 are kept for the program. Keys go by SDL's scancode names, so the same place on any layout.
